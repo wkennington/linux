@@ -486,6 +486,9 @@ struct cache {
 
 	size_t			fifo_last_bucket;
 
+	/* The allocator thread might be waiting to enqueue to these FIFOs */
+	wait_queue_head_t	fifo_wait;
+
 	/* Allocation stuff: */
 	struct bucket		*buckets;
 
