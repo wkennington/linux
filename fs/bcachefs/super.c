@@ -1802,6 +1802,8 @@ static int cache_alloc(struct cache *ca)
 
 	ca->prio_last_buckets = ca->prio_buckets + prio_buckets(ca);
 
+	init_waitqueue_head(&ca->fifo_wait);
+
 	return 0;
 }
 
