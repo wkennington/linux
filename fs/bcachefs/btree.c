@@ -1607,8 +1607,8 @@ static void btree_gc_start(struct cache_set *c)
 	struct bucket *b;
 	unsigned i;
 
-	if (!c->gc_mark_valid)
-		return;
+	/* We should not be doing a GC while trying to start GC */
+	BUG_ON(!c->gc_mark_valid);
 
 	mutex_lock(&c->bucket_lock);
 
@@ -1644,13 +1644,16 @@ static void bch_btree_gc_finish(struct cache_set *c)
 	set_gc_sectors(c);
 	c->gc_mark_valid = 1;
 
+	spin_lock(&c->gc_lock);
+	c->needs_gc = 0;
+	c->gc_count++;
+	spin_unlock(&c->gc_lock);
+
 	bch_mark_writeback_keys(c);
 
 	for_each_cache(ca, c, i) {
 		size_t buckets_free = 0;
 		uint64_t *i;
-
-		ca->invalidate_needs_gc = 0;
 
 		for (i = ca->sb.d; i < ca->sb.d + ca->sb.keys; i++)
 			SET_GC_MARK(ca->buckets + *i, GC_MARK_METADATA);
@@ -1714,33 +1717,17 @@ static void bch_btree_gc(struct cache_set *c)
 	trace_bcache_gc_end(c);
 }
 
-static bool gc_should_run(struct cache_set *c)
-{
-	struct cache *ca;
-	unsigned i;
-
-	for_each_cache(ca, c, i)
-		if (ca->invalidate_needs_gc)
-			return true;
-
-	if (atomic_read(&c->sectors_until_gc) < 0)
-		return true;
-
-	return false;
-}
-
 static int bch_gc_thread(void *arg)
 {
 	struct cache_set *c = arg;
 
 	while (1) {
 		wait_event_interruptible(c->gc_wait,
-			   kthread_should_stop() || gc_should_run(c));
+			   kthread_should_stop() || c->needs_gc);
 again:
 		if (kthread_should_stop())
 			break;
 
-		set_gc_sectors(c);
 		bch_btree_gc(c);
 		if (bch_moving_gc(c))
 			goto again;
@@ -1756,6 +1743,47 @@ int bch_gc_thread_start(struct cache_set *c)
 		return PTR_ERR(c->gc_thread);
 
 	return 0;
+}
+
+static bool next_gc_check(struct cache_set *c, unsigned gc_check)
+{
+	bool ret;
+
+	if (kthread_should_stop())
+		return true;
+
+	spin_lock(&c->gc_lock);
+	ret = ((int) (c->gc_count - gc_check) > 0);
+	trace_bcache_wait_for_next_gc(c, c->gc_count, gc_check);
+	spin_unlock(&c->gc_lock);
+
+	return ret;
+}
+
+/**
+ * bch_wait_for_next_gc - optionally start a new GC, and wait for it to finish
+ *
+ * @c:		pointer to struct cache_set
+ * @wake:	if false, just wait until GC runs again
+ *		if true, start GC and wait for it to finish
+ */
+void bch_wait_for_next_gc(struct cache_set *c, bool wake)
+{
+	unsigned gc_count;
+
+	spin_lock(&c->gc_lock);
+	gc_count = c->gc_count;
+
+	if (wake) {
+		c->needs_gc = 1;
+		wake_up_gc(c);
+	}
+
+	spin_unlock(&c->gc_lock);
+
+	while (wait_event_interruptible(c->gc_wait,
+					next_gc_check(c, gc_count)) != 0)
+		;
 }
 
 /* Initial partial gc */
