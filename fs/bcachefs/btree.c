@@ -26,6 +26,7 @@
 #include "debug.h"
 #include "extents.h"
 #include "journal.h"
+#include "movinggc.h"
 #include "writeback.h"
 
 #include <linux/slab.h>
@@ -1724,13 +1725,11 @@ static int bch_gc_thread(void *arg)
 	while (1) {
 		wait_event_interruptible(c->gc_wait,
 			   kthread_should_stop() || c->needs_gc);
-again:
+
 		if (kthread_should_stop())
 			break;
 
 		bch_btree_gc(c);
-		if (bch_moving_gc(c))
-			goto again;
 	}
 
 	return 0;

@@ -102,7 +102,6 @@ rw_attribute(cache_replacement_policy);
 rw_attribute(btree_shrinker_disabled);
 
 rw_attribute(copy_gc_enabled);
-sysfs_pd_controller_attribute(copy_gc);
 rw_attribute(tiering_enabled);
 sysfs_pd_controller_attribute(tiering);
 
@@ -110,6 +109,7 @@ rw_attribute(size);
 rw_attribute(meta_replicas);
 rw_attribute(data_replicas);
 rw_attribute(tier);
+sysfs_pd_controller_attribute(copy_gc);
 
 SHOW(__bch_cached_dev)
 {
@@ -539,7 +539,6 @@ SHOW(__bch_cache_set)
 	sysfs_printf(gc_always_rewrite,		"%i", c->gc_always_rewrite);
 	sysfs_printf(btree_shrinker_disabled,	"%i", c->shrinker_disabled);
 	sysfs_printf(copy_gc_enabled,		"%i", c->copy_gc_enabled);
-	sysfs_pd_controller_show(copy_gc,	&c->moving_gc_pd);
 	sysfs_printf(tiering_enabled,		"%i", c->tiering_enabled);
 	sysfs_pd_controller_show(tiering,	&c->tiering_pd);
 
@@ -631,7 +630,6 @@ STORE(__bch_cache_set)
 	sysfs_strtoul(btree_shrinker_disabled,	c->shrinker_disabled);
 	sysfs_strtoul(copy_gc_enabled,		c->copy_gc_enabled);
 	sysfs_strtoul(btree_scan_ratelimit,	c->btree_scan_ratelimit);
-	sysfs_pd_controller_store(copy_gc,	&c->moving_gc_pd);
 
 	if (attr == &sysfs_tiering_enabled) {
 		ssize_t ret = strtoul_safe(buf, c->tiering_enabled)
@@ -726,7 +724,6 @@ static struct attribute *bch_cache_set_internal_files[] = {
 	&sysfs_gc_always_rewrite,
 	&sysfs_btree_shrinker_disabled,
 	&sysfs_copy_gc_enabled,
-	sysfs_pd_controller_files(copy_gc),
 	&sysfs_tiering_enabled,
 	sysfs_pd_controller_files(tiering),
 	NULL
@@ -750,6 +747,8 @@ SHOW(__bch_cache)
 
 	sysfs_print(io_errors,
 		    atomic_read(&ca->io_errors) >> IO_ERROR_SHIFT);
+
+	sysfs_pd_controller_show(copy_gc, &ca->moving_gc_pd);
 
 	if (attr == &sysfs_cache_replacement_policy)
 		return bch_snprint_string_list(buf, PAGE_SIZE,
@@ -843,6 +842,8 @@ STORE(__bch_cache)
 	struct cache *ca = container_of(kobj, struct cache, kobj);
 	struct cache_set *c = ca->set;
 
+	sysfs_pd_controller_store(copy_gc, &ca->moving_gc_pd);
+
 	if (attr == &sysfs_discard) {
 		bool v = strtoul_or_return(buf);
 
@@ -930,6 +931,7 @@ static struct attribute *bch_cache_files[] = {
 	&sysfs_clear_stats,
 	&sysfs_cache_replacement_policy,
 	&sysfs_tier,
+	sysfs_pd_controller_files(copy_gc),
 	NULL
 };
 KTYPE(bch_cache);
