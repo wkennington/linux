@@ -1095,35 +1095,27 @@ static void btree_node_free(struct btree *b)
 	mutex_unlock(&b->c->btree_cache_lock);
 }
 
-struct btree *__bch_btree_node_alloc(struct cache_set *c, struct btree_op *op,
-				     int level, enum btree_id id, bool wait,
-				     struct btree *parent)
+struct btree *bch_btree_node_alloc(struct cache_set *c, struct btree_op *op,
+				   int level, enum btree_id id,
+				   struct btree *parent)
 {
 	BKEY_PADDED(key) k;
-	struct btree *b = ERR_PTR(-EAGAIN);
-	struct closure cl;
+	struct btree *b;
 	enum alloc_reserve reserve = id;
-
-	closure_init_stack(&cl);
 
 	if (op && op->moving_gc && id == BTREE_ID_EXTENTS)
 		reserve = RESERVE_MOVINGGC_BTREE;
 
 retry:
 	if (bch_bucket_alloc_set(c, reserve, &k.key,
-				 c->meta_replicas, 0, wait ? &cl : NULL)) {
-		if (wait) {
-			closure_sync(&cl);
-			goto retry;
-		}
+				 c->meta_replicas, 0, NULL))
 		goto err;
-	}
 
 	SET_KEY_SIZE(&k.key, c->btree_pages * PAGE_SECTORS);
 
 	b = mca_alloc(c, op, &k.key, level, id);
 	if (IS_ERR(b))
-		goto err_free;
+		goto err;
 
 	if (!b) {
 		cache_bug(c,
@@ -1137,19 +1129,9 @@ retry:
 
 	trace_bcache_btree_node_alloc(b);
 	return b;
-err_free:
-	bch_bucket_free(c, &k.key);
 err:
 	trace_bcache_btree_node_alloc_fail(c);
-	return b;
-}
-
-static struct btree *bch_btree_node_alloc(struct cache_set *c,
-					  struct btree_op *op,
-					  int level, enum btree_id id,
-					  struct btree *parent)
-{
-	return __bch_btree_node_alloc(c, op, level, id, op != NULL, parent);
+	return NULL;
 }
 
 static struct btree *btree_node_alloc_replacement(struct btree *b,
@@ -1157,7 +1139,7 @@ static struct btree *btree_node_alloc_replacement(struct btree *b,
 {
 	struct btree *n = bch_btree_node_alloc(b->c, op, b->level, b->btree_id,
 					       b->parent);
-	if (!IS_ERR_OR_NULL(n)) {
+	if (n) {
 		mutex_lock(&n->write_lock);
 		bch_btree_sort_into(&b->keys, &n->keys, &b->c->sort);
 		bkey_copy_key(&n->key, &b->key);
@@ -1167,14 +1149,12 @@ static struct btree *btree_node_alloc_replacement(struct btree *b,
 	return n;
 }
 
-static int btree_check_reserve(struct btree *b, struct btree_op *op)
+int __btree_check_reserve(struct cache_set *c, struct btree_op *op,
+			  enum btree_id id, unsigned required)
 {
-	struct cache_set *c = b->c;
 	struct cache *ca;
-	enum btree_id id = b->btree_id;
 	unsigned i;
-	unsigned required = (c->btree_roots[id]->level - b->level) * 2 + 1;
-	enum alloc_reserve reserve = b->btree_id;
+	enum alloc_reserve reserve = id;
 
 	/*
 	 * free_inc.size buckets in btree node reserve are set aside for
@@ -1205,7 +1185,15 @@ static int btree_check_reserve(struct btree *b, struct btree_op *op)
 
 	mutex_unlock(&c->bucket_lock);
 
-	return mca_cannibalize_lock(b->c, op);
+	return mca_cannibalize_lock(c, op);
+}
+
+static int btree_check_reserve(struct btree *b, struct btree_op *op)
+{
+	enum btree_id id = b->btree_id;
+	unsigned required = (b->c->btree_roots[id]->level - b->level) * 2 + 1;
+
+	return __btree_check_reserve(b->c, op, id, required);
 }
 
 /* Garbage collection */
@@ -1348,7 +1336,7 @@ static int btree_gc_coalesce(struct btree *b, struct btree_op *op,
 
 	for (i = 0; i < nodes; i++) {
 		new_nodes[i] = btree_node_alloc_replacement(r[i].b, NULL);
-		if (IS_ERR_OR_NULL(new_nodes[i]))
+		if (!new_nodes[i])
 			goto out_nocoalesce;
 	}
 
@@ -1495,6 +1483,7 @@ static int btree_gc_rewrite_node(struct btree *b, struct btree_op *op,
 		return 0;
 
 	n = btree_node_alloc_replacement(replace, NULL);
+	BUG_ON(!n);
 
 	/* recheck reserve after allocating replacement node */
 	if (btree_check_reserve(b, NULL)) {
