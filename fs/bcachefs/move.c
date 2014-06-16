@@ -19,6 +19,11 @@ static void moving_init(struct moving_io *io)
 	bio->bi_iter.bi_size	= KEY_SIZE(&io->w->key) << 9;
 	bio->bi_private		= &io->cl;
 	bch_bio_map(bio, NULL);
+
+	if (io->stats) {
+		io->stats->keys_moved++;
+		io->stats->sectors_moved += KEY_SIZE(&io->w->key);
+	}
 }
 
 static void moving_io_destructor(struct closure *cl)
