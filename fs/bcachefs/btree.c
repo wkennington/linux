@@ -1471,6 +1471,8 @@ static int btree_gc_coalesce(struct btree *b, struct btree_op *op,
 	return -EINTR;
 
 out_nocoalesce:
+	/* We may have written out some new nodes which are garbage now,
+	 * wait for writes to finish */
 	closure_sync(&cl);
 	bch_keylist_free(&keylist);
 
@@ -1482,6 +1484,9 @@ out_nocoalesce:
 	return 0;
 }
 
+/**
+ * btree_gc_rewrite_node - merge node bsets together and update parent
+ */
 static int btree_gc_rewrite_node(struct btree *b, struct btree_op *op,
 				 struct btree *replace)
 {
@@ -1516,6 +1521,9 @@ static int btree_gc_rewrite_node(struct btree *b, struct btree_op *op,
 	return -EINTR;
 }
 
+/**
+ * btree_gc_count_keys - count keys in a btree node to see if we must coalesce
+ */
 static unsigned btree_gc_count_keys(struct btree *b)
 {
 	struct bkey *k;
@@ -1528,6 +1536,13 @@ static unsigned btree_gc_count_keys(struct btree *b)
 	return ret;
 }
 
+/**
+ * btree_gc_recurse - tracing garbage collection on a node and children
+ *
+ * This may bail out early for a variety of reasons. This is allowed
+ * because concurrent writes will conservatively mark buckets dirty,
+ * ensuring they won't be touched until the next GC pass.
+ */
 static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 			    struct gc_stat *gc)
 {
@@ -1535,6 +1550,8 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 	bool should_rewrite;
 	struct bkey *k;
 	struct btree_iter iter;
+
+	/* Sliding window of GC_MERGE_NODES adjacent btree nodes */
 	struct gc_merge_info r[GC_MERGE_NODES];
 	struct gc_merge_info *i, *last = r + ARRAY_SIZE(r) - 1;
 	struct bkey tmp = NEXT_KEY(&b->c->gc_cur_key);
@@ -1550,12 +1567,14 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 			r->b = bch_btree_node_get(b->c, op, k, b->level - 1,
 						  true, b);
 			if (IS_ERR(r->b)) {
+				/* XXX: handle IO error better */
 				ret = PTR_ERR(r->b);
 				break;
 			}
 
 			r->keys = btree_gc_count_keys(r->b);
 
+			/* See if we should coalesce */
 			ret = btree_gc_coalesce(b, op, gc, r);
 			if (ret)
 				break;
@@ -1707,6 +1726,14 @@ static void bch_btree_gc_finish(struct cache_set *c)
 	mutex_unlock(&c->bucket_lock);
 }
 
+/**
+ * bch_btree_gc - find reclaimable buckets and clean up the btree
+ *
+ * This will find buckets that are completely unreachable, as well as those
+ * only containing clean data that can be safely discarded. Also, nodes that
+ * contain too many bsets are merged up and re-written, and adjacent nodes
+ * with low occupancy are coalesced together.
+ */
 static void bch_btree_gc(struct cache_set *c)
 {
 	struct gc_stat stats;
@@ -2418,7 +2445,10 @@ int bch_btree_insert_node_sync(struct btree *b, struct btree_op *op,
 /**
  * bch_btree_insert_check_key - insert dummy key into btree
  *
- * Used to address a race with cache promotion after cache miss.
+ * We insert a random key on a cache miss, then compare exchange on it
+ * once the cache promotion or backing device read completes. This
+ * ensures that if this key is written to after the read, the read will
+ * lose and not overwrite the key with stale data.
  *
  * Return values:
  * -EAGAIN: @cl was put on a waitlist waiting for btree node allocation
