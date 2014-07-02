@@ -336,7 +336,7 @@ static void bch_btree_node_read(struct btree *b)
 	bio->bio.bi_private		= &cl;
 	bch_bio_map(&bio->bio, b->keys.set[0].data);
 
-	bch_submit_bbio(bio, b->c, &b->key, ptr);
+	bch_submit_bbio(bio, b->c, &b->key, ptr, true);
 
 	closure_sync(&cl);
 
