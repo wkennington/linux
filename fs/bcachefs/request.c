@@ -442,8 +442,10 @@ void bch_data_insert(struct closure *cl)
 		bch_mark_discard(c, bio_sectors(op->bio));
 
 	if (atomic_sub_return(bio_sectors(op->bio),
-			      &c->sectors_until_gc) < 0)
-		wake_up_gc(c);
+			      &c->sectors_until_gc) < 0) {
+		set_gc_sectors(c);
+		wake_up_gc(c, true);
+	}
 
 	SET_KEY_OFFSET(&op->insert_key, bio_end_sector(op->bio));
 	SET_KEY_SIZE(&op->insert_key, bio_sectors(op->bio));

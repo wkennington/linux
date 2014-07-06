@@ -706,6 +706,9 @@ struct cache_set {
 	/* GARBAGE COLLECTION */
 	struct task_struct	*gc_thread;
 	wait_queue_head_t	gc_wait;
+	atomic_t		gc_waiters;
+
+	struct gc_stat		gc_stats;
 
 	/* Counts how many sectors bch_data_insert has added to the cache */
 	atomic_t		sectors_until_gc;
@@ -725,18 +728,10 @@ struct cache_set {
 	int			gc_mark_valid;
 
 	/*
-	 * Protects gc_count and gc_wait.
-	 */
-	spinlock_t		gc_lock;
-
-	/*
 	 * Number of GC iterations completed. To wait for the next GC to finish,
-	 * add yourself to gc_wait and wait for this to change. Protected by
-	 * gc_lock.
+	 * add yourself to gc_wait and wait for this to change.
 	 */
-	unsigned		gc_count;
-
-	struct gc_stat		gc_stats;
+	atomic_t		gc_count;
 
 	/* TIERING */
 	struct task_struct	*tiering_thread;
