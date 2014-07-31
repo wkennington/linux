@@ -186,6 +186,7 @@
 #include <linux/rbtree.h>
 #include <linux/rhashtable.h>
 #include <linux/rwsem.h>
+#include <linux/seqlock.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -481,6 +482,16 @@ struct open_bucket {
 	BKEY_PADDED(key);
 };
 
+struct bucket_stats {
+	atomic_t		buckets_dirty;
+	atomic_t		buckets_cached;
+	atomic_t		buckets_meta;
+	atomic_t		buckets_alloc;
+
+	atomic64_t		sectors_dirty;
+	atomic64_t		sectors_cached;
+};
+
 struct cache {
 	struct cache_set	*set;
 	/* Cache tier is protected by bucket_lock */
@@ -536,11 +547,11 @@ struct cache {
 	u16			min_prio[2];
 
 	/*
-	 * Count of currently available buckets.
-	 *
-	 * Protected by bucket_lock.
+	 * Bucket book keeping. The first element is updated by GC, the
+	 * second contains a saved copy of the stats from the beginning
+	 * of GC.
 	 */
-	size_t			buckets_free;
+	struct bucket_stats	bucket_stats[2];
 
 	struct mutex		heap_lock;
 	DECLARE_HEAP(struct bucket *, heap);
@@ -725,10 +736,14 @@ struct cache_set {
 	atomic_t		sectors_until_gc;
 
 	/*
-	 * Where in the btree gc currently is.
+	 * Where in the btree GC currently is.
 	 *
-	 * Only accessed from the GC thread, so no lock.
+	 * All keys strictly smaller than gc_cur_key have been visited.
+	 *
+	 * Protected by gc_cur_lock. Only written to by GC thread, so GC thread
+	 * can read without a lock.
 	 */
+	seqlock_t		gc_cur_lock;
 	enum btree_id		gc_cur_btree;
 	struct bkey		gc_cur_key;
 
