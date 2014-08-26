@@ -837,10 +837,8 @@ int bch_cached_dev_attach(struct cached_dev *dc, struct cache_set *c)
 		return -EINVAL;
 	}
 
-	if (!test_bit(CACHE_SET_RUNNING, &c->flags)) {
-		pr_err("Can't attach %s: not running", buf);
-		return -EINVAL;
-	}
+	if (!test_bit(CACHE_SET_RUNNING, &c->flags))
+		return 0;
 
 	if (test_bit(CACHE_SET_STOPPING, &c->flags)) {
 		pr_err("Can't attach %s: shutting down", buf);
@@ -1663,9 +1661,6 @@ static const char *run_cache_set(struct cache_set *c)
 	c->sb.last_mount = get_seconds();
 	bcache_write_super(c);
 
-	list_for_each_entry_safe(dc, t, &uncached_devices, list)
-		bch_cached_dev_attach(dc, c);
-
 	flash_devs_run(c);
 
 	bch_debug_init_cache_set(c);
@@ -1675,6 +1670,8 @@ static const char *run_cache_set(struct cache_set *c)
 		goto err;
 
 	set_bit(CACHE_SET_RUNNING, &c->flags);
+	list_for_each_entry_safe(dc, t, &uncached_devices, list)
+		bch_cached_dev_attach(dc, c);
 
 	closure_put(&c->caching);
 
