@@ -2393,7 +2393,8 @@ err_put:
 err:
 	free_super(&sb);
 
-	pr_err("Unable to add device: %s", err);
+	if (ret)
+		pr_err("Unable to add device: %s", err);
 	return ret;
 }
 
