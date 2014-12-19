@@ -504,6 +504,10 @@ struct cache_set {
 
 	struct gc_stat		gc_stats;
 
+	/* This is a list of scan_keylists for btree GC to scan */
+	struct list_head	gc_scan_keylists;
+	struct mutex		gc_scan_keylist_lock;
+
 	/* Counts how many sectors bch_data_insert has added to the cache */
 	atomic64_t		sectors_until_gc;
 
