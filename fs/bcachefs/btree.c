@@ -58,7 +58,7 @@ const char *bch_btree_id_names[BTREE_ID_NR] = {
 static int bch_btree_iter_traverse(struct btree_iter *);
 static int __bch_btree_insert_node(struct btree *, struct btree_iter *,
 				   struct keylist *, struct bch_replace_info *,
-				   struct closure *, unsigned,
+				   struct closure *, u64 *, unsigned,
 				   struct keylist *, struct closure *);
 
 static inline void mark_btree_node_intent_locked(struct btree_iter *iter,
@@ -1497,7 +1497,7 @@ static void bch_btree_set_root(struct btree *b)
 		if (res.ref) {
 			closure_init_stack(&cl);
 			bch_journal_set_dirty(c);
-			bch_journal_res_put(c, &res, &cl);
+			bch_journal_res_put(c, &res, &cl, NULL);
 			closure_sync(&cl);
 		}
 
@@ -1765,7 +1765,7 @@ int bch_btree_node_rewrite(struct btree *b, struct btree_iter *iter, bool wait)
 	if (parent) {
 		ret = bch_btree_insert_node(parent, iter,
 					    &keylist_single(&n->key),
-					    NULL, NULL, 0);
+					    NULL, NULL, NULL, 0);
 		BUG_ON(ret);
 	} else {
 		bch_btree_set_root(n);
@@ -1952,6 +1952,7 @@ bch_btree_insert_keys(struct btree *b,
 		      struct keylist *insert_keys,
 		      struct bch_replace_info *replace,
 		      struct closure *persistent,
+		      u64 *journal_seq,
 		      unsigned flags)
 {
 	bool done = false, inserted = false, need_split = false;
@@ -2017,7 +2018,7 @@ bch_btree_insert_keys(struct btree *b,
 		if (res.ref)
 			bch_journal_res_put(iter->c, &res,
 					    bch_keylist_empty(insert_keys)
-					    ? persistent : NULL);
+					    ? persistent : NULL, journal_seq);
 	}
 
 	if (inserted && b->written) {
@@ -2168,12 +2169,12 @@ static int btree_split(struct btree *b,
 		if (b->level) {
 			btree_iter_node_set(iter, n1);
 			status = bch_btree_insert_keys(n1, iter, insert_keys,
-						       replace, persistent, 0);
+						       replace, NULL, NULL, 0);
 			BUG_ON(status == BTREE_INSERT_NEED_SPLIT);
 
 			btree_iter_node_set(iter, n2);
 			status = bch_btree_insert_keys(n2, iter, insert_keys,
-						       replace, persistent, 0);
+						       replace, NULL, NULL, 0);
 			BUG_ON(status == BTREE_INSERT_NEED_SPLIT);
 			BUG_ON(!bch_keylist_empty(insert_keys));
 			iter->nodes[b->level] = b; /* still have b locked */
@@ -2205,7 +2206,7 @@ static int btree_split(struct btree *b,
 		if (b->level) {
 			btree_iter_node_set(iter, n1);
 			status = bch_btree_insert_keys(n1, iter, insert_keys,
-						       replace, persistent, 0);
+						       replace, NULL, NULL, 0);
 			BUG_ON(status != BTREE_INSERT_INSERTED);
 			BUG_ON(!bch_keylist_empty(insert_keys));
 			iter->nodes[b->level] = b; /* still have b locked */
@@ -2223,7 +2224,8 @@ static int btree_split(struct btree *b,
 		/* once for bch_btree_insert_keys(): */
 		btree_iter_node_set(iter, n3);
 
-		bch_btree_insert_keys(n3, iter, parent_keys, NULL, NULL, 0);
+		bch_btree_insert_keys(n3, iter, parent_keys,
+				      NULL, NULL, NULL, 0);
 		bch_btree_node_write(n3, stack_cl, NULL);
 
 		/*
@@ -2249,7 +2251,7 @@ static int btree_split(struct btree *b,
 		closure_sync(stack_cl);
 
 		ret = __bch_btree_insert_node(parent, iter, parent_keys,
-					      NULL, NULL, 0,
+					      NULL, NULL, NULL, 0,
 					      parent_keys, stack_cl);
 		BUG_ON(ret || !bch_keylist_empty(parent_keys));
 	}
@@ -2280,6 +2282,7 @@ static int __bch_btree_insert_node(struct btree *b,
 				   struct keylist *insert_keys,
 				   struct bch_replace_info *replace,
 				   struct closure *persistent,
+				   u64 *journal_seq,
 				   unsigned flags,
 				   struct keylist *split_keys,
 				   struct closure *stack_cl)
@@ -2291,7 +2294,8 @@ static int __bch_btree_insert_node(struct btree *b,
 	BUG_ON(b->level && replace);
 	BUG_ON(!b->written);
 
-	if (bch_btree_insert_keys(b, iter, insert_keys, replace, persistent,
+	if (bch_btree_insert_keys(b, iter, insert_keys, replace,
+				  persistent, journal_seq,
 				  flags) == BTREE_INSERT_NEED_SPLIT) {
 		if (!b->level) {
 			iter->locks_want = BTREE_MAX_DEPTH;
@@ -2324,6 +2328,7 @@ int bch_btree_insert_node(struct btree *b,
 			  struct keylist *insert_keys,
 			  struct bch_replace_info *replace,
 			  struct closure *persistent,
+			  u64 *journal_seq,
 			  unsigned flags)
 {
 	struct closure stack_cl;
@@ -2336,7 +2341,7 @@ int bch_btree_insert_node(struct btree *b,
 		flags |= FAIL_IF_STALE;
 
 	return __bch_btree_insert_node(b, iter, insert_keys, replace,
-				       persistent, flags,
+				       persistent, journal_seq, flags,
 				       &split_keys, &stack_cl);
 }
 
@@ -2377,6 +2382,7 @@ int bch_btree_insert_at(struct btree_iter *iter,
 			struct keylist *insert_keys,
 			struct bch_replace_info *replace,
 			struct closure *persistent,
+			u64 *journal_seq,
 			unsigned flags)
 {
 	int ret = -EINTR;
@@ -2392,7 +2398,8 @@ int bch_btree_insert_at(struct btree_iter *iter,
 
 	while (1) {
 		ret = bch_btree_insert_node(iter->nodes[0], iter, insert_keys,
-					    replace, persistent, flags);
+					    replace, persistent,
+					    journal_seq, flags);
 traverse:
 		if (ret == -EAGAIN)
 			bch_btree_iter_unlock(iter);
@@ -2448,7 +2455,7 @@ int bch_btree_insert_check_key(struct btree_iter *iter,
 			      bkey_start_pos(&check_key->k));
 
 	return bch_btree_insert_at(iter, &keylist_single(&tmp.key), NULL,
-				   NULL, BTREE_INSERT_ATOMIC);
+				   NULL, NULL, BTREE_INSERT_ATOMIC);
 }
 
 /**
@@ -2460,7 +2467,7 @@ int bch_btree_insert_check_key(struct btree_iter *iter,
  */
 int bch_btree_insert(struct cache_set *c, enum btree_id id,
 		     struct keylist *keys, struct bch_replace_info *replace,
-		     struct closure *persistent)
+		     struct closure *persistent, u64 *journal_seq)
 {
 	struct btree_iter iter;
 	int ret, ret2;
@@ -2472,7 +2479,8 @@ int bch_btree_insert(struct cache_set *c, enum btree_id id,
 	if (unlikely(ret))
 		goto out;
 
-	ret = bch_btree_insert_at(&iter, keys, replace, persistent, 0);
+	ret = bch_btree_insert_at(&iter, keys, replace,
+				  persistent, journal_seq, 0);
 out:	ret2 = bch_btree_iter_unlock(&iter);
 
 	return ret ?: ret2;
