@@ -1506,7 +1506,7 @@ static void bch_btree_set_root(struct btree *b)
 		if (res.ref) {
 			closure_init_stack(&cl);
 			bch_journal_set_dirty(c);
-			bch_journal_res_put(c, &res, &cl, NULL);
+			bch_journal_res_put(c, &res, &cl);
 			closure_sync(&cl);
 		}
 
@@ -1850,10 +1850,10 @@ void bch_btree_insert_and_journal(struct btree *b,
 		}
 	}
 
-	if (res->ref)
-		btree_bset_last(b)->journal_seq =
-			bch_journal_add_keys(c, res, b->btree_id,
-					     insert, b->level);
+	if (res->ref) {
+		bch_journal_add_keys(c, res, b->btree_id, insert, b->level);
+		btree_bset_last(b)->journal_seq = c->journal.seq;
+	}
 }
 
 /**
@@ -2030,8 +2030,11 @@ bch_btree_insert_keys(struct btree *b,
 				break;
 
 			if (btree_insert_key(iter, b, insert_keys,
-					     replace, &res, flags))
+					     replace, &res, flags)) {
 				inserted = true;
+				if (journal_seq)
+					*journal_seq = iter->c->journal.seq;
+			}
 		}
 
 		six_unlock_write(&b->lock);
@@ -2039,7 +2042,7 @@ bch_btree_insert_keys(struct btree *b,
 		if (res.ref)
 			bch_journal_res_put(iter->c, &res,
 					    bch_keylist_empty(insert_keys)
-					    ? persistent : NULL, journal_seq);
+					    ? persistent : NULL);
 	}
 
 	if (inserted && b->written) {
@@ -2217,9 +2220,9 @@ static int btree_split(struct btree *b,
 		 * old node, but not the node we just created, mark it:
 		 */
 		six_lock_write(&b->lock);
-		if (gc_will_visit_node(b->c, n2) &&
-		    !gc_will_visit_node(b->c, n1))
-			btree_gc_mark_node(b->c, n1, NULL);
+		if (gc_will_visit_node(iter->c, n2) &&
+		    !gc_will_visit_node(iter->c, n1))
+			btree_gc_mark_node(iter->c, n1, NULL);
 		six_unlock_write(&b->lock);
 	} else {
 		trace_bcache_btree_node_compact(b, set1->u64s);
