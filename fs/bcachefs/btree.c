@@ -782,7 +782,7 @@ void bch_btree_push_journal_seq(struct cache_set *c, struct btree *b,
 		u64 seq = b->keys.set[i].data->journal_seq;
 
 		if (seq) {
-			bch_journal_push_seq(c, seq, cl);
+			bch_journal_push_seq(&c->journal, seq, cl);
 			break;
 		}
 	}
@@ -1476,7 +1476,6 @@ void btree_node_free(struct cache_set *c, struct btree *b)
 static void bch_btree_set_root(struct cache_set *c, struct btree *b)
 {
 	struct journal_res res;
-	struct closure cl;
 	struct btree *old;
 
 	memset(&res, 0, sizeof(res));
@@ -1486,9 +1485,10 @@ static void bch_btree_set_root(struct cache_set *c, struct btree *b)
 
 	old = btree_node_root(b);
 	if (old) {
-		unsigned u64s = jset_u64s(0);
-
-		bch_journal_res_get(c, &res, u64s, u64s);
+		/*
+		 * Ensure no one is using the old root while we switch to the
+		 * new root:
+		 */
 		six_lock_write(&old->lock);
 	}
 
@@ -1504,14 +1504,25 @@ static void bch_btree_set_root(struct cache_set *c, struct btree *b)
 	bch_recalc_btree_reserve(c);
 
 	if (old) {
-		if (res.ref) {
-			closure_init_stack(&cl);
-			bch_journal_set_dirty(c);
-			bch_journal_res_put(c, &res, &cl);
-			closure_sync(&cl);
-		}
+		struct closure cl;
 
+		closure_init_stack(&cl);
+
+		/*
+		 * Unlock old root after new root is visible:
+		 *
+		 * The new root isn't persistent, but that's ok: we still have
+		 * an intent lock on the new root, and any updates that would
+		 * depend on the new root would have to update the new root.
+		 */
 		six_unlock_write(&old->lock);
+
+		/*
+		 * Ensure new btree root is persistent (reachable via the
+		 * journal) before returning and the caller unlocking it:
+		 */
+		bch_journal_meta(&c->journal, &cl);
+		closure_sync(&cl);
 	}
 }
 
@@ -1854,7 +1865,8 @@ void bch_btree_insert_and_journal(struct cache_set *c, struct btree *b,
 	}
 
 	if (res->ref) {
-		bch_journal_add_keys(c, res, b->btree_id, insert, b->level);
+		bch_journal_add_keys(&c->journal, res, b->btree_id,
+				     insert, b->level);
 		btree_bset_last(b)->journal_seq = c->journal.seq;
 	}
 }
@@ -2000,7 +2012,7 @@ bch_btree_insert_keys(struct btree *b,
 
 		if (!b->level &&
 		    test_bit(JOURNAL_REPLAY_DONE, &iter->c->journal.flags))
-			bch_journal_res_get(iter->c, &res,
+			bch_journal_res_get(&iter->c->journal, &res,
 					    actual_min, actual_max);
 
 		six_lock_write(&b->lock);
@@ -2040,7 +2052,7 @@ bch_btree_insert_keys(struct btree *b,
 		six_unlock_write(&b->lock);
 
 		if (res.ref)
-			bch_journal_res_put(iter->c, &res, NULL);
+			bch_journal_res_put(&iter->c->journal, &res);
 	}
 
 	if (inserted && b->written) {
@@ -2515,7 +2527,7 @@ int bch_btree_insert(struct cache_set *c, enum btree_id id,
 out:	ret2 = bch_btree_iter_unlock(&iter);
 
 	if (persistent)
-		bch_journal_push_seq(c, *journal_seq, persistent);
+		bch_journal_push_seq(&c->journal, *journal_seq, persistent);
 
 	return ret ?: ret2;
 }
@@ -2551,7 +2563,7 @@ int bch_btree_update(struct cache_set *c, enum btree_id id, struct bkey_i *k,
 out:	ret2 = bch_btree_iter_unlock(&iter);
 
 	if (persistent)
-		bch_journal_push_seq(c, *journal_seq, persistent);
+		bch_journal_push_seq(&c->journal, *journal_seq, persistent);
 
 	return ret ?: ret2;
 }
