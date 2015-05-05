@@ -1581,7 +1581,7 @@ static void raid1_make_request(struct mddev *mddev, struct bio *bio)
 		sectors = align_to_barrier_unit_end(
 				bio->bi_iter.bi_sector, bio_sectors(bio));
 		if (sectors < bio_sectors(bio)) {
-			split = bio_split(bio, sectors, GFP_NOIO, fs_bio_set);
+			split = bio_split(bio, sectors, GFP_NOIO, &fs_bio_set);
 			bio_chain(split, bio);
 		} else {
 			split = bio;

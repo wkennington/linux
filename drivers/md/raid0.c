@@ -482,7 +482,7 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
 		sector = bio_sector;
 
 		if (sectors < bio_sectors(bio)) {
-			split = bio_split(bio, sectors, GFP_NOIO, fs_bio_set);
+			split = bio_split(bio, sectors, GFP_NOIO, &fs_bio_set);
 			bio_chain(split, bio);
 		} else {
 			split = bio;
