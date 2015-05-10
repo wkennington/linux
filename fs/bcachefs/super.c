@@ -350,7 +350,7 @@ static void uuid_io(struct cache_set *c, int op, struct bkey *k,
 	down(&c->uuid_write_mutex);
 	closure_init(cl, parent);
 
-	for (i = 0; i < KEY_PTRS(k); i++) {
+	for (i = 0; i < bch_extent_ptrs(k); i++) {
 		struct bio *bio = bch_bbio_alloc(c);
 
 		bio->bi_iter.bi_size = KEY_SIZE(k) << 9;
@@ -1512,6 +1512,7 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 	init_waitqueue_head(&c->bucket_wait);
 	init_waitqueue_head(&c->gc_wait);
 	sema_init(&c->uuid_write_mutex, 1);
+	bkey_init(&c->uuid_bucket);
 
 	spin_lock_init(&c->btree_gc_time.lock);
 	spin_lock_init(&c->btree_split_time.lock);
