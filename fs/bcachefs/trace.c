@@ -1,5 +1,6 @@
 #include "bcachefs.h"
 #include "btree.h"
+#include "buckets.h"
 
 #include <linux/blktrace_api.h>
 
