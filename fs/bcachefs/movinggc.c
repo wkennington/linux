@@ -7,6 +7,7 @@
 #include "bcachefs.h"
 #include "btree.h"
 #include "debug.h"
+#include "keybuf.h"
 #include "request.h"
 
 #include <trace/events/bcachefs.h>
