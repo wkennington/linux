@@ -9,6 +9,7 @@
 #include "bcachefs.h"
 #include "btree.h"
 #include "debug.h"
+#include "keybuf.h"
 #include "writeback.h"
 
 #include <linux/delay.h>
