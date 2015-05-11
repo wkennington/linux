@@ -77,7 +77,6 @@ rw_attribute(cache_mode);
 rw_attribute(writeback_metadata);
 rw_attribute(writeback_running);
 rw_attribute(writeback_percent);
-rw_attribute(writeback_delay);
 rw_attribute(writeback_rate);
 
 rw_attribute(writeback_rate_update_seconds);
@@ -97,6 +96,7 @@ rw_attribute(readahead);
 rw_attribute(errors);
 rw_attribute(io_error_limit);
 rw_attribute(io_error_halflife);
+rw_attribute(btree_scan_ratelimit);
 rw_attribute(verify);
 rw_attribute(bypass_torture_test);
 rw_attribute(key_merging_disabled);
@@ -125,7 +125,6 @@ SHOW(__bch_cached_dev)
 	var_printf(bypass_torture_test,	"%i");
 	var_printf(writeback_metadata,	"%i");
 	var_printf(writeback_running,	"%i");
-	var_print(writeback_delay);
 	var_print(writeback_percent);
 	sysfs_hprint(writeback_rate,	dc->writeback_rate.rate << 9);
 
@@ -205,8 +204,6 @@ STORE(__cached_dev)
 	d_strtoul(bypass_torture_test);
 	d_strtoul(writeback_metadata);
 	d_strtoul(writeback_running);
-	d_strtoul(writeback_delay);
-
 	sysfs_strtoul_clamp(writeback_percent, dc->writeback_percent, 0, 40);
 
 	sysfs_strtoul_clamp(writeback_rate,
@@ -315,7 +312,6 @@ static struct attribute *bch_cached_dev_files[] = {
 	&sysfs_cache_mode,
 	&sysfs_writeback_metadata,
 	&sysfs_writeback_running,
-	&sysfs_writeback_delay,
 	&sysfs_writeback_percent,
 	&sysfs_writeback_rate,
 	&sysfs_writeback_rate_update_seconds,
@@ -571,6 +567,8 @@ SHOW(__bch_cache_set)
 	sysfs_printf(btree_shrinker_disabled,	"%i", c->shrinker_disabled);
 	sysfs_printf(copy_gc_enabled,		"%i", c->copy_gc_enabled);
 
+	sysfs_print(btree_scan_ratelimit,	c->btree_scan_ratelimit);
+
 	if (attr == &sysfs_bset_tree_stats)
 		return bch_bset_print_stats(c, buf);
 
@@ -653,6 +651,7 @@ STORE(__bch_cache_set)
 	sysfs_strtoul(gc_always_rewrite,	c->gc_always_rewrite);
 	sysfs_strtoul(btree_shrinker_disabled,	c->shrinker_disabled);
 	sysfs_strtoul(copy_gc_enabled,		c->copy_gc_enabled);
+	sysfs_strtoul(btree_scan_ratelimit,	c->btree_scan_ratelimit);
 
 	return size;
 }
