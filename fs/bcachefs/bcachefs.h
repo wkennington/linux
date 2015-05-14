@@ -350,15 +350,6 @@ struct cache {
 	atomic_long_t		sectors_written;
 };
 
-struct gc_stat {
-	u64			nodes;
-	u64			key_bytes;
-	u64			nkeys;
-
-	u64			data;	/* sectors */
-	u64			inodes;
-};
-
 /*
  * Flag bits for what phase of startup/shutdown the cache set is at, how we're
  * shutting down, etc.:
@@ -541,8 +532,6 @@ struct cache_set {
 
 	/* GARBAGE COLLECTION */
 	struct task_struct	*gc_thread;
-
-	struct gc_stat		gc_stats;
 
 	/* This is a list of scan_keylists for btree GC to scan */
 	struct list_head	gc_scan_keylists;
