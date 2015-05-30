@@ -919,14 +919,18 @@ void bch_recalc_btree_reserve(struct cache_set *c)
 #define mca_can_free(c)						\
 	max_t(int, 0, c->btree_cache_used - c->btree_cache_reserve)
 
-static void mca_data_free(struct cache_set *c, struct btree *b)
+static void __mca_data_free(struct btree *b)
 {
 	BUG_ON(b->io_mutex.count != 1);
 
 	free_pages((unsigned long) b->data, b->keys.page_order);
 	b->data = NULL;
 	bch_btree_keys_free(&b->keys);
+}
 
+static void mca_data_free(struct cache_set *c, struct btree *b)
+{
+	__mca_data_free(b);
 	c->btree_cache_used--;
 	list_move(&b->list, &c->btree_cache_freed);
 }
@@ -937,22 +941,6 @@ static const struct rhashtable_params bch_btree_cache_params = {
 	.key_len	= sizeof(struct bch_extent_ptr),
 	.hashfn		= jhash,
 };
-
-static void mca_bucket_free(struct cache_set *c, struct btree *b)
-{
-	BUG_ON(btree_node_dirty(b));
-	BUG_ON(!list_empty_careful(&b->journal_seq_blacklisted));
-
-	b->keys.nsets = 0;
-	b->keys.set[0].data = NULL;
-
-	rhashtable_remove_fast(&c->btree_cache_table, &b->hash,
-			       bch_btree_cache_params);
-
-	/* Cause future lookups for this node to fail: */
-	bkey_i_to_extent(&b->key)->v.ptr[0]._val = 0;
-	list_move(&b->list, &c->btree_cache_freeable);
-}
 
 static void mca_data_alloc(struct cache_set *c, struct btree *b, gfp_t gfp)
 {
@@ -990,6 +978,56 @@ static struct btree *mca_bucket_alloc(struct cache_set *c, gfp_t gfp)
 
 	mca_data_alloc(c, b, gfp);
 	return b->data ? b : NULL;
+}
+
+/* Btree in memory cache - hash table */
+
+#define PTR_HASH(_k)	(bkey_i_to_extent_c(_k)->v.ptr[0]._val)
+
+static void mca_hash_remove(struct cache_set *c, struct btree *b)
+{
+	BUG_ON(btree_node_dirty(b));
+	BUG_ON(!list_empty_careful(&b->journal_seq_blacklisted));
+
+	b->keys.nsets = 0;
+	b->keys.set[0].data = NULL;
+
+	rhashtable_remove_fast(&c->btree_cache_table, &b->hash,
+			       bch_btree_cache_params);
+
+	/* Cause future lookups for this node to fail: */
+	bkey_i_to_extent(&b->key)->v.ptr[0]._val = 0;
+}
+
+static int mca_hash_insert(struct cache_set *c, struct btree *b,
+			   unsigned level, enum btree_id id)
+{
+	int ret;
+	b->level	= level;
+	b->btree_id	= id;
+
+	bch_btree_keys_init(&b->keys, b->level
+			    ? &bch_btree_interior_node_ops
+			    : bch_btree_ops[id],
+			    &c->expensive_debug_checks);
+
+	ret = rhashtable_lookup_insert_fast(&c->btree_cache_table, &b->hash,
+					    bch_btree_cache_params);
+	if (ret)
+		return ret;
+
+	mutex_lock(&c->btree_cache_lock);
+	list_add(&b->list, &c->btree_cache);
+	mutex_unlock(&c->btree_cache_lock);
+
+	return 0;
+}
+
+static inline struct btree *mca_find(struct cache_set *c,
+				     const struct bkey_i *k)
+{
+	return rhashtable_lookup_fast(&c->btree_cache_table, &PTR_HASH(k),
+				      bch_btree_cache_params);
 }
 
 /*
@@ -1108,7 +1146,7 @@ static unsigned long bch_mca_scan(struct shrinker *shrink,
 			freed++;
 		}
 	}
-
+restart:
 	list_for_each_entry_safe(b, t, &c->btree_cache, list) {
 		touched++;
 
@@ -1121,17 +1159,32 @@ static unsigned long bch_mca_scan(struct shrinker *shrink,
 
 		if (!b->accessed &&
 		    !mca_reap(c, b, false)) {
-			mca_bucket_free(c, b);
+			/* can't call mca_hash_remove under btree_cache_lock  */
+			freed++;
+			if (&t->list != &c->btree_cache)
+				list_move_tail(&c->btree_cache, &t->list);
+
 			mca_data_free(c, b);
+			mutex_unlock(&c->btree_cache_lock);
+
+			mca_hash_remove(c, b);
 			six_unlock_write(&b->lock);
 			six_unlock_intent(&b->lock);
-			freed++;
+
+			if (freed >= nr)
+				goto out;
+
+			if (sc->gfp_mask & __GFP_IO)
+				mutex_lock(&c->btree_cache_lock);
+			else if (!mutex_trylock(&c->btree_cache_lock))
+				goto out;
+			goto restart;
 		} else
 			b->accessed = 0;
 	}
 
 	mutex_unlock(&c->btree_cache_lock);
-
+out:
 	bch_time_stats_update(&c->mca_scan_time, start_time);
 
 	trace_bcache_mca_scan(c,
@@ -1203,8 +1256,9 @@ void bch_btree_cache_free(struct cache_set *c)
 		kfree(b);
 	}
 
-	rhashtable_destroy(&c->btree_cache_table);
 	mutex_unlock(&c->btree_cache_lock);
+
+	rhashtable_destroy(&c->btree_cache_table);
 }
 
 int bch_btree_cache_alloc(struct cache_set *c)
@@ -1245,32 +1299,6 @@ int bch_btree_cache_alloc(struct cache_set *c)
 	return 0;
 }
 
-/* Btree in memory cache - hash table */
-
-#define PTR_HASH(_k)	(bkey_i_to_extent_c(_k)->v.ptr[0]._val)
-
-static inline struct btree *mca_find(struct cache_set *c,
-				     const struct bkey_i *k)
-{
-	return rhashtable_lookup_fast(&c->btree_cache_table, &PTR_HASH(k),
-				      bch_btree_cache_params);
-}
-
-static void mca_hash_insert(struct cache_set *c, struct btree *b,
-			    unsigned level, enum btree_id id)
-{
-	b->level	= level;
-	b->btree_id	= id;
-
-	bch_btree_keys_init(&b->keys, b->level
-			    ? &bch_btree_interior_node_ops
-			    : bch_btree_ops[id],
-			    &c->expensive_debug_checks);
-
-	BUG_ON(rhashtable_insert_fast(&c->btree_cache_table, &b->hash,
-				      bch_btree_cache_params));
-}
-
 static int mca_cannibalize_lock(struct cache_set *c, struct closure *cl)
 {
 	struct task_struct *old;
@@ -1302,25 +1330,18 @@ success:
 	return 0;
 }
 
-static struct btree *mca_cannibalize(struct cache_set *c, struct closure *cl)
+static struct btree *mca_cannibalize(struct cache_set *c)
 {
 	struct btree *b;
-	int ret;
 
-	ret = mca_cannibalize_lock(c, cl);
-	if (ret)
-		return ERR_PTR(ret);
+	list_for_each_entry_reverse(b, &c->btree_cache, list)
+		if (!mca_reap(c, b, false))
+			return b;
 
 	while (1) {
-		trace_bcache_mca_cannibalize(c, cl);
-
-		list_for_each_entry_reverse(b, &c->btree_cache, list)
-			if (!mca_reap(c, b, false))
-				goto out;
-
 		list_for_each_entry_reverse(b, &c->btree_cache, list)
 			if (!mca_reap(c, b, true))
-				goto out;
+				return b;
 
 		/*
 		 * Rare case: all nodes were intent-locked.
@@ -1329,9 +1350,6 @@ static struct btree *mca_cannibalize(struct cache_set *c, struct closure *cl)
 		WARN_ONCE(1, "btree cache cannibalize failed\n");
 		cond_resched();
 	}
-out:
-	mca_bucket_free(c, b);
-	return b;
 }
 
 /*
@@ -1349,35 +1367,35 @@ static void mca_cannibalize_unlock(struct cache_set *c)
 	}
 }
 
-static struct btree *mca_alloc(struct cache_set *c, const struct bkey_i *k,
-			       int level, enum btree_id id, struct closure *cl)
+static struct btree *mca_alloc(struct cache_set *c, struct closure *cl)
 {
-	struct btree *b = NULL;
-
+	struct btree *b;
+	int ret;
 	u64 start_time = local_clock();
 
 	mutex_lock(&c->btree_cache_lock);
 
-	if (k && mca_find(c, k))
-		goto out_unlock;
-
-	/* btree_free() doesn't free memory; it sticks the node on the end of
+	/*
+	 * btree_free() doesn't free memory; it sticks the node on the end of
 	 * the list. Check if there's any freed nodes there:
 	 */
 	list_for_each_entry(b, &c->btree_cache_freeable, list)
 		if (!mca_reap_notrace(c, b, false))
-			goto out;
+			goto out_unlock;
 
-	/* We never free struct btree itself, just the memory that holds the on
+	/*
+	 * We never free struct btree itself, just the memory that holds the on
 	 * disk node. Check the freed list before allocating a new one:
 	 */
 	list_for_each_entry(b, &c->btree_cache_freed, list)
 		if (!mca_reap_notrace(c, b, false)) {
 			mca_data_alloc(c, b, __GFP_NOWARN|GFP_NOIO);
-			if (!b->data)
-				goto err;
-			else
-				goto out;
+			if (b->data)
+				goto out_unlock;
+
+			six_unlock_write(&b->lock);
+			six_unlock_intent(&b->lock);
+			goto err;
 		}
 
 	b = mca_bucket_alloc(c, __GFP_NOWARN|GFP_NOIO);
@@ -1386,37 +1404,37 @@ static struct btree *mca_alloc(struct cache_set *c, const struct bkey_i *k,
 
 	BUG_ON(!six_trylock_intent(&b->lock));
 	BUG_ON(!six_trylock_write(&b->lock));
-out:
+out_unlock:
 	BUG_ON(b->key.k.type == BCH_EXTENT && PTR_HASH(&b->key));
 	BUG_ON(b->io_mutex.count != 1);
 
-	list_move(&b->list, &c->btree_cache);
-
+	list_del_init(&b->list);
+	mutex_unlock(&c->btree_cache_lock);
+out:
 	b->flags	= 0;
 	b->written	= 0;
-
-	if (k) {
-		bkey_copy(&b->key, k);
-		mca_hash_insert(c, b, level, id);
-	}
-
-out_unlock:
-	mutex_unlock(&c->btree_cache_lock);
+	b->keys.nsets	= 0;
+	b->keys.set[0].data = NULL;
 
 	bch_time_stats_update(&c->mca_alloc_time, start_time);
 
 	return b;
 err:
-	if (b) {
-		six_unlock_write(&b->lock);
-		six_unlock_intent(&b->lock);
+	/* Try to cannibalize another cached btree node: */
+	ret = mca_cannibalize_lock(c, cl);
+	if (ret) {
+		mutex_unlock(&c->btree_cache_lock);
+		return ERR_PTR(ret);
 	}
 
-	b = mca_cannibalize(c, cl);
-	if (!IS_ERR(b))
-		goto out;
+	b = mca_cannibalize(c);
+	list_del_init(&b->list);
+	mutex_unlock(&c->btree_cache_lock);
 
-	goto out_unlock;
+	mca_hash_remove(c, b);
+
+	trace_bcache_mca_cannibalize(c, cl);
+	goto out;
 }
 
 /* Slowpath, don't want it inlined into btree_iter_traverse() */
@@ -1424,13 +1442,30 @@ static noinline struct btree *bch_btree_node_fill(struct btree_iter *iter,
 						  const struct bkey_i *k,
 						  int level)
 {
+	struct cache_set *c = iter->c;
 	struct btree *b;
 
-	b = mca_alloc(iter->c, k, level, iter->btree_id, &iter->cl);
-	if (IS_ERR_OR_NULL(b))
+	b = mca_alloc(c, &iter->cl);
+	if (IS_ERR(b))
 		return b;
 
-	mca_cannibalize_unlock(iter->c);
+	mca_cannibalize_unlock(c);
+
+	bkey_copy(&b->key, k);
+	if (mca_hash_insert(c, b, level, iter->btree_id)) {
+		/* raced with another fill: */
+
+		/* mark as unhashed... */
+		bkey_i_to_extent(&b->key)->v.ptr[0]._val = 0;
+
+		mutex_lock(&c->btree_cache_lock);
+		list_add(&b->list, &c->btree_cache_freeable);
+		mutex_unlock(&c->btree_cache_lock);
+
+		six_unlock_write(&b->lock);
+		six_unlock_intent(&b->lock);
+		return NULL;
+	}
 
 	/*
 	 * If the btree node wasn't cached, we can't drop our lock on
@@ -1444,7 +1479,7 @@ static noinline struct btree *bch_btree_node_fill(struct btree_iter *iter,
 	if (btree_node_read_locked(iter, level + 1))
 		btree_node_unlock(iter, level + 1);
 
-	bch_btree_node_read(iter->c, b);
+	bch_btree_node_read(c, b);
 	six_unlock_write(&b->lock);
 
 	if (btree_want_intent(iter, level)) {
@@ -1568,8 +1603,10 @@ static void __btree_node_free(struct cache_set *c, struct btree *b)
 		mutex_unlock(&c->journal.blacklist_lock);
 	}
 
+	mca_hash_remove(c, b);
+
 	mutex_lock(&c->btree_cache_lock);
-	mca_bucket_free(c, b);
+	list_move(&b->list, &c->btree_cache_freeable);
 	mutex_unlock(&c->btree_cache_lock);
 }
 
@@ -1702,10 +1739,10 @@ retry:
 		goto retry;
 	}
 
-	b = mca_alloc(c, NULL, 0, 0, NULL);
+	b = mca_alloc(c, NULL);
 
 	/* we hold cannibalize_lock: */
-	BUG_ON(IS_ERR_OR_NULL(b));
+	BUG_ON(IS_ERR(b));
 	BUG_ON(b->ob);
 
 	bkey_copy(&b->key, &tmp.k);
@@ -1725,9 +1762,7 @@ static struct btree *bch_btree_node_alloc(struct cache_set *c,
 
 	b = reserve->b[--reserve->nr];
 
-	mutex_lock(&c->btree_cache_lock);
-	mca_hash_insert(c, b, level, id);
-	mutex_unlock(&c->btree_cache_lock);
+	BUG_ON(mca_hash_insert(c, b, level, id));
 
 	b->accessed = 1;
 	set_btree_node_dirty(b);
@@ -1948,11 +1983,13 @@ int bch_btree_root_read(struct cache_set *c, enum btree_id id,
 
 	closure_init_stack(&cl);
 
-	while (IS_ERR(b = mca_alloc(c, k, level, id, &cl))) {
+	while (IS_ERR(b = mca_alloc(c, &cl))) {
 		BUG_ON(PTR_ERR(b) != -EAGAIN);
 		closure_sync(&cl);
 	}
-	BUG_ON(!b);
+
+	bkey_copy(&b->key, k);
+	BUG_ON(mca_hash_insert(c, b, level, id));
 
 	bch_btree_node_read(c, b);
 	six_unlock_write(&b->lock);
