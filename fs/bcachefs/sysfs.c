@@ -23,13 +23,6 @@
 #include <linux/sort.h>
 #include <linux/sched/clock.h>
 
-static const char * const bch_csum_types[] = {
-	"none",
-	"crc32c",
-	"crc64",
-	NULL
-};
-
 static const char * const cache_replacement_policies[] = {
 	"lru",
 	"fifo",
@@ -44,13 +37,6 @@ static const char * const bch_cache_modes[] = {
 	"writeback",
 	"writearound",
 	"none",
-	NULL
-};
-
-static const char * const error_actions[] = {
-	"continue",
-	"readonly",
-	"panic",
 	NULL
 };
 
@@ -656,7 +642,7 @@ SHOW(bch_cache_set)
 				CACHE_META_PREFERRED_CSUM_TYPE(&c->sb));
 
 	if (attr == &sysfs_errors)
-		return bch_snprint_string_list(buf, PAGE_SIZE, error_actions,
+		return bch_snprint_string_list(buf, PAGE_SIZE, bch_error_actions,
 					       CACHE_ERROR_ACTION(&c->sb));
 
 	/* See count_io_errors for why 88 */
@@ -749,7 +735,7 @@ STORE(__bch_cache_set)
 		      c->congested_write_threshold_us);
 
 	if (attr == &sysfs_errors) {
-		ssize_t v = bch_read_string_list(buf, error_actions);
+		ssize_t v = bch_read_string_list(buf, bch_error_actions);
 
 		if (v < 0)
 			return v;
