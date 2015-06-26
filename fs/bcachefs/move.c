@@ -1,8 +1,7 @@
 
 #include "bcachefs.h"
-#include "btree.h"
+#include "btree_gc.h"
 #include "buckets.h"
-#include "gc.h"
 #include "io.h"
 #include "move.h"
 #include "super.h"

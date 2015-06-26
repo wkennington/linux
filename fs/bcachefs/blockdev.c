@@ -1,7 +1,7 @@
 
 #include "bcachefs.h"
 #include "blockdev.h"
-#include "btree.h"
+#include "btree_iter.h"
 #include "error.h"
 #include "inode.h"
 #include "request.h"
