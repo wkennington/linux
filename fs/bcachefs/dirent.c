@@ -1,6 +1,7 @@
 
 #include "bcachefs.h"
-#include "btree.h"
+#include "bkey_methods.h"
+#include "btree_update.h"
 #include "extents.h"
 #include "dirent.h"
 #include "keylist.h"

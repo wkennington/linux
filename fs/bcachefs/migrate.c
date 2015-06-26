@@ -3,7 +3,7 @@
  */
 
 #include "bcachefs.h"
-#include "btree.h"
+#include "btree_update.h"
 #include "buckets.h"
 #include "extents.h"
 #include "journal.h"

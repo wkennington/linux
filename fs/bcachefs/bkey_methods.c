@@ -1,7 +1,7 @@
 
 #include "bcachefs.h"
 #include "bkey_methods.h"
-#include "btree.h"
+#include "btree_types.h"
 #include "dirent.h"
 #include "error.h"
 #include "extents.h"
