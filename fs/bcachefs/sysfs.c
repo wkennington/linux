@@ -123,7 +123,6 @@ rw_attribute(congested_read_threshold_us);
 rw_attribute(congested_write_threshold_us);
 
 rw_attribute(sequential_cutoff);
-rw_attribute(data_csum);
 rw_attribute(cache_mode);
 rw_attribute(writeback_metadata);
 rw_attribute(writeback_running);
@@ -194,7 +193,6 @@ SHOW(bch_cached_dev)
 					       bch_cache_modes + 1,
 					       BDEV_CACHE_MODE(&dc->sb));
 
-	sysfs_printf(data_csum,		"%i", dc->disk.data_csum);
 	var_printf(verify,		"%i");
 	var_printf(bypass_torture_test,	"%i");
 	var_printf(writeback_metadata,	"%i");
@@ -239,7 +237,6 @@ STORE(__cached_dev)
 #define d_strtoul_nonzero(var)	sysfs_strtoul_clamp(var, dc->var, 1, INT_MAX)
 #define d_strtoi_h(var)		sysfs_hatoi(var, dc->var)
 
-	sysfs_strtoul(data_csum,	dc->disk.data_csum);
 	d_strtoul(verify);
 	d_strtoul(bypass_torture_test);
 	d_strtoul(writeback_metadata);
@@ -361,9 +358,6 @@ static struct attribute *bch_cached_dev_files[] = {
 	&sysfs_attach,
 	&sysfs_detach,
 	&sysfs_stop,
-#if 0
-	&sysfs_data_csum,
-#endif
 	&sysfs_cache_mode,
 	&sysfs_writeback_metadata,
 	&sysfs_writeback_running,
@@ -392,7 +386,6 @@ SHOW(bch_blockdev_volume)
 	struct bcache_device *d = container_of(kobj, struct bcache_device,
 					       kobj);
 
-	sysfs_printf(data_csum,	"%i", d->data_csum);
 	sysfs_hprint(size,	d->inode.v.i_inode.i_size);
 
 	if (attr == &sysfs_label) {
@@ -409,8 +402,6 @@ STORE(__bch_blockdev_volume)
 {
 	struct bcache_device *d = container_of(kobj, struct bcache_device,
 					       kobj);
-
-	sysfs_strtoul(data_csum,	d->data_csum);
 
 	if (attr == &sysfs_size) {
 		u64 journal_seq = 0;
@@ -467,9 +458,6 @@ STORE_LOCKED(bch_blockdev_volume)
 
 static struct attribute *bch_blockdev_volume_files[] = {
 	&sysfs_unregister,
-#if 0
-	&sysfs_data_csum,
-#endif
 	&sysfs_label,
 	&sysfs_size,
 	NULL
