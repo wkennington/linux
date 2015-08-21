@@ -829,6 +829,11 @@ int bch_cached_dev_attach(struct cached_dev *dc, struct cache_set *c)
 		return -EINVAL;
 	}
 
+	if (!test_bit(CACHE_SET_RUNNING, &c->flags)) {
+		pr_err("Can't attach %s: not running", buf);
+		return -EINVAL;
+	}
+
 	if (test_bit(CACHE_SET_STOPPING, &c->flags)) {
 		pr_err("Can't attach %s: shutting down", buf);
 		return -EINVAL;
@@ -870,11 +875,12 @@ int bch_cached_dev_attach(struct cached_dev *dc, struct cache_set *c)
 		dc->disk.inode.i_inode.i_ctime = rtime;
 		dc->disk.inode.i_inode.i_mtime = rtime;
 
-		if (bch_inode_create(c, &dc->disk.inode.i_inode,
-				     0, BLOCKDEV_INODE_MAX,
-				     &c->unused_inode_hint)) {
-			pr_err("No free inodes, not caching %s", buf);
-			return -EINVAL;
+		ret = bch_inode_create(c, &dc->disk.inode.i_inode,
+				       0, BLOCKDEV_INODE_MAX,
+				       &c->unused_inode_hint);
+		if (ret) {
+			pr_err("Error %d, not caching %s", ret, buf);
+			return ret;
 		}
 
 		pr_info("attached inode %llu", bcache_dev_inum(&dc->disk));
@@ -1177,12 +1183,7 @@ int bch_flash_dev_create(struct cache_set *c, uint64_t size)
 {
 	s64 rtime = timekeeping_clocktai_ns();
 	struct bch_inode_blockdev inode;
-
-	if (test_bit(CACHE_SET_STOPPING, &c->flags))
-		return -EINTR;
-
-	if (!test_bit(CACHE_SET_RUNNING, &c->flags))
-		return -EPERM;
+	int ret;
 
 	BCH_INODE_INIT(&inode);
 	get_random_bytes(&inode.i_uuid, sizeof(inode.i_uuid));
@@ -1191,10 +1192,11 @@ int bch_flash_dev_create(struct cache_set *c, uint64_t size)
 	inode.i_inode.i_size = size;
 	SET_INODE_FLASH_ONLY(&inode, 1);
 
-	if (bch_inode_create(c, &inode.i_inode, 0, BLOCKDEV_INODE_MAX,
-			     &c->unused_inode_hint)) {
-		pr_err("Can't create volume, no free inodes");
-		return -EINVAL;
+	ret = bch_inode_create(c, &inode.i_inode, 0, BLOCKDEV_INODE_MAX,
+			       &c->unused_inode_hint);
+	if (ret) {
+		pr_err("Can't create volume: %d", ret);
+		return ret;
 	}
 
 	return flash_dev_run(c, &inode);
@@ -1640,6 +1642,8 @@ static const char *run_cache_set(struct cache_set *c)
 
 	flash_devs_run(c);
 
+	bch_debug_init_cache_set(c);
+
 	err = "dynamic fault";
 	if (cache_set_init_fault("run_cache_set"))
 		goto err;
@@ -1695,8 +1699,6 @@ static const char *register_cache_set(struct cache *ca)
 
 	if (bch_cache_accounting_add_kobjs(&c->accounting, &c->kobj))
 		goto err;
-
-	bch_debug_init_cache_set(c);
 
 	list_add(&c->list, &bch_cache_sets);
 found:
