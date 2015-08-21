@@ -58,14 +58,15 @@ struct dirty_io {
 	struct closure		cl;
 	struct cached_dev	*dc;
 	struct cache		*ca;
+	struct keybuf_key	*w;
 	int			error;
 	/* Must be last */
 	struct bio		bio;
 };
 
-static void dirty_init(struct keybuf_key *w)
+static void dirty_init(struct dirty_io *io,
+		       struct keybuf_key *w)
 {
-	struct dirty_io *io = w->private;
 	struct bio *bio = &io->bio;
 
 	bio_init(bio, bio->bi_inline_vecs,
@@ -74,7 +75,6 @@ static void dirty_init(struct keybuf_key *w)
 		bio_set_prio(bio, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
 
 	bio->bi_iter.bi_size	= KEY_SIZE(&w->key) << 9;
-	bio->bi_private		= w;
 	bch_bio_map(bio, NULL);
 }
 
@@ -112,7 +112,7 @@ static void write_dirty_finish(struct closure *cl)
 				: &dc->disk.c->writeback_keys_done);
 	}
 
-	bch_keybuf_del(&dc->writeback_keys, w);
+	bch_keybuf_put(&dc->writeback_keys, io->w);
 
 	closure_return_with_destructor(cl, dirty_io_destructor);
 }
@@ -120,7 +120,7 @@ static void write_dirty_finish(struct closure *cl)
 static void dirty_endio(struct bio *bio)
 {
 	struct keybuf_key *w = bio->bi_private;
-	struct dirty_io *io = w->private;
+	struct dirty_io *io = container_of(bio, struct dirty_io, bio);
 
 	if (bio->bi_error) {
 		trace_bcache_writeback_error(&w->key,
@@ -138,7 +138,7 @@ static void write_dirty(struct closure *cl)
 	struct keybuf_key *w = io->bio.bi_private;
 
 	if (!io->error) {
-		dirty_init(w);
+		dirty_init(io, w);
 		bio_set_op_attrs(&io->bio, REQ_OP_WRITE, 0);
 		io->bio.bi_iter.bi_sector = KEY_START(&w->key);
 		io->bio.bi_bdev		= io->dc->bdev;
@@ -153,7 +153,7 @@ static void write_dirty(struct closure *cl)
 static void read_dirty_endio(struct bio *bio)
 {
 	struct keybuf_key *w = bio->bi_private;
-	struct dirty_io *io = w->private;
+	struct dirty_io *io = container_of(bio, struct dirty_io, bio);
 	struct cache_set *c = io->dc->disk.c;
 
 	bch_count_io_errors(io->ca, bio->bi_error,
@@ -198,7 +198,7 @@ static void read_dirty(struct cached_dev *dc)
 
 		ca = bch_extent_pick_ptr(dc->disk.c, &w->key, &ptr);
 		if (!ca) {
-			bch_keybuf_del(&dc->writeback_keys, w);
+			bch_keybuf_put(&dc->writeback_keys, w);
 			continue;
 		}
 
@@ -210,11 +210,11 @@ static void read_dirty(struct cached_dev *dc)
 			goto err;
 		}
 
-		w->private	= io;
 		io->dc		= dc;
 		io->ca		= ca;
+		io->w		= w;
 
-		dirty_init(w);
+		dirty_init(io, w);
 		bio_set_op_attrs(&io->bio, REQ_OP_READ, 0);
 		io->bio.bi_iter.bi_sector = PTR_OFFSET(&w->key, ptr);
 		io->bio.bi_bdev		= ca->bdev;
@@ -235,9 +235,9 @@ static void read_dirty(struct cached_dev *dc)
 
 	if (0) {
 err_free:
-		kfree(w->private);
+		kfree(io);
 err:
-		bch_keybuf_del(&dc->writeback_keys, w);
+		bch_keybuf_put(&dc->writeback_keys, w);
 	}
 
 	/*
