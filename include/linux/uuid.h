@@ -17,6 +17,7 @@
 #define _LINUX_UUID_H_
 
 #include <uapi/linux/uuid.h>
+#include <linux/string.h>
 
 /*
  * V1 (time-based) UUID definition [RFC 4122].
