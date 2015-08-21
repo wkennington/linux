@@ -332,7 +332,7 @@ DECLARE_EVENT_CLASS(btree_node,
 
 	TP_fast_assign(
 		memcpy(__entry->uuid, b->c->sb.set_uuid.b, 16);
-		__entry->bucket		= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->bucket		= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->level		= b->level;
 		__entry->id		= b->btree_id;
 		__entry->inode		= KEY_INODE(&b->key);
@@ -360,7 +360,7 @@ TRACE_EVENT(bcache_btree_write,
 	),
 
 	TP_fast_assign(
-		__entry->bucket	= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->bucket	= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->block	= b->written;
 		__entry->keys	= b->keys.set[b->keys.nsets].data->keys;
 	),
@@ -411,7 +411,7 @@ TRACE_EVENT(bcache_mca_reap,
 	),
 
 	TP_fast_assign(
-		__entry->bucket	= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->bucket	= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->ret = ret;
 	),
 
@@ -469,8 +469,7 @@ DECLARE_EVENT_CLASS(btree_node_op,
 
 	TP_fast_assign(
 		memcpy(__entry->uuid, b->c->sb.set_uuid.b, 16);
-		__entry->bucket	= bch_extent_ptrs(&b->key) > 1
-		? PTR_BUCKET_NR(b->c, &b->key, 0) : 0;
+		__entry->bucket	= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->level	= b->level;
 		__entry->id	= b->btree_id;
 		__entry->op	= op;
@@ -517,7 +516,7 @@ TRACE_EVENT(bcache_btree_insert_key,
 	),
 
 	TP_fast_assign(
-		__entry->b_bucket	= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->b_bucket	= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->level		= b->level;
 		__entry->id		= b->btree_id;
 		__entry->b_inode	= KEY_INODE(&b->key);
@@ -527,8 +526,7 @@ TRACE_EVENT(bcache_btree_insert_key,
 		 * we'll trigger a BUG_ON since there is no
 		 * PTR_DEV set
 		 */
-		__entry->bucket		= bch_extent_ptrs(k) > 1 ?
-		PTR_BUCKET_NR(b->c, k, 0) : 0;
+		__entry->bucket		= PTR_BUCKET_NR_TRACE(b->c, k, 0);
 		__entry->inode		= KEY_INODE(k);
 		__entry->offset		= KEY_OFFSET(k);
 		__entry->size		= KEY_SIZE(k);
@@ -560,7 +558,7 @@ DECLARE_EVENT_CLASS(btree_split,
 	),
 
 	TP_fast_assign(
-		__entry->bucket	= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->bucket	= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->level	= b->level;
 		__entry->id	= b->btree_id;
 		__entry->inode	= KEY_INODE(&b->key);
@@ -604,7 +602,7 @@ TRACE_EVENT(bcache_btree_gc_coalesce,
 	),
 
 	TP_fast_assign(
-		__entry->bucket		= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->bucket		= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->level		= b->level;
 		__entry->id		= b->btree_id;
 		__entry->inode		= KEY_INODE(&b->key);
@@ -638,8 +636,9 @@ TRACE_EVENT(bcache_btree_node_alloc_replacement,
 
 	TP_fast_assign(
 		memcpy(__entry->uuid, b->c->sb.set_uuid.b, 16);
-		__entry->old_bucket	= PTR_BUCKET_NR(old->c, &old->key, 0);
-		__entry->bucket		= PTR_BUCKET_NR(b->c, &b->key, 0);
+		__entry->old_bucket	= PTR_BUCKET_NR_TRACE(old->c,
+							      &old->key, 0);
+		__entry->bucket		= PTR_BUCKET_NR_TRACE(b->c, &b->key, 0);
 		__entry->level		= b->level;
 		__entry->id		= b->btree_id;
 		__entry->inode		= KEY_INODE(&b->key);
@@ -721,7 +720,7 @@ TRACE_EVENT(bcache_add_sectors,
 		__entry->inode		= KEY_INODE(k);
 		__entry->offset		= KEY_OFFSET(k);
 		__entry->sectors	= sectors;
-		__entry->bucket		= PTR_BUCKET_NR(ca->set, k, i);
+		__entry->bucket		= PTR_BUCKET_NR(ca, k, i);
 		__entry->dirty		= dirty;
 	),
 
