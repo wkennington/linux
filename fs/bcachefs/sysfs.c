@@ -880,7 +880,6 @@ static ssize_t show_quantiles(struct cache *ca, char *buf,
 	int cmp(const void *l, const void *r)
 	{	return *((unsigned *) r) - *((unsigned *) l); }
 
-	struct cache_set *c = ca->set;
 	size_t n = ca->sb.nbuckets, i;
 	/* Compute 31 quantiles */
 	unsigned q[31], *p;
@@ -890,10 +889,8 @@ static ssize_t show_quantiles(struct cache *ca, char *buf,
 	if (!p)
 		return -ENOMEM;
 
-	mutex_lock(&c->bucket_lock);
 	for (i = ca->sb.first_bucket; i < n; i++)
 		p[i] = fn(ca, &ca->buckets[i], private);
-	mutex_unlock(&c->bucket_lock);
 
 	sort(p, n, sizeof(unsigned), cmp, NULL);
 
@@ -920,7 +917,7 @@ static ssize_t show_reserve_stats(struct cache *ca, char *buf)
 	enum alloc_reserve i;
 	ssize_t ret;
 
-	mutex_lock(&ca->set->bucket_lock);
+	spin_lock(&ca->freelist_lock);
 
 	ret = scnprintf(buf, PAGE_SIZE,
 			"free_inc:\t%zu\t%zu\n",
@@ -933,7 +930,7 @@ static ssize_t show_reserve_stats(struct cache *ca, char *buf)
 				 fifo_used(&ca->free[i]),
 				 ca->free[i].size);
 
-	mutex_unlock(&ca->set->bucket_lock);
+	spin_unlock(&ca->freelist_lock);
 
 	return ret;
 }
@@ -1018,10 +1015,7 @@ STORE(__bch_cache)
 			return v;
 
 		if ((unsigned) v != CACHE_REPLACEMENT(mi)) {
-			mutex_lock(&c->bucket_lock);
 			SET_CACHE_REPLACEMENT(mi, v);
-			mutex_unlock(&c->bucket_lock);
-
 			bcache_write_super(c);
 		}
 	}
@@ -1036,7 +1030,6 @@ STORE(__bch_cache)
 			unsigned i;
 			struct cache_tier *tier;
 
-			mutex_lock(&c->bucket_lock);
 			tier = &c->cache_by_alloc[CACHE_TIER(mi)];
 
 			for (i = 0; i < tier->nr_devices; i++)
@@ -1053,8 +1046,6 @@ found:
 
 			tier = &c->cache_by_alloc[v];
 			tier->devices[tier->nr_devices++] = ca;
-
-			mutex_unlock(&c->bucket_lock);
 
 			SET_CACHE_TIER(mi, v);
 			bcache_write_super(c);
