@@ -1759,7 +1759,6 @@ out_nocoalesce:
 static int btree_gc_rewrite_node(struct btree *b, struct btree_op *op,
 				 struct btree *replace)
 {
-	struct keylist keys;
 	struct btree *n;
 
 	if (btree_check_reserve(b, NULL))
@@ -1780,11 +1779,7 @@ static int btree_gc_rewrite_node(struct btree *b, struct btree_op *op,
 
 	bch_btree_node_write_sync(n);
 
-	bch_keylist_init(&keys);
-	bch_keylist_add(&keys, &n->key);
-
-	bch_btree_insert_node(b, op, &keys, NULL, NULL);
-	BUG_ON(!bch_keylist_empty(&keys));
+	bch_btree_insert_node(b, op, &keylist_single(&n->key), NULL, NULL);
 
 	six_lock_write(&replace->lock);
 	btree_node_free(replace);
@@ -2728,19 +2723,14 @@ int bch_btree_insert_node(struct btree *b, struct btree_op *op,
 int bch_btree_insert_check_key(struct btree *b, struct btree_op *op,
 			       struct bkey *check_key)
 {
-	struct keylist insert;
-
-	bch_keylist_init(&insert);
-
 	bch_set_extent_ptrs(check_key, 1);
 	get_random_bytes(&check_key->val[0], sizeof(u64));
 
 	SET_PTR_DEV(check_key, 0, PTR_CHECK_DEV);
 	SET_KEY_CACHED(check_key, 1);
 
-	bch_keylist_add(&insert, check_key);
-
-	return bch_btree_insert_node(b, op, &insert, NULL, NULL);
+	return bch_btree_insert_node(b, op, &keylist_single(check_key),
+				     NULL, NULL);
 }
 
 struct btree_insert_op {
