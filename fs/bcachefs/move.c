@@ -2,6 +2,7 @@
 #include "bcachefs.h"
 #include "btree.h"
 #include "extents.h"
+#include "io.h"
 #include "keybuf.h"
 #include "move.h"
 
