@@ -67,6 +67,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/kthread.h>
+#include <linux/rcupdate.h>
 #include <linux/sched/task.h>
 #include <trace/events/bcachefs.h>
 
@@ -82,7 +83,7 @@ static void bch_cache_group_remove_cache(struct cache_group *grp, struct cache *
 	write_seqcount_begin(&grp->lock);
 
 	for (i = 0; i < grp->nr_devices; i++)
-		if (grp->devices[i] == ca) {
+		if (rcu_access_pointer(grp->devices[i]) == ca) {
 			grp->nr_devices--;
 			memmove(&grp->devices[i],
 				&grp->devices[i + 1],
