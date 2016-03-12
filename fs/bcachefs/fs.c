@@ -1802,7 +1802,7 @@ setflags_out:
 		return 0;
 
 	default:
-		return -ENOTTY;
+		return bch_cache_set_ioctl(c, cmd, (void __user *) arg);
 	}
 }
 
