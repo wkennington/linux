@@ -250,7 +250,8 @@ static void memcpy_from_bio(void *dst, struct bio *src,
 }
 
 static void *__bio_map_or_bounce(struct bio *bio, struct bvec_iter start,
-				 unsigned *bounced, bool may_bounce)
+				 unsigned *bounced, bool may_bounce,
+				 bool copy)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
@@ -294,18 +295,23 @@ bounce:
 		return NULL;
 
 	data = kmalloc(start.bi_size, GFP_NOIO);
-	if (!data)
-		return NULL;
+	if (!data) {
+		data = vmalloc(start.bi_size);
+		if (!data)
+			return NULL;
+	}
 
 	*bounced = 1;
-	memcpy_from_bio(data, bio, start);
+	if (copy)
+		memcpy_from_bio(data, bio, start);
 
 	return data;
 }
 
 static void *bio_map_or_bounce(struct bio *bio, unsigned *bounced, bool may_bounce)
 {
-	return __bio_map_or_bounce(bio, bio->bi_iter, bounced, may_bounce);
+	return __bio_map_or_bounce(bio, bio->bi_iter, bounced,
+				   may_bounce, true);
 }
 
 static void bio_unmap_or_unbounce(void *data, unsigned bounced)
@@ -313,7 +319,7 @@ static void bio_unmap_or_unbounce(void *data, unsigned bounced)
 	if (!data)
 		return;
 	else if (bounced)
-		kfree(data);
+		kvfree(data);
 	else
 		vunmap((void *) ((unsigned long) data & PAGE_MASK));
 }
@@ -1424,18 +1430,27 @@ static int bio_uncompress_lz4(struct cache_set *c,
 			      unsigned skip, unsigned uncompressed_size)
 {
 	void *src_data = NULL, *dst_data = NULL;
-	unsigned src_bounced;
+	unsigned src_bounced, dst_bounced;
 	int ret = -ENOMEM;
 
-	src_data = __bio_map_or_bounce(src, src_iter, &src_bounced, true);
+	src_data = __bio_map_or_bounce(src, src_iter, &src_bounced,
+				       true, true);
 	if (!src_data)
 		goto err;
 
-	dst_data = kmalloc(uncompressed_size, GFP_NOIO|__GFP_NOWARN);
-	if (!dst_data) {
-		dst_data = vmalloc(uncompressed_size);
+	if (uncompressed_size == dst_iter.bi_size) {
+		dst_data = __bio_map_or_bounce(dst, dst_iter, &dst_bounced,
+					       true, false);
 		if (!dst_data)
 			goto err;
+	} else {
+		dst_data = kmalloc(uncompressed_size, GFP_NOIO|__GFP_NOWARN);
+		if (!dst_data) {
+			dst_data = vmalloc(uncompressed_size);
+			if (!dst_data)
+				goto err;
+		}
+		dst_bounced = 1;
 	}
 
 	ret = LZ4_decompress_safe(src_data,
@@ -1446,9 +1461,10 @@ static int bio_uncompress_lz4(struct cache_set *c,
 	if (ret != uncompressed_size)
 		goto err;
 
-	memcpy_to_bio(dst, dst_iter, dst_data + skip);
+	if (dst_bounced)
+		memcpy_to_bio(dst, dst_iter, dst_data + skip);
 err:
-	kvfree(dst_data);
+	bio_unmap_or_unbounce(dst_data, dst_bounced);
 	bio_unmap_or_unbounce(src_data, src_bounced);
 	return ret;
 }
