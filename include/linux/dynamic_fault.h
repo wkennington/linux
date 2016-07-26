@@ -103,8 +103,8 @@ bool __dynamic_fault_enabled(struct _dfault *);
 #define bio_alloc_pages(...)						\
 	(memory_fault() ? -ENOMEM	: bio_alloc_pages(__VA_ARGS__))
 
-#define bio_get_user_pages(...)						\
-	(memory_fault() ? -ENOMEM	: bio_get_user_pages(__VA_ARGS__))
+#define bio_iov_iter_get_pages(...)					\
+	(memory_fault() ? -ENOMEM	: bio_iov_iter_get_pages(__VA_ARGS__))
 
 #else /* CONFIG_DYNAMIC_FAULT */
 
