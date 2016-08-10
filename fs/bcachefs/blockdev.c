@@ -2,6 +2,7 @@
 #include "bcachefs.h"
 #include "blockdev.h"
 #include "btree_iter.h"
+#include "checksum.h"
 #include "error.h"
 #include "inode.h"
 #include "request.h"
