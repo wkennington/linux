@@ -39,14 +39,18 @@ static inline u64 *op_journal_seq(struct bch_write_op *op)
 		? op->journal_seq_p : &op->journal_seq;
 }
 
+static inline struct write_point *foreground_write_point(struct cache_set *c,
+							 unsigned long v)
+{
+	return c->write_points +
+		hash_long(v, ilog2(ARRAY_SIZE(c->write_points)));
+}
+
 void bch_write_op_init(struct bch_write_op *, struct cache_set *,
 		       struct bch_write_bio *,
 		       struct disk_reservation, struct write_point *,
-		       struct bkey_s_c,
-		       struct extent_insert_hook *, u64 *, unsigned);
+		       struct bpos, u64 *, unsigned);
 void bch_write(struct closure *);
-
-void bch_replace_init(struct bch_replace_info *, struct bkey_s_c);
 
 struct cache_promote_op;
 
@@ -83,15 +87,11 @@ void bch_bio_submit_work(struct work_struct *);
 void bch_submit_bbio(struct bbio *, struct cache *,
 		     const struct bch_extent_ptr *, bool);
 void bch_submit_bbio_replicas(struct bch_write_bio *, struct cache_set *,
-			      const struct bkey_i *, unsigned, bool);
+			      const struct bkey_i *, bool);
 
 int bch_discard(struct cache_set *, struct bpos, struct bpos,
 		u64, struct disk_reservation *,
 		struct extent_insert_hook *, u64 *);
-
-void __cache_promote(struct cache_set *, struct bbio *,
-		     struct bkey_s_c, struct bkey_s_c, unsigned);
-bool cache_promote(struct cache_set *, struct bbio *, struct bkey_s_c);
 
 void bch_read_retry_work(struct work_struct *);
 void bch_wake_delayed_writes(unsigned long data);

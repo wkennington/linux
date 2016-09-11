@@ -61,15 +61,29 @@ static inline int bch_moving_context_wait(struct moving_context *ctxt)
 
 void bch_moving_wait(struct moving_context *);
 
+struct migrate_write {
+	BKEY_PADDED(key);
+	bool			promote;
+	bool			move;
+	struct bch_extent_ptr	move_ptr;
+	struct bch_write_op	op;
+	struct bch_write_bio	wbio;
+};
+
+void bch_migrate_write_init(struct cache_set *,
+			    struct migrate_write *,
+			    struct write_point *,
+			    struct bkey_s_c,
+			    const struct bch_extent_ptr *,
+			    unsigned);
+
 struct moving_io {
 	struct list_head	list;
 	struct rb_node		node;
 	struct closure		cl;
 	struct moving_queue	*q;
-	struct bch_write_op	op;
-	struct bch_replace_info	replace;
 	struct moving_context	*context;
-	BKEY_PADDED(key);
+	struct migrate_write	write;
 	/* Sort key for moving_queue->tree */
 	u64			sort_key;
 	/* Protected by q->lock */
@@ -94,13 +108,16 @@ struct moving_io {
 	unsigned		write_issued:1;
 
 	struct bch_read_bio	rbio;
-	struct bch_write_bio	wbio;
 	/* Must be last since it is variable size */
 	struct bio_vec		bi_inline_vecs[0];
 };
 
-struct moving_io *moving_io_alloc(struct bkey_s_c);
 void moving_io_free(struct moving_io *);
+struct moving_io *moving_io_alloc(struct cache_set *,
+				  struct moving_queue *,
+				  struct write_point *,
+				  struct bkey_s_c,
+				  const struct bch_extent_ptr *);
 
 typedef struct moving_io *(moving_queue_fn)(struct moving_queue *,
 					    struct moving_context *);

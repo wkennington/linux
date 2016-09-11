@@ -192,7 +192,7 @@ void bch_cache_set_stats_apply(struct cache_set *c,
 	 * Not allowed to reduce sectors_available except by getting a
 	 * reservation:
 	 */
-	BUG_ON(added > (disk_res ? disk_res->sectors : 0));
+	BUG_ON(added > (s64) (disk_res ? disk_res->sectors : 0));
 
 	if (added > 0) {
 		disk_res->sectors	-= added;
@@ -438,7 +438,8 @@ static void bch_mark_pointer(struct cache_set *c,
 		 * checked the gen
 		 */
 		if (ptr_stale(ca, ptr)) {
-			BUG_ON(type == S_META);
+			BUG_ON(type != S_CACHED &&
+			       test_bit(JOURNAL_REPLAY_DONE, &c->journal.flags));
 			return;
 		}
 
@@ -450,17 +451,10 @@ static void bch_mark_pointer(struct cache_set *c,
 		if (!is_gc && gc_will_visit(c, gc_pos))
 			goto out;
 
-		/*
-		 * Disallowed state transition - this means a bkey_cmpxchg()
-		 * operation is racing; just treat it like the pointer was
-		 * already stale
-		 */
-		if (!may_make_unavailable &&
-		    type != S_CACHED &&
-		    is_available_bucket(old)) {
-			BUG_ON(type == S_META);
-			return;
-		}
+		BUG_ON(type != S_CACHED &&
+		       !may_make_unavailable &&
+		       is_available_bucket(old) &&
+		       test_bit(JOURNAL_REPLAY_DONE, &c->journal.flags));
 
 		BUG_ON((old.dirty_sectors ||
 			old.cached_sectors) &&
@@ -639,6 +633,8 @@ int bch_disk_reservation_add(struct cache_set *c,
 	s64 sectors_available;
 	int ret;
 
+	sectors *= res->nr_replicas;
+
 	lg_local_lock(&c->bucket_stats_lock);
 	stats = this_cpu_ptr(c->bucket_stats_percpu);
 
@@ -704,6 +700,9 @@ int bch_disk_reservation_get(struct cache_set *c,
 {
 	res->sectors = 0;
 	res->gen = c->capacity_gen;
+	res->nr_replicas = (flags & BCH_DISK_RESERVATION_METADATA)
+		? c->opts.metadata_replicas
+		: c->opts.data_replicas;
 
 	return bch_disk_reservation_add(c, res, sectors, flags);
 }

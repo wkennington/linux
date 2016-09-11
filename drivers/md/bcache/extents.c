@@ -164,7 +164,7 @@ static bool crc_cmp(union bch_extent_crc *l, union bch_extent_crc *r)
 }
 
 /* Increment pointers after @crc by crc's offset until the next crc entry: */
-void extent_adjust_pointers(struct bkey_s_extent e, union bch_extent_crc *crc)
+void bch_extent_crc_narrow_pointers(struct bkey_s_extent e, union bch_extent_crc *crc)
 {
 	union bch_extent_entry *entry;
 
@@ -176,7 +176,86 @@ void extent_adjust_pointers(struct bkey_s_extent e, union bch_extent_crc *crc)
 	}
 }
 
-static void extent_cleanup_crcs(struct bkey_s_extent e)
+/*
+ * We're writing another replica for this extent, so while we've got the data in
+ * memory we'll be computing a new checksum for the currently live data.
+ *
+ * If there are other replicas we aren't moving, and they are checksummed but
+ * not compressed, we can modify them to point to only the data that is
+ * currently live (so that readers won't have to bounce) while we've got the
+ * checksum we need:
+ *
+ * XXX: to guard against data being corrupted while in memory, instead of
+ * recomputing the checksum here, it would be better in the read path to instead
+ * of computing the checksum of the entire extent:
+ *
+ * | extent                              |
+ *
+ * compute the checksums of the live and dead data separately
+ * | dead data || live data || dead data |
+ *
+ * and then verify that crc_dead1 + crc_live + crc_dead2 == orig_crc, and then
+ * use crc_live here (that we verified was correct earlier)
+ */
+void bch_extent_narrow_crcs(struct bkey_s_extent e)
+{
+	union bch_extent_crc *crc;
+	bool have_wide = false, have_narrow = false;
+	u64 csum = 0;
+	unsigned csum_type = 0;
+
+	extent_for_each_crc(e, crc) {
+		if (crc_to_64(crc).compression_type)
+			continue;
+
+		if (crc_to_64(crc).uncompressed_size != e.k->size) {
+			have_wide = true;
+		} else {
+			have_narrow = true;
+			csum = crc_to_64(crc).csum;
+			csum_type = crc_to_64(crc).csum_type;
+		}
+	}
+
+	if (!have_wide || !have_narrow)
+		return;
+
+	extent_for_each_crc(e, crc) {
+		if (crc_to_64(crc).compression_type)
+			continue;
+
+		if (crc_to_64(crc).uncompressed_size != e.k->size) {
+			switch (extent_crc_type(crc)) {
+			case BCH_EXTENT_CRC_NONE:
+				BUG();
+			case BCH_EXTENT_CRC32:
+				if (bch_crc_size[csum_type] > sizeof(crc->crc32.csum))
+					continue;
+
+				bch_extent_crc_narrow_pointers(e, crc);
+				crc->crc32.compressed_size	= e.k->size;
+				crc->crc32.uncompressed_size	= e.k->size;
+				crc->crc32.offset		= 0;
+				crc->crc32.csum_type		= csum_type;
+				crc->crc32.csum			= csum;
+				break;
+			case BCH_EXTENT_CRC64:
+				if (bch_crc_size[csum_type] > sizeof(crc->crc64.csum))
+					continue;
+
+				bch_extent_crc_narrow_pointers(e, crc);
+				crc->crc64.compressed_size	= e.k->size;
+				crc->crc64.uncompressed_size	= e.k->size;
+				crc->crc64.offset		= 0;
+				crc->crc64.csum_type		= csum_type;
+				crc->crc64.csum			= csum;
+				break;
+			}
+		}
+	}
+}
+
+void bch_extent_drop_redundant_crcs(struct bkey_s_extent e)
 {
 	union bch_extent_entry *entry = e.v->start;
 	union bch_extent_crc *crc, *prev = NULL;
@@ -209,7 +288,7 @@ static void extent_cleanup_crcs(struct bkey_s_extent e)
 		    !crc_to_64(crc).csum_type &&
 		    !crc_to_64(crc).compression_type){
 			/* null crc entry: */
-			extent_adjust_pointers(e, crc);
+			bch_extent_crc_narrow_pointers(e, crc);
 			goto drop;
 		}
 
@@ -226,12 +305,6 @@ drop:
 	EBUG_ON(bkey_val_u64s(e.k) && !bch_extent_nr_ptrs(e.c));
 }
 
-void bch_extent_drop_ptr(struct bkey_s_extent e, struct bch_extent_ptr *ptr)
-{
-	__bch_extent_drop_ptr(e, ptr);
-	extent_cleanup_crcs(e);
-}
-
 static bool should_drop_ptr(const struct cache_set *c,
 			    struct bkey_s_c_extent e,
 			    const struct bch_extent_ptr *ptr)
@@ -241,7 +314,7 @@ static bool should_drop_ptr(const struct cache_set *c,
 	return (ca = PTR_CACHE(c, ptr)) && ptr_stale(ca, ptr);
 }
 
-void bch_extent_drop_stale(struct cache_set *c, struct bkey_s_extent e)
+static void bch_extent_drop_stale(struct cache_set *c, struct bkey_s_extent e)
 {
 	struct bch_extent_ptr *ptr = &e.v->start->ptr;
 	bool dropped = false;
@@ -261,7 +334,7 @@ void bch_extent_drop_stale(struct cache_set *c, struct bkey_s_extent e)
 	rcu_read_unlock();
 
 	if (dropped)
-		extent_cleanup_crcs(e);
+		bch_extent_drop_redundant_crcs(e);
 }
 
 static bool bch_ptr_normalize(struct btree_keys *bk, struct bkey_s k)
@@ -600,20 +673,6 @@ bool bch_cut_back(struct bpos where, struct bkey *k)
 
 	return true;
 }
-
-/*
- * Returns a key corresponding to the start of @k split at @where, @k will be
- * the second half of the split
- */
-#define bch_key_split(_where, _k)				\
-({								\
-	BKEY_PADDED(k) __tmp;					\
-								\
-	bkey_copy(&__tmp.k, _k);				\
-	bch_cut_back(_where, &__tmp.k.k);			\
-	bch_cut_front(_where, _k);				\
-	&__tmp.k;						\
-})
 
 /**
  * bch_key_resize - adjust size of @k
@@ -1028,8 +1087,7 @@ static enum btree_insert_ret extent_insert_should_stop(struct btree_insert *tran
 }
 
 static void extent_do_insert(struct btree_iter *iter, struct bkey_i *insert,
-			     struct journal_res *res, unsigned flags,
-			     struct bucket_stats_cache_set *stats)
+			     struct journal_res *res)
 {
 	struct btree_keys *b = &iter->nodes[0]->keys;
 	struct btree_node_iter *node_iter = &iter->node_iters[0];
@@ -1038,11 +1096,6 @@ static void extent_do_insert(struct btree_iter *iter, struct bkey_i *insert,
 	struct bkey_packed *prev, *where =
 		bch_btree_node_iter_bset_pos(node_iter, b, i) ?:
 		bset_bkey_last(i);
-
-	if (!(flags & BTREE_INSERT_NO_MARK_KEY))
-		bch_add_sectors(iter, bkey_i_to_s_c(insert),
-				bkey_start_offset(&insert->k),
-				insert->k.size, stats);
 
 	bch_btree_journal_key(iter, insert, res);
 
@@ -1063,20 +1116,42 @@ static void extent_insert_committed(struct btree_insert *trans,
 				    struct journal_res *res,
 				    struct bucket_stats_cache_set *stats)
 {
+	struct btree_iter *iter = insert->iter;
 
-	EBUG_ON(bkey_cmp(bkey_start_pos(&insert->k->k), insert->iter->pos));
+	EBUG_ON(bkey_cmp(bkey_start_pos(&insert->k->k), iter->pos));
 	EBUG_ON(bkey_cmp(insert->k->k.p, committed_pos) < 0);
-	EBUG_ON(bkey_cmp(committed_pos, insert->iter->pos) < 0);
+	EBUG_ON(bkey_cmp(committed_pos, iter->pos) < 0);
 
-	if (bkey_cmp(committed_pos, insert->iter->pos) > 0) {
-		struct bkey_i *split;
+	if (bkey_cmp(committed_pos, iter->pos) > 0) {
+		BKEY_PADDED(k) split;
 
 		EBUG_ON(bkey_deleted(&insert->k->k) || !insert->k->k.size);
 
-		split = bch_key_split(committed_pos, insert->k);
-		extent_do_insert(insert->iter, split, res, trans->flags, stats);
+		bkey_copy(&split.k, insert->k);
 
-		bch_btree_iter_set_pos_same_leaf(insert->iter, committed_pos);
+		if (!(trans->flags & BTREE_INSERT_NO_MARK_KEY) &&
+		    bkey_cmp(committed_pos, insert->k->k.p) &&
+		    bkey_extent_is_compressed(trans->c,
+					      bkey_i_to_s_c(insert->k))) {
+			/* XXX: possibly need to increase our reservation? */
+			bch_cut_subtract_back(iter, committed_pos,
+					      bkey_i_to_s(&split.k), stats);
+			bch_cut_front(committed_pos, insert->k);
+			bch_add_sectors(iter, bkey_i_to_s_c(insert->k),
+					bkey_start_offset(&insert->k->k),
+					insert->k->k.size, stats);
+		} else {
+			bch_cut_back(committed_pos, &split.k.k);
+			bch_cut_front(committed_pos, insert->k);
+		}
+
+		if (debug_check_bkeys(iter->c))
+			bkey_debugcheck(iter->c, iter->nodes[iter->level],
+					bkey_i_to_s_c(&split.k));
+
+		extent_do_insert(iter, &split.k, res);
+
+		bch_btree_iter_set_pos_same_leaf(iter, committed_pos);
 
 		trans->did_work = true;
 	}
@@ -1111,7 +1186,8 @@ __extent_insert_advance_pos(struct btree_insert *trans,
 	case BTREE_HOOK_NO_INSERT:
 		extent_insert_committed(trans, insert, *committed_pos,
 					res, stats);
-		__bch_cut_front(next_pos, bkey_i_to_s(insert->k));
+		bch_cut_subtract_front(insert->iter, next_pos,
+				       bkey_i_to_s(insert->k), stats);
 
 		bch_btree_iter_set_pos_same_leaf(insert->iter, next_pos);
 		break;
@@ -1241,6 +1317,11 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 	 */
 	EBUG_ON(bkey_cmp(iter->pos, bkey_start_pos(&insert->k->k)));
 
+	if (!(trans->flags & BTREE_INSERT_NO_MARK_KEY))
+		bch_add_sectors(iter, bkey_i_to_s_c(insert->k),
+				bkey_start_offset(&insert->k->k),
+				insert->k->k.size, &stats);
+
 	while (bkey_cmp(committed_pos, insert->k->k.p) < 0 &&
 	       (ret = extent_insert_should_stop(trans, insert, res,
 				start_time, nr_done)) == BTREE_INSERT_OK &&
@@ -1290,7 +1371,7 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 			}
 
 		/* k is the key currently in the tree, 'insert' is the new key */
-		switch (bch_extent_overlap(&insert->k->k, k.k)) {
+		switch (overlap) {
 		case BCH_EXTENT_OVERLAP_FRONT:
 			/* insert overlaps with start of k: */
 			bch_cut_subtract_front(iter, insert->k->k.p, k, &stats);
@@ -1377,11 +1458,13 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 			bch_cut_back(bkey_start_pos(&insert->k->k), &split.k.k);
 			BUG_ON(bkey_deleted(&split.k.k));
 
-			__bch_cut_front(bkey_start_pos(&insert->k->k), k);
 			bch_cut_subtract_front(iter, insert->k->k.p, k, &stats);
 			BUG_ON(bkey_deleted(k.k));
 			extent_save(&b->keys, node_iter, _k, k.k);
 
+			bch_add_sectors(iter, bkey_i_to_s_c(&split.k),
+					bkey_start_offset(&split.k.k),
+					split.k.k.size, &stats);
 			bch_btree_bset_insert(iter, b, node_iter, &split.k);
 			break;
 		}
@@ -1396,6 +1479,15 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 		ret = BTREE_INSERT_NEED_TRAVERSE;
 stop:
 	extent_insert_committed(trans, insert, committed_pos, res, &stats);
+	/*
+	 * Subtract any remaining sectors from @insert, if we bailed out early
+	 * and didn't fully insert @insert:
+	 */
+	if (insert->k->k.size &&
+	    !(trans->flags & BTREE_INSERT_NO_MARK_KEY))
+		bch_subtract_sectors(iter, bkey_i_to_s_c(insert->k),
+				     bkey_start_offset(&insert->k->k),
+				     insert->k->k.size, &stats);
 
 	bch_cache_set_stats_apply(c, &stats, trans->disk_res,
 				  gc_pos_btree_node(b));
@@ -1770,8 +1862,11 @@ static void __extent_sort_ptrs(struct cache_member_rcu *mi,
 	extent_for_each_ptr_crc(src, src_ptr, src_crc) {
 		extent_for_each_ptr_crc(dst, dst_ptr, dst_crc)
 			if (PTR_TIER(mi, src_ptr) < PTR_TIER(mi, dst_ptr))
-				break;
+				goto found;
 
+		dst_ptr = &extent_entry_last(dst)->ptr;
+		dst_crc = NULL;
+found:
 		/* found insert position: */
 
 		/*
@@ -1805,7 +1900,7 @@ static void __extent_sort_ptrs(struct cache_member_rcu *mi,
 	}
 
 	/* Sort done - now drop redundant crc entries: */
-	extent_cleanup_crcs(dst);
+	bch_extent_drop_redundant_crcs(dst);
 
 	memcpy(src.v, dst.v, bkey_val_bytes(dst.k));
 	set_bkey_val_u64s(src.k, bkey_val_u64s(dst.k));
@@ -1823,12 +1918,14 @@ static void extent_sort_ptrs(struct cache_set *c, struct bkey_s_extent e)
 	 */
 	mi = cache_member_info_get(c);
 
-	extent_for_each_ptr_crc(e, ptr, crc)
+	extent_for_each_ptr_crc(e, ptr, crc) {
 		if (prev &&
 		    PTR_TIER(mi, ptr) < PTR_TIER(mi, prev)) {
 			__extent_sort_ptrs(mi, e);
 			break;
 		}
+		prev = ptr;
+	}
 
 	cache_member_info_put();
 }

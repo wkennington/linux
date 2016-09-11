@@ -160,6 +160,8 @@ static void tiering_refill(struct cache_set *c, struct tiering_refill *refill)
 	trace_bcache_tiering_refill_start(c);
 
 	for_each_btree_key(&iter, c, BTREE_ID_EXTENTS, refill->start, k) {
+		BKEY_PADDED(k) tmp;
+
 		keys = &refill->ca->tiering_queue.keys;
 
 		if (!tiering_pred(keys, k)) {
@@ -167,13 +169,16 @@ static void tiering_refill(struct cache_set *c, struct tiering_refill *refill)
 			goto next;
 		}
 
+		bkey_reassemble(&tmp.k, k);
+		bch_cut_front(refill->start, &tmp.k);
+
 		/* Growing the keylist might fail */
-		if (bch_scan_keylist_add(keys, k))
+		if (bch_scan_keylist_add(keys, bkey_i_to_s_c(&tmp.k)))
 			goto done;
 
 		/* TODO: split key if refill->sectors is now > stripe_size */
-		refill->sectors += k.k->size;
-		refill->start = k.k->p;
+		refill->sectors += tmp.k.k.size;
+		refill->start = tmp.k.k.p;
 
 		/* Check if we've added enough keys to this keylist */
 		if (tiering_keylist_full(refill)) {
@@ -214,21 +219,11 @@ static int issue_tiering_move(struct moving_queue *q,
 	struct cache_set *c = ca->set;
 	struct moving_io *io;
 
-	io = moving_io_alloc(k);
+	io = moving_io_alloc(c, q, &ca->tiering_write_point, k, NULL);
 	if (!io) {
 		trace_bcache_tiering_alloc_fail(c, k.k->size);
 		return -ENOMEM;
 	}
-
-	bch_replace_init(&io->replace, bkey_i_to_s_c(&io->key));
-
-	bch_write_op_init(&io->op, c, &io->wbio,
-			  (struct disk_reservation) { 0 },
-			  &ca->tiering_write_point,
-			  bkey_i_to_s_c(&io->key),
-			  &io->replace.hook, NULL, 0);
-	io->op.io_wq = q->wq;
-	io->op.nr_replicas = 1;
 
 	trace_bcache_tiering_copy(k.k);
 
@@ -359,6 +354,8 @@ static u64 read_tiering(struct cache_set *c)
 
 	trace_bcache_tiering_end(c, ctxt.sectors_moved, ctxt.keys_moved);
 
+	//pr_info("pred y %llu pred n %llu", c->tiering_pred_y, c->tiering_pred_n);
+
 	return ctxt.sectors_moved;
 }
 
@@ -367,7 +364,7 @@ static int bch_tiering_thread(void *arg)
 	struct cache_set *c = arg;
 	struct io_clock *clock = &c->io_clock[WRITE];
 	struct cache *ca;
-	u64 sectors, tier_capacity;
+	u64 tier_capacity, available_sectors;
 	unsigned long last;
 	unsigned i;
 
@@ -378,21 +375,32 @@ static int bch_tiering_thread(void *arg)
 					   c->cache_tiers[1].nr_devices))
 			break;
 
-		last = atomic_long_read(&clock->now);
+		while (1) {
+			last = atomic_long_read(&clock->now);
 
-		sectors = read_tiering(c);
+			tier_capacity = available_sectors = 0;
+			rcu_read_lock();
+			group_for_each_cache_rcu(ca, &c->cache_tiers[0], i) {
+				tier_capacity +=
+					(ca->mi.nbuckets -
+					 ca->mi.first_bucket) << ca->bucket_bits;
+				available_sectors +=
+					buckets_available_cache(ca) << ca->bucket_bits;
+			}
+			rcu_read_unlock();
 
-		tier_capacity = 0;
-		rcu_read_lock();
-		group_for_each_cache_rcu(ca, &c->cache_tiers[0], i)
-			tier_capacity +=
-				(ca->mi.nbuckets -
-				 ca->mi.first_bucket) << ca->bucket_bits;
-		rcu_read_unlock();
+			if (available_sectors < (tier_capacity >> 1))
+				break;
 
-		if (sectors < tier_capacity >> 4)
 			bch_kthread_io_clock_wait(clock,
-					  last + (tier_capacity >> 5));
+						  last +
+						  available_sectors -
+						  (tier_capacity >> 1));
+			if (kthread_should_stop())
+				return 0;
+		}
+
+		read_tiering(c);
 	}
 
 	return 0;

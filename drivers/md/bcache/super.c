@@ -412,7 +412,7 @@ retry:
 	if (order > sb->page_order)
 		goto retry;
 
-	err = "Bad checksum";
+	err = "bad checksum reading superblock";
 	if (le64_to_cpu(sb->sb->csum) !=
 	    __csum_set(sb->sb, le16_to_cpu(sb->sb->u64s),
 		       le64_to_cpu(sb->sb->version) <
@@ -432,7 +432,7 @@ void __write_super(struct cache_set *c, struct bcache_superblock *disk_sb)
 	struct cache_sb *sb = disk_sb->sb;
 	struct bio *bio = disk_sb->bio;
 
-	bio->bi_rw		|= (REQ_WRITE|REQ_SYNC|REQ_META);
+	bio->bi_rw		|= (REQ_WRITE|REQ_SYNC|REQ_META|REQ_FUA);
 	bio->bi_bdev		= disk_sb->bdev;
 	bio->bi_iter.bi_sector	= SB_SECTOR;
 	bio->bi_iter.bi_size	=
@@ -1318,10 +1318,13 @@ static const char *run_cache_set(struct cache_set *c)
 				goto err;
 		}
 
+		bch_verbose(c, "starting mark and sweep:");
+
 		err = "error in recovery";
 		if (bch_initial_gc(c, &journal))
 			goto err;
-		pr_debug("bch_initial_gc() done");
+
+		bch_verbose(c, "mark and sweep done");
 
 		/*
 		 * bch_journal_start() can't happen sooner, or btree_gc_finish()
@@ -1337,15 +1340,27 @@ static const char *run_cache_set(struct cache_set *c)
 				goto err;
 			}
 
+		bch_verbose(c, "starting journal replay:");
+
 		err = "journal replay failed";
 		if (bch_journal_replay(c, &journal))
 			goto err;
+
+		bch_verbose(c, "journal replay done");
+
+		bch_verbose(c, "starting fs gc:");
 
 		err = "error gcing inode nlinks";
 		if (bch_gc_inode_nlinks(c))
 			goto err;
 
-		bch_fsck(c);
+		bch_verbose(c, "fs gc done");
+
+		if (!c->opts.nofsck) {
+			bch_verbose(c, "starting fsck:");
+			bch_fsck(c);
+			bch_verbose(c, "fsck done");
+		}
 	} else {
 		struct bkey_i_inode inode;
 		struct closure cl;
