@@ -43,6 +43,7 @@
 #include <linux/random.h>
 #include <linux/reboot.h>
 #include <linux/sysfs.h>
+#include <crypto/hash.h>
 
 #include <trace/events/bcache.h>
 
@@ -65,8 +66,8 @@ static struct class *bch_chardev_class;
 static struct device *bch_chardev;
 static DEFINE_IDR(bch_chardev_minor);
 static DECLARE_WAIT_QUEUE_HEAD(bch_read_only_wait);
-
 struct workqueue_struct *bcache_io_wq;
+struct crypto_shash *bch_sha1;
 
 static void bch_cache_stop(struct cache *);
 static int bch_cache_online(struct cache *);
@@ -1098,6 +1099,9 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 	c->congested_read_threshold_us	= 2000;
 	c->congested_write_threshold_us	= 20000;
 	c->error_limit	= 16 << IO_ERROR_SHIFT;
+	init_waitqueue_head(&c->writeback_wait);
+
+	c->writeback_pages_max = (256 << 10) / PAGE_SIZE;
 
 	c->btree_flush_delay = 30;
 
@@ -2397,6 +2401,8 @@ static void bcache_exit(void)
 		class_destroy(bch_chardev_class);
 	if (bch_chardev_major > 0)
 		unregister_chrdev(bch_chardev_major, "bcache");
+	if (!IS_ERR_OR_NULL(bch_sha1))
+		crypto_free_shash(bch_sha1);
 	unregister_reboot_notifier(&reboot);
 }
 
@@ -2419,6 +2425,10 @@ static int __init bcache_init(void)
 	register_reboot_notifier(&reboot);
 	closure_debug_init();
 	bkey_pack_test();
+
+	bch_sha1 = crypto_alloc_shash("sha1", 0, 0);
+	if (IS_ERR(bch_sha1))
+		goto err;
 
 	bch_chardev_major = register_chrdev(0, "bcache-ctl", &bch_chardev_fops);
 	if (bch_chardev_major < 0)
