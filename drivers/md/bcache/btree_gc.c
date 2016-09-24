@@ -509,10 +509,10 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 			goto out;
 		}
 
-	as = __bch_btree_interior_update_alloc(old_nodes, nr_old_nodes, iter);
+	as = bch_btree_interior_update_alloc(c);
 
 	for (i = 0; i < nr_old_nodes; i++)
-		bch_btree_interior_update_will_free_node(as, old_nodes[i]);
+		bch_btree_interior_update_will_free_node(c, as, old_nodes[i]);
 
 	/* Repack everything with @new_format and sort down to one bset */
 	for (i = 0; i < nr_old_nodes; i++)
@@ -600,8 +600,6 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 	for (i = 0; i < nr_old_nodes; i++) {
 		struct bkey_i delete;
 		unsigned j;
-
-		bch_btree_node_free_start(c, as, old_nodes[i]);
 
 		for (j = 0; j < nr_new_nodes; j++)
 			if (!bkey_cmp(old_nodes[i]->key.k.p,
@@ -846,17 +844,17 @@ static void bch_initial_gc_btree(struct cache_set *c, enum btree_id id)
 	struct btree_iter iter;
 	struct btree *b;
 	struct range_checks r;
-	unsigned depth = id == BTREE_ID_EXTENTS ? 0 : 1;
 
-	if (expensive_debug_checks(c))
-		depth = 0;
-
-	btree_node_range_checks_init(&r, depth);
+	btree_node_range_checks_init(&r, 0);
 
 	if (!c->btree_roots[id].b)
 		return;
 
-	for_each_btree_node(&iter, c, id, POS_MIN, depth, b) {
+	/*
+	 * We have to hit every btree node before starting journal replay, in
+	 * order for the journal seq blacklist machinery to work:
+	 */
+	for_each_btree_node(&iter, c, id, POS_MIN, 0, b) {
 		btree_node_range_checks(c, b, &r);
 
 		if (btree_node_has_ptrs(b)) {
