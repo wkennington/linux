@@ -466,7 +466,7 @@ struct bch_extent_crc128 {
 struct bch_extent_ptr {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	__u64			type:1,
-				dirty:1,
+				cached:1,
 				erasure_coded:1,
 				reservation:1,
 				offset:44, /* 8 petabytes */
@@ -478,7 +478,7 @@ struct bch_extent_ptr {
 				offset:44,
 				reservation:1,
 				erasure_coded:1,
-				dirty:1,
+				cached:1,
 				type:1;
 #endif
 } __attribute__((packed, aligned(8)));
