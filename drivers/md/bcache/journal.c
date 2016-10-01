@@ -985,6 +985,7 @@ static void __journal_res_put(struct journal *j, unsigned idx,
 static void __bch_journal_next_entry(struct journal *j)
 {
 	struct journal_entry_pin_list pin_list, *p;
+	struct journal_buf *buf;
 	struct jset *jset;
 
 	/*
@@ -1002,7 +1003,10 @@ static void __bch_journal_next_entry(struct journal *j)
 		j->cur_pin_list = p;
 	}
 
-	jset = journal_cur_buf(j)->data;
+	buf = journal_cur_buf(j);
+	memset(buf->has_inode, 0, sizeof(buf->has_inode));
+
+	jset = buf->data;
 	jset->seq	= cpu_to_le64(++j->seq);
 	jset->u64s	= 0;
 
@@ -1877,7 +1881,7 @@ static void journal_write_done(struct closure *cl)
 
 static void journal_write(struct closure *cl)
 {
-	struct journal *j =  container_of(cl, struct journal, io);
+	struct journal *j = container_of(cl, struct journal, io);
 	struct cache_set *c = container_of(j, struct cache_set, journal);
 	struct cache *ca;
 	struct journal_buf *w = journal_prev_buf(j);
@@ -1962,6 +1966,21 @@ static void journal_write(struct closure *cl)
 		ca->journal.bucket_seq[ca->journal.cur_idx] = le64_to_cpu(w->data->seq);
 	}
 
+	for_each_cache(ca, c, i)
+		if (ca->mi.state == CACHE_ACTIVE &&
+		    journal_flushes_device(ca) &&
+		    !bch_extent_has_device(bkey_i_to_s_c_extent(&j->key), i)) {
+			percpu_ref_get(&ca->ref);
+
+			bio = &ca->journal.bio;
+			bio_reset(bio);
+			bio->bi_bdev		= ca->disk_sb.bdev;
+			bio->bi_rw		= WRITE_FLUSH;
+			bio->bi_end_io		= journal_write_endio;
+			bio->bi_private		= w;
+			closure_bio_submit_punt(bio, cl, c);
+		}
+
 	closure_return_with_destructor(cl, journal_write_done);
 }
 
@@ -1976,15 +1995,47 @@ static void journal_write_work(struct work_struct *work)
 		spin_unlock(&j->lock);
 }
 
+static void bch_journal_set_has_inode(struct journal_buf *buf, u64 inode)
+{
+	set_bit(hash_64(inode, sizeof(buf->has_inode) * 8), buf->has_inode);
+}
+
+/*
+ * Given an inode number, if that inode number has data in the journal that
+ * hasn't yet been flushed, return the journal sequence number that needs to be
+ * flushed:
+ */
+u64 bch_inode_journal_seq(struct journal *j, u64 inode)
+{
+	size_t h = hash_64(inode, sizeof(j->buf[0].has_inode) * 8);
+	u64 seq = 0;
+
+	if (!test_bit(h, j->buf[0].has_inode) &&
+	    !test_bit(h, j->buf[1].has_inode))
+		return 0;
+
+	spin_lock(&j->lock);
+	if (test_bit(h, journal_cur_buf(j)->has_inode))
+		seq = j->seq;
+	else if (test_bit(h, journal_prev_buf(j)->has_inode))
+		seq = j->seq - 1;
+	spin_unlock(&j->lock);
+
+	return seq;
+}
+
 void bch_journal_add_keys(struct journal *j, struct journal_res *res,
 			  enum btree_id id, const struct bkey_i *k)
 {
+	struct journal_buf *buf = &j->buf[res->idx];
 	unsigned actual = jset_u64s(k->k.u64s);
 
 	BUG_ON(!res->ref);
 	BUG_ON(actual > res->u64s);
 
-	bch_journal_add_entry_at(&j->buf[res->idx], k, k->k.u64s,
+	bch_journal_set_has_inode(buf, k->k.p.inode);
+
+	bch_journal_add_entry_at(buf, k, k->k.u64s,
 				 JOURNAL_ENTRY_BTREE_KEYS, id,
 				 0, res->offset);
 
