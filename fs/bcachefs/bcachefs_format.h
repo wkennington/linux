@@ -108,8 +108,6 @@ struct bversion {
 } __attribute__((packed, aligned(4)));
 
 struct bkey {
-	__u64		_data[0];
-
 	/* Size of combined key and value, in u64s */
 	__u8		u64s;
 
@@ -213,8 +211,18 @@ enum bch_bkey_fields {
 
 /* bkey with inline value */
 struct bkey_i {
-	struct bkey	k;
-	struct bch_val	v;
+	__u64			_data[0];
+
+	union {
+	struct {
+		/* Size of combined key and value, in u64s */
+		__u8		u64s;
+	};
+	struct {
+		struct bkey	k;
+		struct bch_val	v;
+	};
+	};
 };
 
 #define KEY(_inode, _offset, _size)					\
@@ -1274,7 +1282,15 @@ struct btree_node {
 	struct bch_extent_ptr	ptr;
 	struct bkey_format	format;
 
+	union {
 	struct bset		keys;
+	struct {
+		__u8		pad[22];
+		__le16		u64s;
+		__u64		_data[0];
+
+	};
+	};
 } __attribute__((packed));
 
 LE64_BITMASK(BTREE_NODE_ID,	struct btree_node, flags, 0, 4);
@@ -1283,7 +1299,15 @@ LE64_BITMASK(BTREE_NODE_LEVEL,	struct btree_node, flags, 4, 8);
 struct btree_node_entry {
 	struct bch_csum		csum;
 
+	union {
 	struct bset		keys;
+	struct {
+		__u8		pad[22];
+		__le16		u64s;
+		__u64		_data[0];
+
+	};
+	};
 } __attribute__((packed));
 
 /* Crypto: */
