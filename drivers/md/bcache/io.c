@@ -210,7 +210,7 @@ static void bch_write_done(struct closure *cl)
 
 	bch_disk_reservation_put(op->c, &op->res);
 	percpu_ref_put(&op->c->writes);
-	bch_keylist_free(&op->insert_keys);
+	bch_keylist_free(&op->insert_keys, op->inline_keys);
 	closure_return(cl);
 }
 
@@ -262,7 +262,7 @@ static void bch_write_index(struct closure *cl)
 		op->written += sectors_start - keylist_sectors(keys);
 
 		if (ret) {
-			__bcache_io_error(op->c, "btree IO error");
+			__bcache_io_error(op->c, "btree IO error %i", ret);
 			op->error = ret;
 		}
 	}
@@ -342,7 +342,7 @@ static void bch_write_io_error(struct closure *cl)
 	} else {
 		/* TODO: We could try to recover from this. */
 		while (!bch_keylist_empty(&op->insert_keys))
-			bch_keylist_dequeue(&op->insert_keys);
+			bch_keylist_pop_front(&op->insert_keys);
 
 		op->error = -EIO;
 		op->flags |= BCH_WRITE_DONE;
@@ -560,13 +560,18 @@ static void __bch_write(struct closure *cl)
 
 		/* for the device pointers and 1 for the chksum */
 		if (bch_keylist_realloc(&op->insert_keys,
+					op->inline_keys,
+					ARRAY_SIZE(op->inline_keys),
 					BKEY_EXTENT_U64s_MAX))
 			continue_at(cl, bch_write_index, op->c->wq);
 
 		k = op->insert_keys.top;
 		bkey_extent_init(k);
 		k->k.p = op->pos;
-		bch_key_resize(&k->k, bio_sectors(bio));
+		bch_key_resize(&k->k,
+			       (op->flags & BCH_WRITE_DATA_COMPRESSED)
+			       ? op->size
+			       : bio_sectors(bio));
 
 		b = bch_alloc_sectors_start(op->c, op->wp,
 			bkey_i_to_extent(k), op->nr_replicas,
@@ -620,7 +625,7 @@ static void __bch_write(struct closure *cl)
 		if (!(op->flags & BCH_WRITE_CACHED))
 			bch_check_mark_super(op->c, k, false);
 
-		bch_keylist_enqueue(&op->insert_keys);
+		bch_keylist_push(&op->insert_keys);
 
 		trace_bcache_cache_insert(&k->k);
 	} while (ret);
@@ -1029,7 +1034,7 @@ static void bch_read_endio(struct bio *bio)
 	struct bch_read_bio *rbio =
 		container_of(bio, struct bch_read_bio, bio);
 	struct cache_set *c = rbio->ca->set;
-	int stale = race_fault() ||
+	int stale = ((rbio->flags & BCH_READ_RETRY_IF_STALE) && race_fault()) ||
 		ptr_stale(rbio->ca, &rbio->ptr) ? -EINTR : 0;
 	int error = bio->bi_error ?: stale;
 
@@ -1188,6 +1193,7 @@ void bch_read_extent_iter(struct cache_set *c, struct bch_read_bio *orig,
 		if (rbio->crc.compression_type) {
 			promote_op->write.op.flags |= BCH_WRITE_DATA_COMPRESSED;
 			promote_op->write.op.crc = rbio->crc;
+			promote_op->write.op.size = k.k->size;
 		} else if (read_full) {
 			/*
 			 * Adjust bio to correspond to _live_ portion of @k -
@@ -1230,6 +1236,7 @@ static void bch_read_iter(struct cache_set *c, struct bch_read_bio *rbio,
 	struct bio *bio = &rbio->bio;
 	struct btree_iter iter;
 	struct bkey_s_c k;
+	int ret;
 
 	for_each_btree_key_with_holes(&iter, c, BTREE_ID_EXTENTS,
 				      POS(inode, bvec_iter.bi_sector), k) {
@@ -1289,8 +1296,9 @@ static void bch_read_iter(struct cache_set *c, struct bch_read_bio *rbio,
 	 * If we get here, it better have been because there was an error
 	 * reading a btree node
 	 */
-	BUG_ON(!bch_btree_iter_unlock(&iter));
-	bcache_io_error(c, bio, "btree IO error");
+	ret = bch_btree_iter_unlock(&iter);
+	BUG_ON(!ret);
+	bcache_io_error(c, bio, "btree IO error %i", ret);
 	bio_endio(bio);
 }
 

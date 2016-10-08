@@ -1337,17 +1337,26 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 		if (k.k->size &&
 		    overlap == BCH_EXTENT_OVERLAP_MIDDLE) {
 			unsigned sectors = bkey_extent_is_compressed(c, k.s_c);
-			int flags = 0;
+			int flags = BCH_DISK_RESERVATION_BTREE_LOCKS_HELD;
 
 			if (trans->flags & BTREE_INSERT_NOFAIL)
 				flags |= BCH_DISK_RESERVATION_NOFAIL;
 
-			if (sectors &&
-			    bch_disk_reservation_add(c, trans->disk_res,
-						     sectors, flags)) {
-				ret = BTREE_INSERT_ENOSPC;
-				goto stop;
-			}
+			if (sectors)
+				switch (bch_disk_reservation_add(c,
+						trans->disk_res,
+						sectors, flags)) {
+				case 0:
+					break;
+				case -ENOSPC:
+					ret = BTREE_INSERT_ENOSPC;
+					goto stop;
+				case -EINTR:
+					ret = BTREE_INSERT_NEED_GC_LOCK;
+					goto stop;
+				default:
+					BUG();
+				}
 		}
 
 		/*
@@ -1531,12 +1540,8 @@ static const char *bch_extent_invalid(const struct cache_set *c,
 			case BCH_EXTENT_ENTRY_crc64:
 				crc = entry_to_crc(entry);
 
-				reason = "checksum uncompressed size < key size";
-				if (crc_uncompressed_size(crc) < e.k->size)
-					goto invalid;
-
-				reason = "checksum offset > uncompressed size";
-				if (crc_offset(crc) >= crc_uncompressed_size(crc))
+				reason = "checksum offset + key size > uncompressed size";
+				if (crc_offset(crc) + e.k->size > crc_uncompressed_size(crc))
 					goto invalid;
 
 				size_ondisk = crc_compressed_size(crc);

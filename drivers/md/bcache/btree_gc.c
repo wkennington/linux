@@ -308,23 +308,6 @@ static void bch_mark_pending_btree_node_frees(struct cache_set *c)
 	mutex_unlock(&c->btree_interior_update_lock);
 }
 
-static void bch_mark_scan_keylists(struct cache_set *c)
-{
-	struct scan_keylist *kl;
-
-	mutex_lock(&c->gc_scan_keylist_lock);
-
-	/* What the goddamn fuck? */
-	list_for_each_entry(kl, &c->gc_scan_keylists, mark_list) {
-		if (kl->owner == NULL)
-			bch_keylist_recalc_oldest_gens(c, kl);
-		else
-			bch_queue_recalc_oldest_gens(c, kl->owner);
-	}
-
-	mutex_unlock(&c->gc_scan_keylist_lock);
-}
-
 /**
  * bch_gc - recompute bucket marks and oldest_gen, rewrite btree nodes
  */
@@ -426,7 +409,6 @@ void bch_gc(struct cache_set *c)
 	bch_mark_metadata(c);
 	bch_mark_pending_btree_node_frees(c);
 	bch_writeback_recalc_oldest_gens(c);
-	bch_mark_scan_keylists(c);
 
 	for_each_cache(ca, c, i)
 		atomic_long_set(&ca->saturated_count, 0);
@@ -486,7 +468,7 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 	if (IS_ERR(res))
 		return;
 
-	if (bch_keylist_realloc(&keylist,
+	if (bch_keylist_realloc(&keylist, NULL, 0,
 			(BKEY_U64s + BKEY_EXTENT_U64s_MAX) * nr_old_nodes)) {
 		trace_bcache_btree_gc_coalesce_fail(c);
 		goto out;
@@ -654,7 +636,7 @@ next:
 		}
 	}
 out:
-	bch_keylist_free(&keylist);
+	bch_keylist_free(&keylist, NULL);
 	bch_btree_reserve_put(c, res);
 }
 

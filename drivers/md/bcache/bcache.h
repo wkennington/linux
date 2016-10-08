@@ -490,6 +490,7 @@ enum {
 	CACHE_SET_GC_FAILURE,
 	CACHE_SET_BDEV_MOUNTED,
 	CACHE_SET_ERROR,
+	CACHE_SET_FSCK_FIXED_ERRORS,
 };
 
 struct btree_debug {
@@ -535,6 +536,7 @@ struct cache_set {
 		u16		btree_node_size;
 
 		u8		nr_in_set;
+		u8		clean;
 
 		u8		meta_replicas_have;
 		u8		data_replicas_have;
@@ -685,10 +687,6 @@ struct cache_set {
 	/* GARBAGE COLLECTION */
 	struct task_struct	*gc_thread;
 	atomic_t		kick_gc;
-
-	/* This is a list of scan_keylists for btree GC to scan */
-	struct list_head	gc_scan_keylists;
-	struct mutex		gc_scan_keylist_lock;
 
 	/*
 	 * Tracks GC's progress - everything in the range [ZERO_KEY..gc_cur_pos]

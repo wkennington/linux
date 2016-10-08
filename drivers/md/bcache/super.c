@@ -552,6 +552,7 @@ static int cache_sb_to_cache_set(struct cache_set *c, struct cache_sb *src)
 	c->sb.block_size	= le16_to_cpu(src->block_size);
 	c->sb.btree_node_size	= CACHE_SET_BTREE_NODE_SIZE(src);
 	c->sb.nr_in_set		= src->nr_in_set;
+	c->sb.clean		= CACHE_SET_CLEAN(src);
 	c->sb.meta_replicas_have= CACHE_SET_META_REPLICAS_HAVE(src);
 	c->sb.data_replicas_have= CACHE_SET_DATA_REPLICAS_HAVE(src);
 	c->sb.str_hash_type	= CACHE_SET_STR_HASH_TYPE(src);
@@ -1073,8 +1074,6 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 
 	init_rwsem(&c->gc_lock);
 	mutex_init(&c->trigger_gc_lock);
-	mutex_init(&c->gc_scan_keylist_lock);
-	INIT_LIST_HEAD(&c->gc_scan_keylists);
 
 #define BCH_TIME_STAT(name, frequency_units, duration_units)		\
 	spin_lock_init(&c->name##_time.lock);
@@ -1250,6 +1249,7 @@ static const char *run_cache_set(struct cache_set *c)
 	time64_t now;
 	LIST_HEAD(journal);
 	struct jset *j;
+	int ret;
 
 	lockdep_assert_held(&bch_register_lock);
 	BUG_ON(test_bit(CACHE_SET_RUNNING, &c->flags));
@@ -1349,16 +1349,18 @@ static const char *run_cache_set(struct cache_set *c)
 		bch_verbose(c, "journal replay done");
 
 		bch_verbose(c, "starting fs gc:");
-
-		err = "error gcing inode nlinks";
-		if (bch_gc_inode_nlinks(c))
-			goto err;
-
+		err = "error in fs gc";
+		ret = bch_gc_inode_nlinks(c);
+		if (ret)
+			goto fsck_err;
 		bch_verbose(c, "fs gc done");
 
 		if (!c->opts.nofsck) {
 			bch_verbose(c, "starting fsck:");
-			bch_fsck(c);
+			err = "error in fsck";
+			ret = bch_fsck(c);
+			if (ret)
+				goto fsck_err;
 			bch_verbose(c, "fsck done");
 		}
 	} else {
@@ -1474,6 +1476,22 @@ err:
 	bch_cache_set_unregister(c);
 	closure_put(&c->caching);
 	return err;
+fsck_err:
+	switch (ret) {
+	case BCH_FSCK_OK:
+		break;
+	case BCH_FSCK_ERRORS_NOT_FIXED:
+		bch_err(c, "filesystem contains errors: please report this to the developers");
+		pr_cont("mount with -o fix_errors to repair");
+		goto err;
+	case BCH_FSCK_REPAIR_UNIMPLEMENTED:
+		bch_err(c, "filesystem contains errors: please report this to the developers");
+		pr_cont("repair unimplemented: inform the developers so that it can be added");
+		goto err;
+	default:
+		goto err;
+	}
+	goto err;
 }
 
 static const char *can_add_cache(struct cache_sb *sb,
@@ -1934,11 +1952,16 @@ static const char *cache_alloc(struct bcache_superblock *sb,
 	ca->bucket_bits = ilog2(ca->mi.bucket_size);
 
 	/* XXX: tune these */
-	movinggc_reserve = max_t(size_t, NUM_GC_GENS * 2,
+	movinggc_reserve = max_t(size_t, NUM_GC_GENS * 4,
 				 ca->mi.nbuckets >> 7);
 	reserve_none = max_t(size_t, 4, ca->mi.nbuckets >> 9);
-	free_inc_reserve = reserve_none << 1;
-	heap_size = max_t(size_t, free_inc_reserve, movinggc_reserve);
+	/*
+	 * free_inc must be smaller than the copygc reserve: if it was bigger,
+	 * one copygc iteration might not make enough buckets available to fill
+	 * up free_inc and allow the allocator to make forward progress
+	 */
+	free_inc_reserve = movinggc_reserve / 2;
+	heap_size = movinggc_reserve * 8;
 
 	if (!init_fifo(&ca->free[RESERVE_PRIO], prio_buckets(ca), GFP_KERNEL) ||
 	    !init_fifo(&ca->free[RESERVE_BTREE], BTREE_NODE_RESERVE, GFP_KERNEL) ||
@@ -1979,12 +2002,6 @@ static const char *cache_alloc(struct bcache_superblock *sb,
 
 	ca->tiering_write_point.reserve = RESERVE_NONE;
 	ca->tiering_write_point.group = &ca->self;
-
-	/* XXX: scan keylists will die */
-	bch_scan_keylist_init(&ca->moving_gc_queue.keys, c,
-			      DFLT_SCAN_KEYLIST_MAX_SIZE);
-	bch_scan_keylist_init(&ca->tiering_queue.keys, c,
-			      DFLT_SCAN_KEYLIST_MAX_SIZE);
 
 	kobject_get(&c->kobj);
 	ca->set = c;

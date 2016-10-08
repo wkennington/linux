@@ -732,11 +732,17 @@ static void invalidate_buckets(struct cache *ca)
 
 static bool __bch_allocator_push(struct cache *ca, long bucket)
 {
-	unsigned i;
+	if (fifo_push(&ca->free[RESERVE_PRIO], bucket))
+		goto success;
 
-	for (i = 0; i < RESERVE_NR; i++)
-		if (fifo_push(&ca->free[i], bucket))
-			goto success;
+	if (fifo_push(&ca->free[RESERVE_MOVINGGC], bucket))
+		goto success;
+
+	if (fifo_push(&ca->free[RESERVE_BTREE], bucket))
+		goto success;
+
+	if (fifo_push(&ca->free[RESERVE_NONE], bucket))
+		goto success;
 
 	return false;
 success:
@@ -927,7 +933,7 @@ static void recalc_alloc_group_weights(struct cache_set *c,
 				       struct cache_group *devs)
 {
 	struct cache *ca;
-	u64 available_buckets = 0;
+	u64 available_buckets = 1; /* avoid a divide by zero... */
 	unsigned i;
 
 	for (i = 0; i < devs->nr_devices; i++) {
@@ -960,6 +966,7 @@ static enum bucket_alloc_ret bch_bucket_alloc_group(struct cache_set *c,
 {
 	enum bucket_alloc_ret ret;
 	unsigned fail_idx = -1, i;
+	unsigned available = 0;
 
 	if (ob->nr_ptrs >= nr_replicas)
 		return ALLOC_SUCCESS;
@@ -968,14 +975,9 @@ static enum bucket_alloc_ret bch_bucket_alloc_group(struct cache_set *c,
 	spin_lock(&devs->lock);
 
 	for (i = 0; i < devs->nr_devices; i++)
-		if (!test_bit(devs->d[i].dev->sb.nr_this_dev, caches_used))
-			goto available;
+		available += !test_bit(devs->d[i].dev->sb.nr_this_dev,
+				       caches_used);
 
-	/* no unused devices: */
-	ret = NO_DEVICES;
-	goto err;
-
-available:
 	recalc_alloc_group_weights(c, devs);
 
 	i = devs->cur_device;
@@ -983,6 +985,11 @@ available:
 	while (ob->nr_ptrs < nr_replicas) {
 		struct cache *ca;
 		u64 bucket;
+
+		if (!available) {
+			ret = NO_DEVICES;
+			goto err;
+		}
 
 		i++;
 		i %= devs->nr_devices;
@@ -1022,11 +1029,13 @@ available:
 		};
 
 		__set_bit(ca->sb.nr_this_dev, caches_used);
+		available--;
 		devs->cur_device = i;
 	}
 
 	ret = ALLOC_SUCCESS;
 err:
+	EBUG_ON(ret != ALLOC_SUCCESS && reserve == RESERVE_MOVINGGC);
 	spin_unlock(&devs->lock);
 	rcu_read_unlock();
 	return ret;
@@ -1525,10 +1534,16 @@ static void bch_recalc_capacity(struct cache_set *c)
 		 * allocations for foreground writes must wait -
 		 * not -ENOSPC calculations.
 		 */
-		for (j = 0; j < RESERVE_NR; j++)
+		for (j = 0; j < RESERVE_NONE; j++)
 			reserve += ca->free[j].size;
 
 		reserve += ca->free_inc.size;
+
+		reserve += ARRAY_SIZE(c->write_points);
+
+		if (ca->mi.tier)
+			reserve += 1;	/* tiering write point */
+		reserve += 1;		/* btree write point */
 
 		reserved_sectors += reserve << ca->bucket_bits;
 

@@ -503,6 +503,14 @@ static struct btree_reserve *__bch_btree_reserve_get(struct cache_set *c,
 	if (!check_enospc)
 		flags |= BCH_DISK_RESERVATION_NOFAIL;
 
+	/*
+	 * This check isn't necessary for correctness - it's just to potentially
+	 * prevent us from doing a lot of work that'll end up being wasted:
+	 */
+	ret = bch_journal_error(&c->journal);
+	if (ret)
+		return ERR_PTR(ret);
+
 	if (bch_disk_reservation_get(c, &disk_res, sectors, flags))
 		return ERR_PTR(-ENOSPC);
 
@@ -725,10 +733,9 @@ static void verify_keys_sorted(struct keylist *l)
 #ifdef CONFIG_BCACHE_DEBUG
 	struct bkey_i *k;
 
-	for (k = l->bot;
-	     k < l->top && bkey_next(k) < l->top;
-	     k = bkey_next(k))
-		BUG_ON(bkey_cmp(k->k.p, bkey_next(k)->k.p) >= 0);
+	for_each_keylist_key(l, k)
+		BUG_ON(bkey_next(k) != l->top &&
+		       bkey_cmp(k->k.p, bkey_next(k)->k.p) >= 0);
 #endif
 }
 
@@ -1092,7 +1099,7 @@ bch_btree_insert_keys_interior(struct btree *b,
 
 	btree_node_lock_for_insert(b, iter);
 
-	if (bch_keylist_nkeys(insert_keys) >
+	if (bch_keylist_u64s(insert_keys) >
 	    bch_btree_keys_u64s_remaining(iter->c, b)) {
 		btree_node_unlock_write(b, iter);
 		return BTREE_INSERT_BTREE_NODE_FULL;
@@ -1115,7 +1122,7 @@ bch_btree_insert_keys_interior(struct btree *b,
 
 		bch_insert_fixup_btree_ptr(iter, b, insert,
 					   &node_iter, &res->disk_res);
-		bch_keylist_dequeue(insert_keys);
+		bch_keylist_pop_front(insert_keys);
 	}
 
 	btree_interior_update_updated_btree(iter->c, as, b);
@@ -1224,7 +1231,7 @@ static void btree_split_insert_keys(struct btree_iter *iter, struct btree *b,
 	while (!bch_keylist_empty(keys)) {
 		k = bch_keylist_front(keys);
 
-		BUG_ON(bch_keylist_nkeys(keys) >
+		BUG_ON(bch_keylist_u64s(keys) >
 		       bch_btree_keys_u64s_remaining(iter->c, b));
 		BUG_ON(bkey_cmp(k->k.p, b->data->min_key) < 0);
 
@@ -1234,7 +1241,7 @@ static void btree_split_insert_keys(struct btree_iter *iter, struct btree *b,
 		}
 
 		bch_insert_fixup_btree_ptr(iter, b, k, &node_iter, &res->disk_res);
-		bch_keylist_dequeue(keys);
+		bch_keylist_pop_front(keys);
 	}
 
 	six_unlock_write(&b->lock);
@@ -1252,7 +1259,7 @@ static void btree_split(struct btree *b, struct btree_iter *iter,
 	struct btree *n1, *n2 = NULL, *n3 = NULL;
 	uint64_t start_time = local_clock();
 	unsigned u64s_to_insert = b->level
-		? bch_keylist_nkeys(insert_keys) : 0;
+		? bch_keylist_u64s(insert_keys) : 0;
 
 	BUG_ON(!parent && (b != btree_node_root(b)));
 	BUG_ON(!btree_node_intent_locked(iter, btree_node_root(b)->level));
@@ -1561,8 +1568,9 @@ int __bch_btree_insert_at(struct btree_insert *trans, u64 *journal_seq)
 	struct cache_set *c = trans->c;
 	struct journal_res res = { 0, 0 };
 	struct btree_insert_entry *i;
-	struct btree_iter *split;
+	struct btree_iter *split = NULL;
 	struct closure cl;
+	bool cycle_gc_lock = false;
 	unsigned u64s;
 	int ret;
 
@@ -1619,6 +1627,7 @@ retry:
 
 	ret = 0;
 	split = NULL;
+	cycle_gc_lock = false;
 
 	trans_for_each_entry(trans, i) {
 		if (i->done)
@@ -1641,6 +1650,12 @@ retry:
 		case BTREE_INSERT_ENOSPC:
 			ret = -ENOSPC;
 			break;
+		case BTREE_INSERT_NEED_GC_LOCK:
+			cycle_gc_lock = true;
+			ret = -EINTR;
+			break;
+		default:
+			BUG();
 		}
 
 		if (!trans->did_work && (ret || split))
@@ -1689,6 +1704,11 @@ err:
 		ret = -EINTR;
 	}
 
+	if (cycle_gc_lock) {
+		down_read(&c->gc_lock);
+		up_read(&c->gc_lock);
+	}
+
 	/*
 	 * Main rule is, BTREE_INSERT_ATOMIC means we can't call
 	 * bch_btree_iter_traverse(), because if we have to we either dropped
@@ -1724,7 +1744,7 @@ int bch_btree_insert_list_at(struct btree_iter *iter,
 	BUG_ON(bch_keylist_empty(keys));
 	verify_keys_sorted(keys);
 
-	while (1) {
+	while (!bch_keylist_empty(keys)) {
 		/* need to traverse between each insert */
 		int ret = bch_btree_iter_traverse(iter);
 		if (ret)
@@ -1736,10 +1756,10 @@ int bch_btree_insert_list_at(struct btree_iter *iter,
 		if (ret)
 			return ret;
 
-		bch_keylist_dequeue(keys);
-		if (bch_keylist_empty(keys))
-			return 0;
+		bch_keylist_pop_front(keys);
 	}
+
+	return 0;
 }
 
 /**

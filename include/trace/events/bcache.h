@@ -993,38 +993,6 @@ DEFINE_EVENT(open_bucket_alloc, bcache_open_bucket_alloc_fail,
 
 /* Keylists */
 
-DECLARE_EVENT_CLASS(keylist,
-	TP_PROTO(struct keylist *keys),
-	TP_ARGS(keys),
-
-	TP_STRUCT__entry(
-		__field(struct keylist *,	keys		)
-		__field(size_t,			capacity	)
-	),
-
-	TP_fast_assign(
-		__entry->keys		= keys;
-		__entry->capacity	= bch_keylist_capacity(keys);
-	),
-
-	TP_printk("%p capacity %zu", __entry->keys, __entry->capacity)
-);
-
-DEFINE_EVENT(keylist, bcache_keylist_realloc,
-	TP_PROTO(struct keylist *keys),
-	TP_ARGS(keys)
-);
-
-DEFINE_EVENT(keylist, bcache_keylist_realloc_full,
-	TP_PROTO(struct keylist *keys),
-	TP_ARGS(keys)
-);
-
-DEFINE_EVENT(keylist, bcache_keylist_realloc_fail,
-	TP_PROTO(struct keylist *keys),
-	TP_ARGS(keys)
-);
-
 TRACE_EVENT(bcache_keyscan,
 	TP_PROTO(unsigned nr_found,
 		 unsigned start_inode, u64 start_offset,
@@ -1075,9 +1043,9 @@ DECLARE_EVENT_CLASS(moving_io,
 		__entry->inode		= k->p.inode;
 		__entry->offset		= k->p.offset;
 		__entry->sectors	= k->size;
-		__entry->count		= q->count;
-		__entry->read_count	= q->read_count;
-		__entry->write_count	= q->write_count;
+		__entry->count		= atomic_read(&q->count);
+		__entry->read_count	= atomic_read(&q->read_count);
+		__entry->write_count	= atomic_read(&q->write_count);
 	),
 
 	TP_printk("%p %u:%llu sectors %u queue %u reads %u writes %u",
