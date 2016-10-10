@@ -691,10 +691,8 @@ static void __bch_cache_set_read_only(struct cache_set *c)
 	bch_ratelimit_reset(&c->tiering_pd.rate);
 	bch_tiering_read_stop(c);
 
-	for_each_cache(ca, c, i) {
-		bch_tiering_write_stop(ca);
+	for_each_cache(ca, c, i)
 		bch_moving_gc_stop(ca);
-	}
 
 	bch_gc_thread_stop(c);
 
@@ -846,8 +844,6 @@ static const char *__bch_cache_set_read_write(struct cache_set *c)
 			percpu_ref_put(&ca->ref);
 			goto err;
 		}
-
-		bch_tiering_write_start(ca);
 	}
 
 	err = "error starting tiering thread";
@@ -1541,7 +1537,6 @@ static void __bch_cache_read_only(struct cache *ca)
 {
 	trace_bcache_cache_read_only(ca);
 
-	bch_tiering_write_stop(ca);
 	bch_moving_gc_stop(ca);
 
 	/*
@@ -1597,8 +1592,6 @@ static const char *__bch_cache_read_write(struct cache *ca)
 	lockdep_assert_held(&bch_register_lock);
 
 	trace_bcache_cache_read_write(ca);
-
-	bch_tiering_write_start(ca);
 
 	trace_bcache_cache_read_write_done(ca);
 
@@ -1660,15 +1653,6 @@ static void bch_cache_free_work(struct work_struct *work)
 	struct cache *ca = container_of(work, struct cache, free_work);
 	struct cache_set *c = ca->set;
 	unsigned i;
-
-	/*
-	 * These test internally and skip if never initialized,
-	 * hence we don't need to test here. However, we do need
-	 * to unregister them before we drop our reference to
-	 * @c.
-	 */
-	bch_moving_gc_destroy(ca);
-	bch_tiering_write_destroy(ca);
 
 	cancel_work_sync(&ca->io_error_work);
 
@@ -1937,6 +1921,7 @@ static const char *cache_alloc(struct bcache_superblock *sb,
 	spin_lock_init(&ca->freelist_lock);
 	spin_lock_init(&ca->prio_buckets_lock);
 	mutex_init(&ca->heap_lock);
+	bch_moving_init_cache(ca);
 
 	ca->disk_sb = *sb;
 	ca->disk_sb.bdev->bd_holder = ca;
@@ -1983,9 +1968,7 @@ static const char *cache_alloc(struct bcache_superblock *sb,
 	    !(ca->bio_prio = bio_kmalloc(GFP_NOIO, bucket_pages(ca))) ||
 	    bioset_init(&ca->replica_set, 4,
 			offsetof(struct bch_write_bio, bio.bio)) ||
-	    !(ca->sectors_written = alloc_percpu(*ca->sectors_written)) ||
-	    bch_moving_init_cache(ca) ||
-	    bch_tiering_init_cache(ca))
+	    !(ca->sectors_written = alloc_percpu(*ca->sectors_written)))
 		goto err;
 
 	ca->prio_last_buckets = ca->prio_buckets + prio_buckets(ca);
