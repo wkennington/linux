@@ -419,6 +419,13 @@ void bch_gc(struct cache_set *c)
 	up_write(&c->gc_lock);
 	trace_bcache_gc_end(c);
 	bch_time_stats_update(&c->btree_gc_time, start_time);
+
+	/*
+	 * Wake up allocator in case it was waiting for buckets
+	 * because of not being able to inc gens
+	 */
+	for_each_cache(ca, c, i)
+		bch_wake_allocator(ca);
 }
 
 /* Btree coalescing */
@@ -465,16 +472,18 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 		return;
 
 	res = bch_btree_reserve_get(c, parent, nr_old_nodes, false, NULL);
-	if (IS_ERR(res))
+	if (IS_ERR(res)) {
+		trace_bcache_btree_gc_coalesce_fail(c,
+				BTREE_GC_COALESCE_FAIL_RESERVE_GET);
 		return;
+	}
 
 	if (bch_keylist_realloc(&keylist, NULL, 0,
 			(BKEY_U64s + BKEY_EXTENT_U64s_MAX) * nr_old_nodes)) {
-		trace_bcache_btree_gc_coalesce_fail(c);
+		trace_bcache_btree_gc_coalesce_fail(c,
+				BTREE_GC_COALESCE_FAIL_KEYLIST_REALLOC);
 		goto out;
 	}
-
-	trace_bcache_btree_gc_coalesce(parent, nr_old_nodes);
 
 	/* Find a format that all keys in @old_nodes can pack into */
 	bch_bkey_format_init(&format_state);
@@ -487,9 +496,12 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 	/* Check if repacking would make any nodes too big to fit */
 	for (i = 0; i < nr_old_nodes; i++)
 		if (!bch_btree_node_format_fits(old_nodes[i], &new_format)) {
-			trace_bcache_btree_gc_coalesce_fail(c);
+			trace_bcache_btree_gc_coalesce_fail(c,
+					BTREE_GC_COALESCE_FAIL_FORMAT_FITS);
 			goto out;
 		}
+
+	trace_bcache_btree_gc_coalesce(parent, nr_old_nodes);
 
 	as = bch_btree_interior_update_alloc(c);
 
@@ -711,9 +723,9 @@ static int bch_coalesce_btree(struct cache_set *c, enum btree_id btree_id)
 /**
  * bch_coalesce - coalesce adjacent nodes with low occupancy
  */
-static void bch_coalesce(struct cache_set *c)
+void bch_coalesce(struct cache_set *c)
 {
-	u64 start_time = local_clock();
+	u64 start_time;
 	enum btree_id id;
 
 	if (btree_gc_coalesce_disabled(c))
@@ -722,7 +734,9 @@ static void bch_coalesce(struct cache_set *c)
 	if (test_bit(CACHE_SET_GC_FAILURE, &c->flags))
 		return;
 
+	down_read(&c->gc_lock);
 	trace_bcache_gc_coalesce_start(c);
+	start_time = local_clock();
 
 	for (id = 0; id < BTREE_ID_NR; id++) {
 		int ret = c->btree_roots[id].b
@@ -738,8 +752,8 @@ static void bch_coalesce(struct cache_set *c)
 	}
 
 	bch_time_stats_update(&c->btree_coalesce_time, start_time);
-
 	trace_bcache_gc_coalesce_end(c);
+	up_read(&c->gc_lock);
 }
 
 static int bch_gc_thread(void *arg)
@@ -748,8 +762,6 @@ static int bch_gc_thread(void *arg)
 	struct io_clock *clock = &c->io_clock[WRITE];
 	unsigned long last = atomic_long_read(&clock->now);
 	unsigned last_kick = atomic_read(&c->kick_gc);
-	struct cache *ca;
-	unsigned i;
 
 	set_freezable();
 
@@ -776,22 +788,8 @@ static int bch_gc_thread(void *arg)
 		last = atomic_long_read(&clock->now);
 		last_kick = atomic_read(&c->kick_gc);
 
-		/*
-		 * avoid racing with sysfs trigger_gc - gc gets confused if it
-		 * runs concurrently with coalescing
-		 */
-		mutex_lock(&c->trigger_gc_lock);
 		bch_gc(c);
-
-		/*
-		 * Wake up allocator in case it was waiting for buckets
-		 * because of not being able to inc gens
-		 */
-		for_each_cache(ca, c, i)
-			bch_wake_allocator(ca);
-
 		bch_coalesce(c);
-		mutex_unlock(&c->trigger_gc_lock);
 
 		debug_check_no_locks_held();
 	}
