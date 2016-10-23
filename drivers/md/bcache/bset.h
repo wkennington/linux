@@ -543,6 +543,20 @@ struct bkey_s_c bch_btree_node_iter_peek_unpack(struct btree_node_iter *,
 
 /* Accounting: */
 
+static inline bool bkey_is_whiteout(const struct bkey *k)
+{
+	return bkey_deleted(k) ||
+		(k->type == KEY_TYPE_DISCARD && !k->version);
+}
+
+static inline bool bkey_packed_is_whiteout(const struct btree_keys *b,
+					   const struct bkey_packed *k)
+{
+	return bkey_deleted(k) ||
+		(k->type == KEY_TYPE_DISCARD &&
+		 !bkey_unpack_key(&b->format, k).version);
+}
+
 static inline void btree_keys_account_key(struct btree_nr_keys *n,
 					  unsigned bset,
 					  struct bkey_packed *k,
