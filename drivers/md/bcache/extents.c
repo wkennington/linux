@@ -1327,6 +1327,7 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 	       (ret = extent_insert_should_stop(trans, insert, res,
 				start_time, nr_done)) == BTREE_INSERT_OK &&
 	       (_k = bch_btree_node_iter_peek_all(node_iter, &b->keys))) {
+		struct bset_tree *t = bch_bkey_to_bset(&b->keys, _k);
 		struct bkey_s k = __bkey_disassemble(f, _k, &unpacked);
 		enum bch_extent_overlap overlap;
 
@@ -1402,8 +1403,8 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 			 * key and we've just changed the end, update the
 			 * auxiliary tree.
 			 */
-			bch_bset_fix_invalidated_key(&b->keys, _k);
-			bch_btree_node_iter_fix(iter, b, node_iter, _k, true);
+			bch_bset_fix_invalidated_key(&b->keys, t, _k);
+			bch_btree_node_iter_fix(iter, b, node_iter, t, _k, true);
 			break;
 
 		case BCH_EXTENT_OVERLAP_ALL: {
@@ -1411,7 +1412,8 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 
 			/* The insert key completely covers k, invalidate k */
 			if (!bkey_is_whiteout(k.k))
-				btree_keys_account_key_drop(&b->keys, _k);
+				btree_keys_account_key_drop(&b->keys.nr,
+							t - b->keys.set, _k);
 
 			bch_drop_subtract(iter, k, &stats);
 			k.k->p = bkey_start_pos(&insert->k->k);
@@ -1442,8 +1444,9 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 				 */
 				EBUG_ON(bkey_cmp(committed_pos, k.k->p));
 			} else {
-				bch_bset_fix_invalidated_key(&b->keys, _k);
-				bch_btree_node_iter_fix(iter, b, node_iter, _k, true);
+				bch_bset_fix_invalidated_key(&b->keys, t, _k);
+				bch_btree_node_iter_fix(iter, b, node_iter, t,
+							_k, true);
 			}
 
 			break;
@@ -2155,6 +2158,7 @@ static void extent_i_save(struct btree_keys *b, struct btree_node_iter *iter,
 
 static bool extent_merge_one_overlapping(struct btree_iter *iter,
 					 struct bpos new_pos,
+					 struct bset_tree *t,
 					 struct bkey_packed *k, struct bkey uk,
 					 bool check, bool could_pack)
 {
@@ -2168,8 +2172,8 @@ static bool extent_merge_one_overlapping(struct btree_iter *iter,
 	} else {
 		uk.p = new_pos;
 		extent_save(&b->keys, node_iter, k, &uk);
-		bch_bset_fix_invalidated_key(&b->keys, k);
-		bch_btree_node_iter_fix(iter, b, node_iter, k, true);
+		bch_bset_fix_invalidated_key(&b->keys, t, k);
+		bch_btree_node_iter_fix(iter, b, node_iter, t, k, true);
 		return true;
 	}
 }
@@ -2223,7 +2227,7 @@ do_fixup:
 					continue;
 
 				if (!extent_merge_one_overlapping(iter, new_pos,
-						k, uk, check, could_pack))
+						t, k, uk, check, could_pack))
 					return false;
 			}
 		} else {
@@ -2238,7 +2242,7 @@ do_fixup:
 					continue;
 
 				if (!extent_merge_one_overlapping(iter, new_pos,
-						k, uk, check, could_pack))
+						t, k, uk, check, could_pack))
 					return false;
 			}
 		}
@@ -2268,6 +2272,7 @@ static bool bch_extent_merge_inline(struct btree_iter *iter,
 	struct btree_keys *b = &iter->nodes[0]->keys;
 	struct btree_node_iter *node_iter = &iter->node_iters[0];
 	const struct bkey_format *f = &b->format;
+	struct bset_tree *t = bset_tree_last(b);
 	struct bkey_packed *m;
 	BKEY_PADDED(k) li;
 	BKEY_PADDED(k) ri;
@@ -2285,7 +2290,7 @@ static bool bch_extent_merge_inline(struct btree_iter *iter,
 	mi = back_merge ? &li.k : &ri.k;
 
 	/* l & r should be in last bset: */
-	EBUG_ON(bch_bkey_to_bset(b, m) != bset_tree_last(b));
+	EBUG_ON(bch_bkey_to_bset(b, m) != t);
 
 	switch (bch_extent_merge(b, &li.k, &ri.k)) {
 	case BCH_MERGE_NOMERGE:
@@ -2308,7 +2313,7 @@ static bool bch_extent_merge_inline(struct btree_iter *iter,
 			bch_btree_iter_set_pos_same_leaf(iter, li.k.k.p);
 
 		bch_btree_node_iter_fix(iter, iter->nodes[0], node_iter,
-					m, true);
+					t, m, true);
 
 		if (!back_merge)
 			bkey_copy(packed_to_bkey(l), &li.k);
@@ -2324,7 +2329,7 @@ static bool bch_extent_merge_inline(struct btree_iter *iter,
 
 		extent_i_save(b, node_iter, m, &li.k);
 		bch_btree_node_iter_fix(iter, iter->nodes[0], node_iter,
-					m, true);
+					t, m, true);
 		return true;
 	default:
 		BUG();

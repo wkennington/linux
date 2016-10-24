@@ -319,13 +319,15 @@ void bch_btree_keys_init(struct btree_keys *, const struct btree_keys_ops *,
 void bch_bset_init_first(struct btree_keys *, struct bset *);
 void bch_bset_init_next(struct btree_keys *, struct bset *);
 void bch_bset_build_written_tree(struct btree_keys *, struct bset_tree *);
-void bch_bset_fix_invalidated_key(struct btree_keys *, struct bkey_packed *);
+void bch_bset_fix_invalidated_key(struct btree_keys *, struct bset_tree *,
+				  struct bkey_packed *);
 
 struct bkey_packed *bch_bset_insert(struct btree_keys *,
 				    struct btree_node_iter *,
 				    struct bkey_i *);
-bool bch_bset_try_overwrite(struct btree_keys *, struct btree_node_iter *iter,
-			    struct bkey_packed *, struct bkey_i *);
+bool bch_bset_try_overwrite(struct btree_keys *, struct btree_node_iter *,
+			    struct bset_tree *, struct bkey_packed *,
+			    struct bkey_i *);
 
 /* Bkey utility code */
 
@@ -573,16 +575,8 @@ static inline void btree_keys_account_key(struct btree_nr_keys *n,
 
 #define btree_keys_account_key_add(_nr, _bset_idx, _k)		\
 	btree_keys_account_key(_nr, _bset_idx, _k, 1)
-#define __btree_keys_account_key_drop(_nr, _bset_idx, _k)	\
+#define btree_keys_account_key_drop(_nr, _bset_idx, _k)	\
 	btree_keys_account_key(_nr, _bset_idx, _k, -1)
-
-static inline void btree_keys_account_key_drop(struct btree_keys *b,
-					       struct bkey_packed *k)
-{
-	unsigned idx = bch_bkey_to_bset(b, k) - b->set;
-
-	__btree_keys_account_key_drop(&b->nr, idx, k);
-}
 
 /* Sorting */
 
