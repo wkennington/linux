@@ -93,7 +93,7 @@ struct btree_nr_keys bch_key_sort_fix_overlapping(struct btree_keys *b,
 
 			/* XXX: need better bkey_copy */
 			memcpy(out, k, bkey_bytes(k));
-			btree_keys_account_key_add(&nr, out);
+			btree_keys_account_key_add(&nr, 0, out);
 			out = bkey_next(out);
 		}
 
@@ -763,7 +763,7 @@ static struct bkey_packed *extent_sort_append(struct btree_keys *b,
 	if (bkey_deleted(k))
 		return out;
 
-	btree_keys_account_key_add(nr, k);
+	btree_keys_account_key_add(nr, 0, k);
 
 	/* XXX: need better bkey_copy */
 	memcpy(out, k, bkey_bytes(k));
@@ -1410,7 +1410,7 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 
 			/* The insert key completely covers k, invalidate k */
 			if (!bkey_deleted(_k))
-				btree_keys_account_key_drop(&b->keys.nr, _k);
+				btree_keys_account_key_drop(&b->keys, _k);
 
 			bch_drop_subtract(iter, k, &stats);
 			k.k->p = bkey_start_pos(&insert->k->k);
