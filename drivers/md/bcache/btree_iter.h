@@ -121,6 +121,13 @@ __next_linked_btree_node(struct btree_iter *iter, struct btree *b,
 	for ((_linked) = (_iter);					\
 	     ((_linked) = __next_linked_btree_node(_iter, _b, _linked));)
 
+#define BTREE_ITER_NOT_END	((struct btree *) 1)
+
+static inline bool is_btree_node(struct btree_iter *iter, unsigned l)
+{
+	return iter->nodes[l] && iter->nodes[l] != BTREE_ITER_NOT_END;
+}
+
 #ifdef CONFIG_BCACHE_DEBUG
 void bch_btree_iter_verify(struct btree_iter *, struct btree *);
 #else

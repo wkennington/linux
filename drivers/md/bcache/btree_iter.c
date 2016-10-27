@@ -9,13 +9,6 @@
 
 #include <trace/events/bcache.h>
 
-#define BTREE_ITER_NOT_END	((struct btree *) 1)
-
-static inline bool is_btree_node(struct btree_iter *iter, unsigned l)
-{
-	return iter->nodes[l] && iter->nodes[l] != BTREE_ITER_NOT_END;
-}
-
 /* Btree node locking: */
 
 /*
