@@ -11,6 +11,20 @@ struct bkey_format_state;
 struct bkey_format;
 struct btree;
 
+#define BTREE_SPLIT_THRESHOLD(c)		(btree_blocks(c) * 3 / 4)
+#define BTREE_REWRITE_MERGE_THRESHOLD(c)	(btree_blocks(c) * 1 / 2)
+
+#define BTREE_FOREGROUND_MERGE_THRESHOLD(c)	(btree_max_u64s(c) * 1 / 3)
+#define BTREE_FOREGROUND_MERGE_HYSTERESIS(c)			\
+	(BTREE_FOREGROUND_MERGE_THRESHOLD(c) +			\
+	 (BTREE_FOREGROUND_MERGE_THRESHOLD(c) << 2))
+
+static inline void btree_node_reset_sib_u64s(struct btree *b)
+{
+	b->sib_u64s[0] = b->keys.nr.live_u64s;
+	b->sib_u64s[1] = b->keys.nr.live_u64s;
+}
+
 struct btree_reserve {
 	struct disk_reservation	disk_res;
 	unsigned		nr;
@@ -274,10 +288,10 @@ int __bch_btree_insert_at(struct btree_insert *, u64 *);
 #define BTREE_INSERT_NOFAIL		(1 << 1)
 
 /*
- * Don't account key being insert (bch_mark_key) - only for journal replay,
- * where we've already marked the new keys:
+ * Insert is for journal replay: don't get journal reservations, or mark extents
+ * (bch_mark_key)
  */
-#define BTREE_INSERT_NO_MARK_KEY	(1 << 2)
+#define BTREE_INSERT_JOURNAL_REPLAY	(1 << 2)
 
 int bch_btree_insert_list_at(struct btree_iter *, struct keylist *,
 			     struct disk_reservation *,
@@ -287,12 +301,14 @@ static inline bool journal_res_insert_fits(struct btree_insert *trans,
 					   struct btree_insert_entry *insert,
 					   struct journal_res *res)
 {
-	struct cache_set *c = insert->iter->c;
 	unsigned u64s = 0;
 	struct btree_insert_entry *i;
 
-	/* If we're in journal replay we're not getting journal reservations: */
-	if (!test_bit(JOURNAL_REPLAY_DONE, &c->journal.flags))
+	/*
+	 * If we didn't get a journal reservation, we're in journal replay and
+	 * we're not journalling updates:
+	 */
+	if (!res->ref)
 		return true;
 
 	for (i = insert; i < trans->entries + trans->nr; i++)

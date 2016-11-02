@@ -10,6 +10,7 @@
 #include "btree_cache.h"
 #include "btree_io.h"
 #include "btree_iter.h"
+#include "btree_update.h"
 #include "buckets.h"
 #include "debug.h"
 #include "error.h"
@@ -265,7 +266,8 @@ static ssize_t bch_read_btree(struct file *file, char __user *buf,
 
 	bch_btree_iter_init(&iter, i->c, i->id, i->from);
 
-	while ((k = bch_btree_iter_peek(&iter)).k) {
+	while ((k = bch_btree_iter_peek(&iter)).k &&
+	       !(err = btree_iter_err(k))) {
 		bch_bkey_val_to_text(i->c, bkey_type(0, i->id),
 				     i->buf, sizeof(i->buf), k);
 		i->bytes = strlen(i->buf);
@@ -295,6 +297,53 @@ static const struct file_operations btree_debug_ops = {
 	.read		= bch_read_btree,
 };
 
+static int print_btree_node(struct dump_iter *i, struct btree *b)
+{
+	const struct bkey_format *f = &b->keys.format;
+	struct bset_stats stats;
+
+	memset(&stats, 0, sizeof(stats));
+
+	bch_btree_keys_stats(&b->keys, &stats);
+
+	i->bytes = scnprintf(i->buf, sizeof(i->buf),
+			     "l %u %llu:%llu - %llu:%llu:\n"
+			     "    format: u64s %u fields %u %u %u %u %u\n"
+			     "    bytes used %zu/%zu (%zu%% full)\n"
+			     "    sib u64s: %u, %u (merge threshold %zu)\n"
+			     "    nr packed keys %u\n"
+			     "    nr unpacked keys %u\n"
+			     "    floats %zu\n"
+			     "    failed unpacked %zu\n"
+			     "    failed prev %zu\n"
+			     "    failed overflow %zu\n",
+			     b->level,
+			     b->data->min_key.inode,
+			     b->data->min_key.offset,
+			     b->data->max_key.inode,
+			     b->data->max_key.offset,
+			     f->key_u64s,
+			     f->bits_per_field[0],
+			     f->bits_per_field[1],
+			     f->bits_per_field[2],
+			     f->bits_per_field[3],
+			     f->bits_per_field[4],
+			     b->keys.nr.live_u64s * sizeof(u64),
+			     btree_bytes(i->c) - sizeof(struct btree_node),
+			     b->keys.nr.live_u64s * 100 / btree_max_u64s(i->c),
+			     b->sib_u64s[0],
+			     b->sib_u64s[1],
+			     BTREE_FOREGROUND_MERGE_THRESHOLD(i->c),
+			     b->keys.nr.packed_keys,
+			     b->keys.nr.unpacked_keys,
+			     stats.floats,
+			     stats.failed_unpacked,
+			     stats.failed_prev,
+			     stats.failed_overflow);
+
+	return flush_buf(i);
+}
+
 static ssize_t bch_read_btree_formats(struct file *file, char __user *buf,
 				      size_t size, loff_t *ppos)
 {
@@ -315,46 +364,7 @@ static ssize_t bch_read_btree_formats(struct file *file, char __user *buf,
 		return i->ret;
 
 	for_each_btree_node(&iter, i->c, i->id, i->from, 0, b) {
-		const struct bkey_format *f = &b->keys.format;
-		struct bset_stats stats;
-
-		memset(&stats, 0, sizeof(stats));
-
-		bch_btree_keys_stats(&b->keys, &stats);
-
-		i->bytes = scnprintf(i->buf, sizeof(i->buf),
-				     "l %u %llu:%llu - %llu:%llu:\n"
-				     "\tformat: u64s %u fields %u %u %u %u %u\n"
-				     "\tbytes used %zu/%zu (%zu%% full)\n"
-				     "\tnr packed keys %u\n"
-				     "\tnr unpacked keys %u\n"
-				     "\tfloats %zu\n"
-				     "\tfailed unpacked %zu\n"
-				     "\tfailed prev %zu\n"
-				     "\tfailed overflow %zu\n",
-				     b->level,
-				     b->data->min_key.inode,
-				     b->data->min_key.offset,
-				     b->data->max_key.inode,
-				     b->data->max_key.offset,
-				     f->key_u64s,
-				     f->bits_per_field[0],
-				     f->bits_per_field[1],
-				     f->bits_per_field[2],
-				     f->bits_per_field[3],
-				     f->bits_per_field[4],
-				     b->keys.nr.live_u64s * sizeof(u64),
-				     btree_bytes(i->c) - sizeof(struct btree_node),
-				     (b->keys.nr.live_u64s * sizeof(u64) * 100) /
-				     (btree_bytes(i->c) - sizeof(struct btree_node)),
-				     b->keys.nr.packed_keys,
-				     b->keys.nr.unpacked_keys,
-				     stats.floats,
-				     stats.failed_unpacked,
-				     stats.failed_prev,
-				     stats.failed_overflow);
-
-		err = flush_buf(i);
+		err = print_btree_node(i, b);
 		if (err)
 			break;
 
@@ -381,6 +391,69 @@ static const struct file_operations btree_format_debug_ops = {
 	.read		= bch_read_btree_formats,
 };
 
+static ssize_t bch_read_bfloat_failed(struct file *file, char __user *buf,
+				      size_t size, loff_t *ppos)
+{
+	struct dump_iter *i = file->private_data;
+	struct btree_iter iter;
+	struct bkey_s_c k;
+	struct btree *prev_node = NULL;
+	int err;
+
+	i->ubuf = buf;
+	i->size	= size;
+	i->ret	= 0;
+
+	err = flush_buf(i);
+	if (err)
+		return err;
+
+	if (!i->size)
+		return i->ret;
+
+	bch_btree_iter_init(&iter, i->c, i->id, i->from);
+
+	while ((k = bch_btree_iter_peek(&iter)).k &&
+	       !(err = btree_iter_err(k))) {
+		struct btree_keys *b = &iter.nodes[0]->keys;
+		struct btree_node_iter *node_iter = &iter.node_iters[0];
+		struct bkey_packed *_k = bch_btree_node_iter_peek(node_iter, b);
+
+		if (iter.nodes[0] != prev_node) {
+			err = print_btree_node(i, iter.nodes[0]);
+			if (err)
+				break;
+		}
+		prev_node = iter.nodes[0];
+
+		i->bytes = bch_bkey_print_bfloat(b, _k, i->buf, sizeof(i->buf));
+
+		err = flush_buf(i);
+		if (err)
+			break;
+
+		bch_btree_iter_advance_pos(&iter);
+		i->from = iter.pos;
+
+		err = flush_buf(i);
+		if (err)
+			break;
+
+		if (!i->size)
+			break;
+	}
+	bch_btree_iter_unlock(&iter);
+
+	return err < 0 ? err : i->ret;
+}
+
+static const struct file_operations bfloat_failed_debug_ops = {
+	.owner		= THIS_MODULE,
+	.open		= bch_dump_open,
+	.release	= bch_dump_release,
+	.read		= bch_read_bfloat_failed,
+};
+
 void bch_debug_exit_cache_set(struct cache_set *c)
 {
 	if (!IS_ERR_OR_NULL(c->debug))
@@ -390,7 +463,7 @@ void bch_debug_exit_cache_set(struct cache_set *c)
 void bch_debug_init_cache_set(struct cache_set *c)
 {
 	struct btree_debug *bd;
-	char name[50];
+	char name[100];
 
 	if (IS_ERR_OR_NULL(bch_debug))
 		return;
@@ -413,6 +486,12 @@ void bch_debug_init_cache_set(struct cache_set *c)
 
 		bd->btree_format = debugfs_create_file(name, 0400, c->debug, bd,
 						       &btree_format_debug_ops);
+
+		snprintf(name, sizeof(name), "%s-bfloat-failed",
+			 bch_btree_id_names[bd->id]);
+
+		bd->failed = debugfs_create_file(name, 0400, c->debug, bd,
+						 &bfloat_failed_debug_ops);
 	}
 }
 

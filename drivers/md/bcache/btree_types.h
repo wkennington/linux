@@ -46,6 +46,13 @@ struct btree {
 	u16			written;
 	u8			level;
 	u8			btree_id;
+	u16			sib_u64s[2];
+	/*
+	 * XXX: add a delete sequence number, so when btree_node_relock() fails
+	 * because the lock sequence number has changed - i.e. the contents were
+	 * modified - we can still relock the node if it's still the one we
+	 * want, without redoing the traversal
+	 */
 
 	/*
 	 * For asynchronous splits/interior node updates:

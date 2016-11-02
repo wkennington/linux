@@ -75,7 +75,7 @@ static void btree_node_sort(struct cache_set *c, struct btree *b,
 
 	b->keys.nsets = from;
 	b->keys.nr = nr;
-	bch_bset_build_written_tree(&b->keys);
+	bch_bset_build_written_tree(&b->keys, &b->keys.set[from]);
 
 	if (!is_write_locked)
 		__btree_node_unlock_write(b, iter);
@@ -123,7 +123,7 @@ static bool btree_node_compact(struct cache_set *c, struct btree *b,
 
 nosort:
 	__btree_node_lock_write(b, iter);
-	bch_bset_build_written_tree(&b->keys);
+	bch_bset_build_written_tree(&b->keys, bset_tree_last(&b->keys));
 	__btree_node_unlock_write(b, iter);
 	return false;
 sort:
@@ -382,6 +382,8 @@ void bch_btree_node_read_done(struct cache_set *c, struct btree *b,
 			: bch_key_sort_fix_overlapping,
 			true);
 
+	btree_node_reset_sib_u64s(b);
+
 	err = "short btree key";
 	if (b->keys.set[0].size &&
 	    bkey_cmp_packed(&b->keys.format, &b->key.k,
@@ -455,13 +457,19 @@ int bch_btree_root_read(struct cache_set *c, enum btree_id id,
 {
 	struct closure cl;
 	struct btree *b;
+	int ret;
 
 	closure_init_stack(&cl);
 
-	while (IS_ERR(b = mca_alloc(c, &cl))) {
-		BUG_ON(PTR_ERR(b) != -EAGAIN);
+	do {
+		ret = mca_cannibalize_lock(c, &cl);
 		closure_sync(&cl);
-	}
+	} while (ret);
+
+	b = mca_alloc(c);
+	mca_cannibalize_unlock(c);
+
+	BUG_ON(IS_ERR(b));
 
 	bkey_copy(&b->key, k);
 	BUG_ON(mca_hash_insert(c, b, level, id));
