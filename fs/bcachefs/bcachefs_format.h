@@ -1067,7 +1067,7 @@ enum btree_id {
 
 #undef DEF_BTREE_ID
 
-#define BTREE_MAX_DEPTH		4
+#define BTREE_MAX_DEPTH		4U
 
 /* Btree nodes */
 
