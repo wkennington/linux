@@ -54,8 +54,9 @@ static inline bool should_drop_next_key(struct btree_node_iter *iter,
 {
 	const struct bkey_format *f = &b->format;
 	struct btree_node_iter_set *l = iter->data, *r = iter->data + 1;
+	struct bkey_packed *k = __btree_node_offset_to_key(b, l->k);
 
-	if (bkey_deleted(__btree_node_offset_to_key(b, l->k)))
+	if (bkey_packed_is_whiteout(b, k))
 		return true;
 
 	if (iter->used < 2)
@@ -93,7 +94,7 @@ struct btree_nr_keys bch_key_sort_fix_overlapping(struct btree_keys *b,
 
 			/* XXX: need better bkey_copy */
 			memcpy(out, k, bkey_bytes(k));
-			btree_keys_account_key_add(&nr, out);
+			btree_keys_account_key_add(&nr, 0, out);
 			out = bkey_next(out);
 		}
 
@@ -763,7 +764,7 @@ static void extent_sort_append(struct btree_keys *b,
 	struct bkey_format *f = &b->format;
 	BKEY_PADDED(k) tmp;
 
-	if (bkey_deleted(k))
+	if (bkey_packed_is_whiteout(b, k))
 		return;
 
 	bkey_unpack(&tmp.k, f, k);
@@ -775,7 +776,7 @@ static void extent_sort_append(struct btree_keys *b,
 	if (*prev) {
 		bkey_pack(*prev, (void *) *prev, f);
 
-		btree_keys_account_key_add(nr, *prev);
+		btree_keys_account_key_add(nr, 0, *prev);
 		*prev = bkey_next(*prev);
 	} else {
 		*prev = start;
@@ -875,7 +876,7 @@ struct btree_nr_keys bch_extent_sort_fix_overlapping(struct btree_keys *b,
 
 	if (prev) {
 		bkey_pack(prev, (void *) prev, f);
-		btree_keys_account_key_add(&nr, prev);
+		btree_keys_account_key_add(&nr, 0, prev);
 		out = bkey_next(prev);
 	} else {
 		out = bset->start;
@@ -1096,28 +1097,54 @@ static enum btree_insert_ret extent_insert_should_stop(struct btree_insert *tran
 		return BTREE_INSERT_OK;
 }
 
-static void extent_do_insert(struct btree_iter *iter, struct bkey_i *insert,
-			     struct journal_res *res)
+static void extent_bset_insert(struct btree_iter *iter, struct bkey_i *insert)
 {
-	struct btree_keys *b = &iter->nodes[0]->keys;
+	struct btree *b = iter->nodes[0];
 	struct btree_node_iter *node_iter = &iter->node_iters[0];
-	struct bset_tree *t = bset_tree_last(b);
-	struct bset *i = t->data;
-	struct bkey_packed *prev, *where =
-		bch_btree_node_iter_bset_pos(node_iter, b, i) ?:
-		bset_bkey_last(i);
+	struct bset_tree *t = bset_tree_last(&b->keys);
+	struct bkey_packed *where =
+		bch_btree_node_iter_bset_pos(node_iter, &b->keys, t->data);
+	struct bkey_packed *prev = bkey_prev(t, where);
+	struct bkey_packed *next_live_key = where;
+	unsigned clobber_u64s;
 
+	if (prev)
+		where = bkey_next(prev);
+
+	while (next_live_key != bset_bkey_last(t->data) &&
+	       bkey_deleted(next_live_key))
+		next_live_key = bkey_next(next_live_key);
+
+	/*
+	 * Everything between where and next_live_key is now deleted keys, and
+	 * is overwritten:
+	 */
+	clobber_u64s = (u64 *) next_live_key - (u64 *) where;
+
+	if (prev &&
+	    bch_extent_merge_inline(iter, prev, bkey_to_packed(insert), true))
+		goto drop_deleted_keys;
+
+	if (next_live_key != bset_bkey_last(t->data) &&
+	    bch_extent_merge_inline(iter, bkey_to_packed(insert),
+				    next_live_key, false))
+		goto drop_deleted_keys;
+
+	bch_bset_insert(&b->keys, node_iter, where, insert, clobber_u64s);
+	bch_btree_node_iter_fix(iter, b, node_iter, t, where,
+				clobber_u64s, where->u64s);
+	return;
+drop_deleted_keys:
+	bch_bset_delete(&b->keys, where, clobber_u64s);
+	bch_btree_node_iter_fix(iter, b, node_iter, t, where, clobber_u64s, 0);
+}
+
+static void extent_insert_and_journal(struct btree_iter *iter, struct bkey_i *insert,
+				      struct journal_res *res)
+{
 	bch_btree_journal_key(iter, insert, res);
 
-	if ((prev = bkey_prev(t, where)) &&
-	    bch_extent_merge_inline(iter, prev, bkey_to_packed(insert), true))
-		return;
-
-	if (where != bset_bkey_last(i) &&
-	    bch_extent_merge_inline(iter, bkey_to_packed(insert), where, false))
-		return;
-
-	bch_btree_bset_insert(iter, iter->nodes[0], node_iter, insert);
+	extent_bset_insert(iter, insert);
 }
 
 static void extent_insert_committed(struct btree_insert *trans,
@@ -1159,7 +1186,7 @@ static void extent_insert_committed(struct btree_insert *trans,
 			bkey_debugcheck(iter->c, iter->nodes[iter->level],
 					bkey_i_to_s_c(&split.k));
 
-		extent_do_insert(iter, &split.k, res);
+		extent_insert_and_journal(iter, &split.k, res);
 
 		bch_btree_iter_set_pos_same_leaf(iter, committed_pos);
 
@@ -1413,15 +1440,17 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 			 * auxiliary tree.
 			 */
 			bch_bset_fix_invalidated_key(&b->keys, t, _k);
-			bch_btree_node_iter_fix(iter, b, node_iter, t, _k, true);
+			bch_btree_node_iter_fix(iter, b, node_iter, t,
+						_k, _k->u64s, _k->u64s);
 			break;
 
 		case BCH_EXTENT_OVERLAP_ALL: {
 			struct bpos orig_pos = k.k->p;
 
 			/* The insert key completely covers k, invalidate k */
-			if (!bkey_deleted(_k))
-				btree_keys_account_key_drop(&b->keys.nr, _k);
+			if (!bkey_is_whiteout(k.k))
+				btree_keys_account_key_drop(&b->keys.nr,
+							t - b->keys.set, _k);
 
 			bch_drop_subtract(iter, k, &stats);
 			k.k->p = bkey_start_pos(&insert->k->k);
@@ -1454,7 +1483,7 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 			} else {
 				bch_bset_fix_invalidated_key(&b->keys, t, _k);
 				bch_btree_node_iter_fix(iter, b, node_iter, t,
-							_k, true);
+							_k, _k->u64s, _k->u64s);
 			}
 
 			break;
@@ -1486,7 +1515,7 @@ bch_insert_fixup_extent(struct btree_insert *trans,
 			bch_add_sectors(iter, bkey_i_to_s_c(&split.k),
 					bkey_start_offset(&split.k.k),
 					split.k.k.size, &stats);
-			bch_btree_bset_insert(iter, b, node_iter, &split.k);
+			extent_bset_insert(iter, &split.k);
 			break;
 		}
 		}
@@ -1951,8 +1980,10 @@ static void extent_sort_ptrs(struct cache_set *c, struct bkey_s_extent e)
 /*
  * bch_extent_normalize - clean up an extent, dropping stale pointers etc.
  *
- * Returns true if @k should be dropped entirely (when compacting/rewriting
- * btree nodes).
+ * Returns true if @k should be dropped entirely
+ *
+ * For existing keys, only called when btree nodes are being rewritten, not when
+ * they're merely being compacted/resorted in memory.
  */
 static bool __bch_extent_normalize(struct cache_set *c, struct bkey_s k,
 				   bool sort)
@@ -2155,11 +2186,20 @@ static void extent_i_save(struct btree_keys *b, struct btree_node_iter *iter,
 			  struct bkey_packed *dst, struct bkey_i *src)
 {
 	struct bkey_format *f = &b->format;
+	struct bkey_i *dst_unpacked;
 
 	BUG_ON(bkeyp_val_u64s(f, dst) != bkey_val_u64s(&src->k));
 
-	extent_save(b, iter, dst, &src->k);
-	memcpy(bkeyp_val(f, dst), &src->v, bkey_val_bytes(&src->k));
+	/*
+	 * We don't want the bch_verify_key_order() call in extent_save(),
+	 * because we may be out of order with deleted keys that are about to be
+	 * removed by extent_bset_insert()
+	 */
+
+	if ((dst_unpacked = packed_to_bkey(dst)))
+		bkey_copy(dst_unpacked, src);
+	else
+		BUG_ON(!bkey_pack(dst, src, f));
 }
 
 static bool extent_merge_one_overlapping(struct btree_iter *iter,
@@ -2179,7 +2219,8 @@ static bool extent_merge_one_overlapping(struct btree_iter *iter,
 		uk.p = new_pos;
 		extent_save(&b->keys, node_iter, k, &uk);
 		bch_bset_fix_invalidated_key(&b->keys, t, k);
-		bch_btree_node_iter_fix(iter, b, node_iter, t, k, true);
+		bch_btree_node_iter_fix(iter, b, node_iter, t,
+					k, k->u64s, k->u64s);
 		return true;
 	}
 }
@@ -2215,8 +2256,10 @@ do_fixup:
 		 * if we don't find this bset in the iterator we already got to
 		 * the end of that bset, so start searching from the end.
 		 */
-		k = bch_btree_node_iter_bset_pos(node_iter, b, t->data) ?:
-			bkey_prev(t, bset_bkey_last(t->data));
+		k = bch_btree_node_iter_bset_pos(node_iter, b, t->data);
+
+		if (k == bset_bkey_last(t->data))
+			k = bkey_prev_all(t, k);
 
 		if (back_merge) {
 			/*
@@ -2228,7 +2271,7 @@ do_fixup:
 			     k &&
 			     (uk = bkey_unpack_key(f, k),
 			      bkey_cmp(uk.p, bkey_start_pos(m)) > 0);
-			     k = bkey_prev(t, k)) {
+			     k = bkey_prev_all(t, k)) {
 				if (bkey_cmp(uk.p, m->p) >= 0)
 					continue;
 
@@ -2319,7 +2362,7 @@ static bool bch_extent_merge_inline(struct btree_iter *iter,
 			bch_btree_iter_set_pos_same_leaf(iter, li.k.k.p);
 
 		bch_btree_node_iter_fix(iter, iter->nodes[0], node_iter,
-					t, m, true);
+					t, m, m->u64s, m->u64s);
 
 		if (!back_merge)
 			bkey_copy(packed_to_bkey(l), &li.k);
@@ -2335,7 +2378,7 @@ static bool bch_extent_merge_inline(struct btree_iter *iter,
 
 		extent_i_save(b, node_iter, m, &li.k);
 		bch_btree_node_iter_fix(iter, iter->nodes[0], node_iter,
-					t, m, true);
+					t, m, m->u64s, m->u64s);
 		return true;
 	default:
 		BUG();
