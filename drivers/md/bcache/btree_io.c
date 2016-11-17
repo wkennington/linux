@@ -233,8 +233,8 @@ static const char *validate_bset(struct cache_set *c, struct btree *b,
 					 "invalid bkey format %u", k->format);
 
 			i->u64s = cpu_to_le16(le16_to_cpu(i->u64s) - k->u64s);
-			memmove(k, bkey_next(k),
-				(void *) bset_bkey_last(i) - (void *) k);
+			memmove_u64s_down(k, bkey_next(k),
+					  (u64 *) bset_bkey_last(i) - (u64 *) k);
 			continue;
 		}
 
@@ -253,8 +253,8 @@ static const char *validate_bset(struct cache_set *c, struct btree *b,
 					 "invalid bkey %s", buf);
 
 			i->u64s = cpu_to_le16(le16_to_cpu(i->u64s) - k->u64s);
-			memmove(k, bkey_next(k),
-				(void *) bset_bkey_last(i) - (void *) k);
+			memmove_u64s_down(k, bkey_next(k),
+					  (u64 *) bset_bkey_last(i) - (u64 *) k);
 			continue;
 		}
 
@@ -365,8 +365,8 @@ void bch_btree_node_read_done(struct cache_set *c, struct btree *b,
 		if (ret)
 			continue;
 
-		bch_btree_node_iter_push(iter, &b->keys,
-					 i->start, bset_bkey_last(i));
+		__bch_btree_node_iter_push(iter, &b->keys,
+					   i->start, bset_bkey_last(i));
 	}
 
 	err = "corrupted btree";
@@ -455,13 +455,19 @@ int bch_btree_root_read(struct cache_set *c, enum btree_id id,
 {
 	struct closure cl;
 	struct btree *b;
+	int ret;
 
 	closure_init_stack(&cl);
 
-	while (IS_ERR(b = mca_alloc(c, &cl))) {
-		BUG_ON(PTR_ERR(b) != -EAGAIN);
+	do {
+		ret = mca_cannibalize_lock(c, &cl);
 		closure_sync(&cl);
-	}
+	} while (ret);
+
+	b = mca_alloc(c);
+	mca_cannibalize_unlock(c);
+
+	BUG_ON(IS_ERR(b));
 
 	bkey_copy(&b->key, k);
 	BUG_ON(mca_hash_insert(c, b, level, id));

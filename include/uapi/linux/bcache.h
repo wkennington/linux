@@ -225,11 +225,6 @@ static inline void bkey_init(struct bkey *k)
 
 #define bkey_bytes(_k)		((_k)->u64s * sizeof(__u64))
 
-static inline void bkey_copy(struct bkey_i *dst, const struct bkey_i *src)
-{
-	memcpy(dst, src, bkey_bytes(&src->k));
-}
-
 #define __BKEY_PADDED(key, pad)					\
 	struct { struct bkey_i key; __u64 key ## _pad[pad]; }
 
@@ -1092,7 +1087,7 @@ enum btree_id {
 
 #undef DEF_BTREE_ID
 
-#define BTREE_MAX_DEPTH		4
+#define BTREE_MAX_DEPTH		4U
 
 /* Btree nodes */
 
