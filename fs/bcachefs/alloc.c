@@ -1049,6 +1049,7 @@ static enum bucket_alloc_ret __bch_bucket_alloc_set(struct cache_set *c,
 						    struct write_point *wp,
 						    struct open_bucket *ob,
 						    unsigned nr_replicas,
+						    enum alloc_reserve reserve,
 						    long *caches_used)
 {
 	/*
@@ -1060,22 +1061,23 @@ static enum bucket_alloc_ret __bch_bucket_alloc_set(struct cache_set *c,
 
 	/* foreground writes: prefer tier 0: */
 	if (wp->group == &c->cache_all)
-		bch_bucket_alloc_group(c, ob, wp->reserve, nr_replicas,
+		bch_bucket_alloc_group(c, ob, reserve, nr_replicas,
 				       &c->cache_tiers[0], caches_used);
 
-	return bch_bucket_alloc_group(c, ob, wp->reserve, nr_replicas,
+	return bch_bucket_alloc_group(c, ob, reserve, nr_replicas,
 				      wp->group, caches_used);
 }
 
 static int bch_bucket_alloc_set(struct cache_set *c, struct write_point *wp,
 				struct open_bucket *ob, unsigned nr_replicas,
-				long *caches_used, struct closure *cl)
+				enum alloc_reserve reserve, long *caches_used,
+				struct closure *cl)
 {
 	bool waiting = false;
 
 	while (1) {
 		switch (__bch_bucket_alloc_set(c, wp, ob, nr_replicas,
-					       caches_used)) {
+					       reserve, caches_used)) {
 		case ALLOC_SUCCESS:
 			if (waiting)
 				closure_wake_up(&c->freelist_wait);
@@ -1090,7 +1092,7 @@ static int bch_bucket_alloc_set(struct cache_set *c, struct write_point *wp,
 		case FREELIST_EMPTY:
 			if (!cl || waiting)
 				trace_bcache_freelist_empty_fail(c,
-							wp->reserve, cl);
+							reserve, cl);
 
 			if (!cl)
 				return -ENOSPC;
@@ -1276,6 +1278,7 @@ static int open_bucket_add_buckets(struct cache_set *c,
 				   struct open_bucket *ob,
 				   struct bkey_i_extent *e,
 				   unsigned nr_replicas,
+				   enum alloc_reserve reserve,
 				   struct closure *cl)
 {
 	const struct bch_extent_ptr *ptr;
@@ -1313,7 +1316,8 @@ static int open_bucket_add_buckets(struct cache_set *c,
 			nr_replicas++;
 		}
 
-	return bch_bucket_alloc_set(c, wp, ob, nr_replicas, caches_used, cl);
+	return bch_bucket_alloc_set(c, wp, ob, nr_replicas,
+				    reserve, caches_used, cl);
 }
 
 /*
@@ -1323,16 +1327,17 @@ struct open_bucket *bch_alloc_sectors_start(struct cache_set *c,
 					    struct write_point *wp,
 					    struct bkey_i_extent *e,
 					    unsigned nr_replicas,
+					    enum alloc_reserve reserve,
 					    struct closure *cl)
 {
 	struct open_bucket *ob;
-	unsigned open_buckets_reserved = allocation_is_metadata(wp->reserve)
+	unsigned open_buckets_reserved = allocation_is_metadata(reserve)
 		? 0
 		: BTREE_NODE_RESERVE;
 	int ret;
 
 	BUG_ON(!wp->group);
-	BUG_ON(!wp->reserve);
+	BUG_ON(!reserve);
 	BUG_ON(!nr_replicas);
 retry:
 	ob = lock_writepoint(c, wp);
@@ -1376,7 +1381,8 @@ retry:
 		ob = new_ob;
 	}
 
-	ret = open_bucket_add_buckets(c, wp, ob, e, nr_replicas, cl);
+	ret = open_bucket_add_buckets(c, wp, ob, e, nr_replicas,
+				      reserve, cl);
 	if (ret) {
 		mutex_unlock(&ob->lock);
 		return ERR_PTR(ret);
@@ -1467,11 +1473,12 @@ struct open_bucket *bch_alloc_sectors(struct cache_set *c,
 				      struct write_point *wp,
 				      struct bkey_i_extent *e,
 				      unsigned nr_replicas,
+				      enum alloc_reserve reserve,
 				      struct closure *cl)
 {
 	struct open_bucket *ob;
 
-	ob = bch_alloc_sectors_start(c, wp, e, nr_replicas, cl);
+	ob = bch_alloc_sectors_start(c, wp, e, nr_replicas, reserve, cl);
 	if (IS_ERR_OR_NULL(ob))
 		return ob;
 
@@ -1811,7 +1818,6 @@ void bch_open_buckets_init(struct cache_set *c)
 
 	for (i = 0; i < ARRAY_SIZE(c->write_points); i++) {
 		c->write_points[i].throttle = true;
-		c->write_points[i].reserve = RESERVE_NONE;
 		c->write_points[i].group = &c->cache_tiers[0];
 	}
 
@@ -1819,13 +1825,10 @@ void bch_open_buckets_init(struct cache_set *c)
 		spin_lock_init(&c->cache_tiers[i].lock);
 
 	c->promote_write_point.group = &c->cache_tiers[0];
-	c->promote_write_point.reserve = RESERVE_NONE;
 
 	c->migration_write_point.group = &c->cache_all;
-	c->migration_write_point.reserve = RESERVE_NONE;
 
 	c->btree_write_point.group = &c->cache_all;
-	c->btree_write_point.reserve = RESERVE_BTREE;
 
 	c->pd_controllers_update_seconds = 5;
 	INIT_DELAYED_WORK(&c->pd_controllers_update, pd_controllers_update);
