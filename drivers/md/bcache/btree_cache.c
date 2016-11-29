@@ -53,25 +53,10 @@ static void mca_data_free(struct cache_set *c, struct btree *b)
 
 #define PTR_HASH(_k)	(bkey_i_to_extent_c(_k)->v._data[0])
 
-/*
- * gcc isn't smart enough to optimize away a memcmp for a constant number of
- * bytes :(
- */
-static inline int btree_rhash_cmp(struct rhashtable_compare_arg *arg,
-			   const void *obj)
-{
-	const u64 *v = arg->key;
-	const struct btree *b = obj;
-
-	return PTR_HASH(&b->key) == *v ? 0 : 1;
-}
-
 static const struct rhashtable_params bch_btree_cache_params = {
 	.head_offset	= offsetof(struct btree, hash),
 	.key_offset	= offsetof(struct btree, key.v),
 	.key_len	= sizeof(struct bch_extent_ptr),
-	.hashfn		= jhash,
-	.obj_cmpfn	= btree_rhash_cmp,
 };
 
 static void mca_data_alloc(struct cache_set *c, struct btree *b, gfp_t gfp)
@@ -102,9 +87,6 @@ static struct btree *mca_bucket_alloc(struct cache_set *c, gfp_t gfp)
 
 	six_lock_init(&b->lock);
 	INIT_LIST_HEAD(&b->list);
-	INIT_DELAYED_WORK(&b->work, btree_node_write_work);
-	b->c = c;
-	b->writes[1].index = 1;
 	INIT_LIST_HEAD(&b->write_blocked);
 
 	mca_data_alloc(c, b, gfp);
@@ -134,11 +116,6 @@ int mca_hash_insert(struct cache_set *c, struct btree *b,
 	b->level	= level;
 	b->btree_id	= id;
 
-	bch_btree_keys_init(&b->keys, b->level
-			    ? &bch_btree_interior_node_ops
-			    : bch_btree_ops[id],
-			    &c->expensive_debug_checks);
-
 	ret = rhashtable_lookup_insert_fast(&c->btree_cache_table, &b->hash,
 					    bch_btree_cache_params);
 	if (ret)
@@ -151,7 +128,8 @@ int mca_hash_insert(struct cache_set *c, struct btree *b,
 	return 0;
 }
 
-static inline struct btree *mca_find(struct cache_set *c,
+noinline __flatten
+static struct btree *mca_find(struct cache_set *c,
 				     const struct bkey_i *k)
 {
 	return rhashtable_lookup_fast(&c->btree_cache_table, &PTR_HASH(k),
@@ -164,9 +142,6 @@ static inline struct btree *mca_find(struct cache_set *c,
  */
 static int mca_reap_notrace(struct cache_set *c, struct btree *b, bool flush)
 {
-	struct closure cl;
-
-	closure_init_stack(&cl);
 	lockdep_assert_held(&c->btree_cache_lock);
 
 	if (!six_trylock_intent(&b->lock))
@@ -191,9 +166,7 @@ static int mca_reap_notrace(struct cache_set *c, struct btree *b, bool flush)
 	 * after the write, since this node is about to be evicted:
 	 */
 	if (btree_node_dirty(b))
-		__bch_btree_node_write(b, &cl, -1);
-
-	closure_sync(&cl);
+		__bch_btree_node_write(c, b, NULL, -1);
 
 	/* wait for any in flight btree write */
 	wait_on_bit_io(&b->flags, BTREE_NODE_write_in_flight,
@@ -211,7 +184,7 @@ static int mca_reap(struct cache_set *c, struct btree *b, bool flush)
 {
 	int ret = mca_reap_notrace(c, b, flush);
 
-	trace_bcache_mca_reap(b, ret);
+	trace_bcache_mca_reap(c, b, ret);
 	return ret;
 }
 
@@ -370,7 +343,6 @@ void bch_btree_cache_free(struct cache_set *c)
 		b = list_first_entry(&c->btree_cache_freed,
 				     struct btree, list);
 		list_del(&b->list);
-		cancel_delayed_work_sync(&b->work);
 		kfree(b);
 	}
 
@@ -541,6 +513,7 @@ out:
 	b->keys.set[0].data = NULL;
 	b->sib_u64s[0]	= 0;
 	b->sib_u64s[1]	= 0;
+	bch_btree_keys_init(&b->keys, &c->expensive_debug_checks);
 
 	bch_time_stats_update(&c->mca_alloc_time, start_time);
 
@@ -607,9 +580,7 @@ static noinline struct btree *bch_btree_node_fill(struct btree_iter *iter,
 	six_unlock_write(&b->lock);
 
 	if (lock_type == SIX_LOCK_read)
-		BUG_ON(!six_trylock_convert(&b->lock,
-					    SIX_LOCK_intent,
-					    SIX_LOCK_read));
+		six_lock_downgrade(&b->lock);
 
 	return b;
 }
@@ -627,8 +598,8 @@ struct btree *bch_btree_node_get(struct btree_iter *iter,
 				 const struct bkey_i *k, unsigned level,
 				 enum six_lock_type lock_type)
 {
-	int i = 0;
 	struct btree *b;
+	struct bset_tree *t;
 
 	BUG_ON(level >= BTREE_MAX_DEPTH);
 retry:
@@ -696,9 +667,9 @@ retry:
 		}
 	}
 
-	for (; i <= b->keys.nsets; i++) {
-		prefetch(b->keys.set[i].tree);
-		prefetch(b->keys.set[i].data);
+	for_each_bset(&b->keys, t) {
+		prefetch(t->tree);
+		prefetch(t->data);
 	}
 
 	/* avoid atomic set bit if it's not needed: */

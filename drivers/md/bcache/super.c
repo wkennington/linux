@@ -709,6 +709,7 @@ static void __bch_cache_set_read_only(struct cache_set *c)
 		bch_journal_meta(&c->journal);
 
 	cancel_delayed_work_sync(&c->journal.write_work);
+	cancel_delayed_work_sync(&c->journal.reclaim_work);
 }
 
 static void bch_writes_disabled(struct percpu_ref *writes)
@@ -888,7 +889,6 @@ static void cache_set_free(struct cache_set *c)
 	cancel_work_sync(&c->bio_submit_work);
 	cancel_work_sync(&c->read_retry_work);
 
-	bch_bset_sort_state_free(&c->sort);
 	bch_btree_cache_free(c);
 	bch_journal_free(&c->journal);
 	bch_io_clock_exit(&c->io_clock[WRITE]);
@@ -897,6 +897,7 @@ static void cache_set_free(struct cache_set *c)
 	bdi_destroy(&c->bdi);
 	free_percpu(c->bucket_stats_lock.lock);
 	free_percpu(c->bucket_stats_percpu);
+	mempool_exit(&c->btree_bounce_pool);
 	mempool_exit(&c->bio_bounce_pages);
 	bioset_exit(&c->bio_write);
 	bioset_exit(&c->bio_read_split);
@@ -1111,8 +1112,6 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 
 	c->writeback_pages_max = (256 << 10) / PAGE_SIZE;
 
-	c->btree_flush_delay = 30;
-
 	c->copy_gc_enabled = 1;
 	c->tiering_enabled = 1;
 	c->tiering_percent = 10;
@@ -1139,7 +1138,7 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 	if (cache_set_init_fault("cache_set_alloc"))
 		goto err;
 
-	iter_size = (btree_blocks(c) + 1) *
+	iter_size = (btree_blocks(c) + 1) * 2 *
 		sizeof(struct btree_node_iter_set);
 
 	if (!(c->wq = alloc_workqueue("bcache",
@@ -1151,10 +1150,10 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 	    mempool_init_kmalloc_pool(&c->btree_interior_update_pool, 1,
 				      sizeof(struct btree_interior_update)) ||
 	    mempool_init_kmalloc_pool(&c->fill_iter, 1, iter_size) ||
-	    bioset_init(&c->btree_read_bio, 1, offsetof(struct bbio, bio)) ||
+	    bioset_init(&c->btree_read_bio, 1, 0) ||
 	    bioset_init(&c->bio_read, 1, offsetof(struct bch_read_bio, bio)) ||
 	    bioset_init(&c->bio_read_split, 1, offsetof(struct bch_read_bio, bio)) ||
-	    bioset_init(&c->bio_write, 1, offsetof(struct bch_write_bio, bio.bio)) ||
+	    bioset_init(&c->bio_write, 1, offsetof(struct bch_write_bio, bio)) ||
 	    mempool_init_page_pool(&c->bio_bounce_pages,
 				   max_t(unsigned,
 					 c->sb.btree_node_size,
@@ -1162,13 +1161,13 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 				   PAGE_SECTORS, 0) ||
 	    !(c->bucket_stats_percpu = alloc_percpu(struct bucket_stats_cache_set)) ||
 	    !(c->bucket_stats_lock.lock = alloc_percpu(*c->bucket_stats_lock.lock)) ||
+	    mempool_init_page_pool(&c->btree_bounce_pool, 1,
+				   ilog2(btree_pages(c))) ||
 	    bdi_setup_and_register(&c->bdi, "bcache") ||
 	    bch_io_clock_init(&c->io_clock[READ]) ||
 	    bch_io_clock_init(&c->io_clock[WRITE]) ||
 	    bch_journal_alloc(&c->journal) ||
 	    bch_btree_cache_alloc(c) ||
-	    bch_bset_sort_state_init(&c->sort, ilog2(btree_pages(c)),
-				     &c->btree_sort_time) ||
 	    bch_compress_init(c))
 		goto err;
 
@@ -1977,7 +1976,7 @@ static const char *cache_alloc(struct bcache_superblock *sb,
 					       sizeof(u64), GFP_KERNEL)) ||
 	    !(ca->bio_prio = bio_kmalloc(GFP_NOIO, bucket_pages(ca))) ||
 	    bioset_init(&ca->replica_set, 4,
-			offsetof(struct bch_write_bio, bio.bio)) ||
+			offsetof(struct bch_write_bio, bio)) ||
 	    !(ca->sectors_written = alloc_percpu(*ca->sectors_written)))
 		goto err;
 

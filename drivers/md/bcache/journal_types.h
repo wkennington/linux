@@ -112,6 +112,7 @@ struct journal {
 	union journal_res_state reservations;
 	unsigned		cur_entry_u64s;
 	unsigned		prev_buf_sectors;
+	unsigned		cur_buf_sectors;
 
 	/*
 	 * Two journal entries -- one is currently open for new entries, the
@@ -127,10 +128,8 @@ struct journal {
 	struct closure		io;
 	struct delayed_work	write_work;
 
-	unsigned		delay_ms;
-
 	/* Sequence number of most recent journal entry (last entry in @pin) */
-	u64			seq;
+	atomic64_t		seq;
 
 	/* last_seq from the most recent journal entry written */
 	u64			last_seq_ondisk;
@@ -165,13 +164,17 @@ struct journal {
 
 	BKEY_PADDED(key);
 
-	struct work_struct	reclaim_work;
+	struct delayed_work	reclaim_work;
+	unsigned long		last_flushed;
+
 	/* protects advancing ja->last_idx: */
 	struct mutex		reclaim_lock;
 
 	__le64			prio_buckets[MAX_CACHES_PER_SET];
 	unsigned		nr_prio_buckets;
 
+	unsigned		write_delay_ms;
+	unsigned		reclaim_delay_ms;
 
 	u64			res_get_blocked_start;
 	u64			need_write_time;

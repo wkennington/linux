@@ -148,7 +148,9 @@ static bool btree_gc_mark_node(struct cache_set *c, struct btree *b)
 		struct bkey_s_c k;
 		u8 stale = 0;
 
-		for_each_btree_node_key_unpack(&b->keys, k, &iter, &unpacked) {
+		for_each_btree_node_key_unpack(&b->keys, k, &iter,
+					       btree_node_is_extents(b),
+					       &unpacked) {
 			bkey_debugcheck(c, b, k);
 			stale = max(stale, btree_mark_key(c, b, k));
 		}
@@ -436,7 +438,7 @@ static void recalc_packed_keys(struct btree *b)
 
 	memset(&b->keys.nr, 0, sizeof(b->keys.nr));
 
-	BUG_ON(b->keys.nsets);
+	BUG_ON(b->keys.nsets != 1);
 
 	for (k = b->keys.set[0].data->start;
 	     k != bset_bkey_last(b->keys.set[0].data);
@@ -507,7 +509,7 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 			goto out;
 		}
 
-	trace_bcache_btree_gc_coalesce(parent, nr_old_nodes);
+	trace_bcache_btree_gc_coalesce(c, parent, nr_old_nodes);
 
 	as = bch_btree_interior_update_alloc(c);
 
@@ -586,8 +588,10 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 		recalc_packed_keys(n);
 		btree_node_reset_sib_u64s(n);
 
+		bch_btree_build_aux_trees(n);
 		six_unlock_write(&n->lock);
-		bch_btree_node_write(n, &as->cl, NULL);
+
+		bch_btree_node_write(c, n, &as->cl, SIX_LOCK_intent, NULL, -1);
 	}
 
 	/*
@@ -849,8 +853,9 @@ static void bch_initial_gc_btree(struct cache_set *c, enum btree_id id)
 			struct bkey unpacked;
 			struct bkey_s_c k;
 
-			for_each_btree_node_key_unpack(&b->keys, k,
-						       &node_iter, &unpacked)
+			for_each_btree_node_key_unpack(&b->keys, k, &node_iter,
+						       btree_node_is_extents(b),
+						       &unpacked)
 				btree_mark_key(c, b, k);
 		}
 

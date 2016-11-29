@@ -218,9 +218,7 @@ static void btree_iter_drop_extra_locks(struct btree_iter *iter)
 		if (l > iter->level) {
 			btree_node_unlock(iter, l);
 		} else if (btree_node_intent_locked(iter, l)) {
-			BUG_ON(!six_trylock_convert(&iter->nodes[l]->lock,
-						    SIX_LOCK_intent,
-						    SIX_LOCK_read));
+			six_lock_downgrade(&iter->nodes[l]->lock);
 			iter->nodes_intent_locked ^= 1 << l;
 		}
 	}
@@ -412,7 +410,7 @@ found:
 		struct bset_tree *t;
 		struct bkey_packed *k;
 
-		for (t = b->keys.set; t <= b->keys.set + b->keys.nsets; t++) {
+		for_each_bset(&b->keys, t) {
 			if (bch_bkey_to_bset(&b->keys, where) == t)
 				continue;
 
@@ -559,7 +557,8 @@ static inline void __btree_iter_init(struct btree_iter *iter,
 				     struct btree *b)
 {
 	bch_btree_node_iter_init(&iter->node_iters[b->level], &b->keys,
-				 iter->pos, iter->is_extents);
+				 iter->pos, iter->is_extents,
+				 btree_node_is_extents(b));
 
 	/* Skip to first non whiteout: */
 	if (b->level)
@@ -1108,6 +1107,8 @@ void __bch_btree_iter_init(struct btree_iter *iter, struct cache_set *c,
 			   unsigned locks_want, unsigned depth)
 {
 	iter->level			= depth;
+	/* bch_bkey_ops isn't used much, this would be a cache miss */
+	/* iter->is_extents		= bch_bkey_ops[btree_id]->is_extents; */
 	iter->is_extents		= btree_id == BTREE_ID_EXTENTS;
 	iter->nodes_locked		= 0;
 	iter->nodes_intent_locked	= 0;

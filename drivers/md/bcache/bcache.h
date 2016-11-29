@@ -755,10 +755,9 @@ struct cache_set {
 	 */
 	mempool_t		fill_iter;
 
-	struct bset_sort_state	sort;
+	mempool_t		btree_bounce_pool;
 
 	struct journal		journal;
-	unsigned		btree_flush_delay;
 
 	/* CACHING OTHER BLOCK DEVICES */
 	mempool_t		search;

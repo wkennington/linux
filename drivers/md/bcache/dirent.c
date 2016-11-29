@@ -138,9 +138,6 @@ static void bch_dirent_to_text(struct cache_set *c, char *buf,
 	}
 }
 
-const struct btree_keys_ops bch_dirent_ops = {
-};
-
 const struct bkey_ops bch_bkey_dirent_ops = {
 	.key_invalid	= bch_dirent_invalid,
 	.val_to_text	= bch_dirent_to_text,
@@ -187,7 +184,7 @@ int bch_dirent_create(struct inode *dir, u8 type,
 
 	ret = bch_hash_set(dirent_hash_desc, &ei->str_hash, c,
 			   ei->vfs_inode.i_ino, &ei->journal_seq,
-			   &dirent->k_i, 0);
+			   &dirent->k_i, BCH_HASH_SET_MUST_CREATE);
 	kfree(dirent);
 
 	return ret;

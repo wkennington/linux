@@ -168,30 +168,37 @@ int bch_btree_root_alloc(struct cache_set *, enum btree_id, struct closure *);
 
 void bch_btree_bset_insert_key(struct btree_iter *, struct btree *,
 			       struct btree_node_iter *, struct bkey_i *);
-void bch_btree_journal_key(struct btree_iter *, struct bkey_i *,
-			   struct journal_res *);
+void bch_btree_journal_key(struct btree_insert *trans, struct btree_iter *,
+			   struct bkey_i *);
 
-static inline struct btree_node_entry *write_block(struct btree *b)
+static inline void *write_block(struct btree *b)
 {
-	EBUG_ON(!b->written);
-
 	return (void *) b->data + (b->written << 9);
+}
+
+static inline bool bset_written(struct btree *b, struct bset *i)
+{
+	return (void *) i < write_block(b);
+}
+
+static inline bool bset_unwritten(struct btree *b, struct bset *i)
+{
+	return (void *) i > write_block(b);
 }
 
 static inline size_t bch_btree_keys_u64s_remaining(struct cache_set *c,
 						   struct btree *b)
 {
 	struct bset *i = btree_bset_last(b);
-	size_t bytes_used = bset_byte_offset(b, i) +
-		__set_bytes(i, le16_to_cpu(i->u64s));
+	unsigned used = bset_byte_offset(b, bset_bkey_last(i)) / sizeof(u64);
+	unsigned total = c->sb.btree_node_size << 6;
 
-	if (b->written == c->sb.btree_node_size)
+	EBUG_ON(used > total);
+
+	if (bset_written(b, i))
 		return 0;
 
-	EBUG_ON(bytes_used > btree_bytes(c));
-	EBUG_ON(i != (b->written ? &write_block(b)->keys : &b->data->keys));
-
-	return (btree_bytes(c) - bytes_used) / sizeof(u64);
+	return total - used;
 }
 
 /*
@@ -199,9 +206,9 @@ static inline size_t bch_btree_keys_u64s_remaining(struct cache_set *c,
  * insert into could be written out from under us)
  */
 static inline bool bch_btree_node_insert_fits(struct cache_set *c,
-				struct btree *b, unsigned u64s)
+					      struct btree *b, unsigned u64s)
 {
-	if (b->keys.ops->is_extents) {
+	if (btree_node_is_extents(b)) {
 		/* The insert key might split an existing key
 		 * (bch_insert_fixup_extent() -> BCH_EXTENT_OVERLAP_MIDDLE case:
 		 */
@@ -220,6 +227,8 @@ void bch_btree_insert_node(struct btree *, struct btree_iter *,
 struct btree_insert {
 	struct cache_set	*c;
 	struct disk_reservation *disk_res;
+	struct journal_res	journal_res;
+	u64			*journal_seq;
 	struct extent_insert_hook *hook;
 	unsigned		flags;
 	bool			did_work;
@@ -236,7 +245,7 @@ struct btree_insert {
 	}			*entries;
 };
 
-int __bch_btree_insert_at(struct btree_insert *, u64 *);
+int __bch_btree_insert_at(struct btree_insert *);
 
 
 #define _TENTH_ARG(_1, _2, _3, _4, _5, _6, _7, _8, _9, N, ...)   N
@@ -267,13 +276,13 @@ int __bch_btree_insert_at(struct btree_insert *, u64 *);
 	__bch_btree_insert_at(&(struct btree_insert) {			\
 		.c		= (_c),					\
 		.disk_res	= (_disk_res),				\
+		.journal_seq	= (_journal_seq),			\
 		.hook		= (_hook),				\
 		.flags		= (_flags),				\
 		.nr		= COUNT_ARGS(__VA_ARGS__),		\
 		.entries	= (struct btree_insert_entry[]) {	\
 			__VA_ARGS__					\
-		}},							\
-		_journal_seq)
+		}})
 
 /*
  * Don't drop/retake locks: instead return -EINTR if need to upgrade to intent
@@ -298,8 +307,7 @@ int bch_btree_insert_list_at(struct btree_iter *, struct keylist *,
 			     struct extent_insert_hook *, u64 *, unsigned);
 
 static inline bool journal_res_insert_fits(struct btree_insert *trans,
-					   struct btree_insert_entry *insert,
-					   struct journal_res *res)
+					   struct btree_insert_entry *insert)
 {
 	unsigned u64s = 0;
 	struct btree_insert_entry *i;
@@ -308,13 +316,13 @@ static inline bool journal_res_insert_fits(struct btree_insert *trans,
 	 * If we didn't get a journal reservation, we're in journal replay and
 	 * we're not journalling updates:
 	 */
-	if (!res->ref)
+	if (!trans->journal_res.ref)
 		return true;
 
 	for (i = insert; i < trans->entries + trans->nr; i++)
 		u64s += jset_u64s(i->k->k.u64s);
 
-	return u64s <= res->u64s;
+	return u64s <= trans->journal_res.u64s;
 }
 
 int bch_btree_insert_check_key(struct btree_iter *, struct bkey_i *);
