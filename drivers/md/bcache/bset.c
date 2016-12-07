@@ -145,7 +145,7 @@ void __bch_verify_btree_nr_keys(struct btree_keys *b)
 		for (k = t->data->start;
 		     k != bset_bkey_last(t->data);
 		     k = bkey_next(k))
-			if (!bkey_packed_is_whiteout(b, k))
+			if (!bkey_whiteout(k))
 				btree_keys_account_key_add(&nr, t - b->set, k);
 
 	BUG_ON(memcmp(&nr, &b->nr, sizeof(nr)));
@@ -202,7 +202,8 @@ void bch_btree_node_iter_verify(struct btree_node_iter *iter,
 		if (bch_btree_node_iter_bset_pos(iter, b, t->data) ==
 		    bset_bkey_last(t->data) &&
 		    (k = bkey_prev_all(t, bset_bkey_last(t->data))))
-			BUG_ON(__btree_node_iter_cmp(iter, b, k, first) > 0);
+			BUG_ON(__btree_node_iter_cmp(iter->is_extents, b,
+						     k, first) > 0);
 }
 
 void bch_verify_key_order(struct btree_keys *b,
@@ -1116,7 +1117,7 @@ void bch_bset_insert(struct btree_keys *b,
 	if (bkey_pack_key(&packed, &insert->k, f))
 		src = &packed;
 
-	if (!bkey_is_whiteout(&insert->k))
+	if (!bkey_whiteout(&insert->k))
 		btree_keys_account_key_add(&b->nr, t - b->set, src);
 
 	if (src->u64s != clobber_u64s) {
@@ -1557,7 +1558,8 @@ struct bkey_packed *bch_btree_node_iter_prev_all(struct btree_node_iter *iter,
 		k = bkey_prev_all(t,
 			bch_btree_node_iter_bset_pos(iter, b, t->data));
 		if (k &&
-		    (!prev || __btree_node_iter_cmp(iter, b, k, prev) > 0)) {
+		    (!prev || __btree_node_iter_cmp(iter->is_extents, b,
+						    k, prev) > 0)) {
 			prev = k;
 			prev_i = t->data;
 		}
@@ -1612,53 +1614,7 @@ struct bkey_s_c bch_btree_node_iter_peek_unpack(struct btree_node_iter *iter,
 }
 EXPORT_SYMBOL(bch_btree_node_iter_peek_unpack);
 
-bool bch_maybe_compact_deleted_keys(struct btree_keys *b)
-{
-	struct bset_tree *t, *rebuild_from = NULL;
-	bool last_set_aux_tree_ro = bset_has_ro_aux_tree(bset_tree_last(b));
-
-	for_each_bset(b, t) {
-		struct bset *i = t->data;
-		struct bkey_packed *k, *n, *out = i->start;
-
-		if (b->nr.bset_u64s[t - b->set] * 4 > le16_to_cpu(i->u64s) * 3)
-			continue;
-
-		/*
-		 * We cannot drop deleted keys from the last bset, if it hasn't
-		 * been written yet - we may need that whiteout on disk:
-		 *
-		 * XXX unless they're extents, if we fix assertions elsewhere
-		 */
-		if (t == bset_tree_last(b) && !last_set_aux_tree_ro)
-			break;
-
-		for (k = i->start; k != bset_bkey_last(i); k = n) {
-			n = bkey_next(k);
-
-			if (!bkey_packed_is_whiteout(b, k)) {
-				bkey_copy(out, k);
-				out = bkey_next(out);
-			}
-		}
-
-		i->u64s = cpu_to_le16((u64 *) out - i->_data);
-		bch_bset_set_no_aux_tree(b, t);
-
-		if (!rebuild_from)
-			rebuild_from = t;
-	}
-
-	if (!rebuild_from)
-		return false;
-
-	for (t = rebuild_from; t < b->set + b->nsets; t++)
-		bch_bset_build_aux_tree(b, t,
-					t == bset_tree_last(b) &&
-					!last_set_aux_tree_ro);
-
-	return true;
-}
+/* Mergesort */
 
 void bch_btree_keys_stats(struct btree_keys *b, struct bset_stats *stats)
 {

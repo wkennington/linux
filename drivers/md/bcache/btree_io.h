@@ -19,6 +19,8 @@ static inline void btree_node_io_lock(struct btree *b)
 			    TASK_UNINTERRUPTIBLE);
 }
 
+bool bch_maybe_compact_whiteouts(struct cache_set *, struct btree *);
+
 void bch_btree_sort_into(struct cache_set *, struct btree *, struct btree *);
 
 void bch_btree_build_aux_trees(struct btree *);
@@ -35,12 +37,11 @@ void bch_btree_complete_write(struct cache_set *, struct btree *,
 			      struct btree_write *);
 
 void __bch_btree_node_write(struct cache_set *, struct btree *,
-			    struct closure *, int);
+			    struct closure *, enum six_lock_type, int);
+bool bch_btree_post_write_cleanup(struct cache_set *, struct btree *);
+
 void bch_btree_node_write(struct cache_set *, struct btree *,
-			  struct closure *, enum six_lock_type,
-			  struct btree_iter *, int);
-void bch_btree_node_write_lazy(struct cache_set *, struct btree *,
-			       struct btree_iter *);
+			  struct closure *, enum six_lock_type, int);
 
 void bch_btree_flush(struct cache_set *);
 void bch_btree_node_flush_journal_entries(struct cache_set *, struct btree *,

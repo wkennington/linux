@@ -378,29 +378,21 @@ struct bkey_packed *bkey_prev_all(struct bset_tree *, struct bkey_packed *);
 struct bkey_packed *bkey_prev(struct bset_tree *, struct bkey_packed *);
 
 enum bch_extent_overlap {
-	BCH_EXTENT_OVERLAP_FRONT,
-	BCH_EXTENT_OVERLAP_BACK,
-	BCH_EXTENT_OVERLAP_ALL,
-	BCH_EXTENT_OVERLAP_MIDDLE,
+	BCH_EXTENT_OVERLAP_ALL		= 0,
+	BCH_EXTENT_OVERLAP_BACK		= 1,
+	BCH_EXTENT_OVERLAP_FRONT	= 2,
+	BCH_EXTENT_OVERLAP_MIDDLE	= 3,
 };
 
 /* Returns how k overlaps with m */
 static inline enum bch_extent_overlap bch_extent_overlap(const struct bkey *k,
 							 const struct bkey *m)
 {
-	if (bkey_cmp(k->p, m->p) < 0) {
-		if (bkey_cmp(bkey_start_pos(k),
-			     bkey_start_pos(m)) > 0)
-			return BCH_EXTENT_OVERLAP_MIDDLE;
-		else
-			return BCH_EXTENT_OVERLAP_FRONT;
-	} else {
-		if (bkey_cmp(bkey_start_pos(k),
-			     bkey_start_pos(m)) <= 0)
-			return BCH_EXTENT_OVERLAP_ALL;
-		else
-			return BCH_EXTENT_OVERLAP_BACK;
-	}
+	int cmp1 = bkey_cmp(k->p, m->p) < 0;
+	int cmp2 = bkey_cmp(bkey_start_pos(k),
+			    bkey_start_pos(m)) > 0;
+
+	return (cmp1 << 1) + cmp2;
 }
 
 /* Btree key iteration */
@@ -460,7 +452,7 @@ __btree_node_offset_to_key(struct btree_keys *b, u16 k)
 	return (void *) ((u64 *) b->set->data + k);
 }
 
-static inline int __btree_node_iter_cmp(struct btree_node_iter *iter,
+static inline int __btree_node_iter_cmp(bool is_extents,
 					struct btree_keys *b,
 					struct bkey_packed *l,
 					struct bkey_packed *r)
@@ -473,7 +465,7 @@ static inline int __btree_node_iter_cmp(struct btree_node_iter *iter,
 	 * For extents, bkey_deleted() is used as a proxy for k->size == 0, so
 	 * deleted keys have to sort last.
 	 */
-	return bkey_cmp_packed(&b->format, l, r) ?: iter->is_extents
+	return bkey_cmp_packed(&b->format, l, r) ?: is_extents
 		? (int) bkey_deleted(l) - (int) bkey_deleted(r)
 		: (int) bkey_deleted(r) - (int) bkey_deleted(l);
 }
@@ -483,7 +475,7 @@ static inline int btree_node_iter_cmp(struct btree_node_iter *iter,
 				      struct btree_node_iter_set l,
 				      struct btree_node_iter_set r)
 {
-	return __btree_node_iter_cmp(iter, b,
+	return __btree_node_iter_cmp(iter->is_extents, b,
 			__btree_node_offset_to_key(b, l.k),
 			__btree_node_offset_to_key(b, r.k));
 }
@@ -564,20 +556,6 @@ struct bkey_s_c bch_btree_node_iter_peek_unpack(struct btree_node_iter *,
 
 /* Accounting: */
 
-static inline bool bkey_is_whiteout(const struct bkey *k)
-{
-	return bkey_deleted(k) ||
-		(k->type == KEY_TYPE_DISCARD && !k->version);
-}
-
-static inline bool bkey_packed_is_whiteout(const struct btree_keys *b,
-					   const struct bkey_packed *k)
-{
-	return bkey_deleted(k) ||
-		(k->type == KEY_TYPE_DISCARD &&
-		 !bkey_unpack_key(&b->format, k).version);
-}
-
 static inline void btree_keys_account_key(struct btree_nr_keys *n,
 					  unsigned bset,
 					  struct bkey_packed *k,
@@ -596,8 +574,6 @@ static inline void btree_keys_account_key(struct btree_nr_keys *n,
 	btree_keys_account_key(_nr, _bset_idx, _k, 1)
 #define btree_keys_account_key_drop(_nr, _bset_idx, _k)	\
 	btree_keys_account_key(_nr, _bset_idx, _k, -1)
-
-bool bch_maybe_compact_deleted_keys(struct btree_keys *);
 
 struct bset_stats {
 	struct {

@@ -215,6 +215,8 @@
 	printk(KERN_INFO bch_fmt(c, fmt), ##__VA_ARGS__)
 #define bch_notice(c, fmt, ...) \
 	printk(KERN_NOTICE bch_fmt(c, fmt), ##__VA_ARGS__)
+#define bch_warn(c, fmt, ...) \
+	printk(KERN_WARNING bch_fmt(c, fmt), ##__VA_ARGS__)
 #define bch_err(c, fmt, ...) \
 	printk(KERN_ERR bch_fmt(c, fmt), ##__VA_ARGS__)
 
@@ -606,6 +608,8 @@ struct cache_set {
 	struct mutex		btree_interior_update_lock;
 
 	struct workqueue_struct	*wq;
+	/* copygc needs its own workqueue for index updates.. */
+	struct workqueue_struct	*copygc_wq;
 
 	/* ALLOCATION */
 	struct bch_pd_controller foreground_write_pd;
