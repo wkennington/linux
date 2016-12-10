@@ -8,7 +8,6 @@
 #include <linux/workqueue.h>
 
 #include "bkey_methods.h"
-#include "bset.h"
 #include "journal_types.h"
 #include "six.h"
 
@@ -16,20 +15,46 @@ struct cache_set;
 struct open_bucket;
 struct btree_interior_update;
 
+#define MAX_BSETS		3U
+
+struct btree_nr_keys {
+
+	/*
+	 * Amount of live metadata (i.e. size of node after a compaction) in
+	 * units of u64s
+	 */
+	u16			live_u64s;
+	u16			bset_u64s[MAX_BSETS];
+
+	/* live keys only: */
+	u16			packed_keys;
+	u16			unpacked_keys;
+};
+
+struct bset_tree {
+	/*
+	 * We construct a binary tree in an array as if the array
+	 * started at 1, so that things line up on the same cachelines
+	 * better: see comments in bset.c at cacheline_to_bkey() for
+	 * details
+	 */
+
+	/* size of the binary tree and prev array */
+	u16			size;
+
+	/* function of size - precalculated for to_inorder() */
+	u16			extra;
+
+	u16			data_offset;
+	u16			aux_data_offset;
+	u16			end_offset;
+
+	struct bpos		max_key;
+};
+
 struct btree_write {
 	struct journal_entry_pin	journal;
 	struct closure_waitlist		wait;
-};
-
-struct btree_root {
-	struct btree		*b;
-
-	struct btree_interior_update *as;
-
-	/* On disk root - see async splits: */
-	__BKEY_PADDED(key, BKEY_BTREE_PTR_VAL_U64s_MAX);
-	u8			level;
-	u8			alive;
 };
 
 struct btree {
@@ -45,12 +70,29 @@ struct btree {
 	u16			written;
 	u8			level;
 	u8			btree_id;
+	u8			nsets;
+	u8			nr_key_bits;
+
+	struct bkey_format	format;
+
+	struct btree_node	*data;
+	void			*aux_data;
+
+	/*
+	 * Sets of sorted keys - the real btree node - plus a binary search tree
+	 *
+	 * set[0] is special; set[0]->tree, set[0]->prev and set[0]->data point
+	 * to the memory we have allocated for this btree node. Additionally,
+	 * set[0]->data points to the entire btree node as it exists on disk.
+	 */
+	struct bset_tree	set[MAX_BSETS];
+
+	struct btree_nr_keys	nr;
 	u16			sib_u64s[2];
 	u16			whiteout_u64s;
 	u16			uncompacted_whiteout_u64s;
-
-	struct btree_keys	keys;
-	struct btree_node	*data;
+	u8			page_order;
+	u8			unpack_fn_len;
 
 	/*
 	 * XXX: add a delete sequence number, so when btree_node_relock() fails
@@ -76,6 +118,10 @@ struct btree {
 	struct list_head	list;
 
 	struct btree_write	writes[2];
+
+#ifdef CONFIG_BCACHE_DEBUG
+	bool			*expensive_debug_checks;
+#endif
 };
 
 #define BTREE_FLAG(flag)						\
@@ -116,14 +162,80 @@ static inline struct btree_write *btree_prev_write(struct btree *b)
 	return b->writes + (btree_node_write_idx(b) ^ 1);
 }
 
+static inline struct bset_tree *bset_tree_last(struct btree *b)
+{
+	EBUG_ON(!b->nsets);
+	return b->set + b->nsets - 1;
+}
+
+static inline struct bset *bset(const struct btree *b,
+				const struct bset_tree *t)
+{
+	return (void *) b->data + t->data_offset * sizeof(u64);
+}
+
 static inline struct bset *btree_bset_first(struct btree *b)
 {
-	return b->keys.set->data;
+	return bset(b, b->set);
 }
 
 static inline struct bset *btree_bset_last(struct btree *b)
 {
-	return bset_tree_last(&b->keys)->data;
+	return bset(b, bset_tree_last(b));
+}
+
+static inline u16
+__btree_node_key_to_offset(const struct btree *b, const struct bkey_packed *k)
+{
+	size_t ret = (u64 *) k - (u64 *) b->data - 1;
+
+	EBUG_ON(ret > U16_MAX);
+	return ret;
+}
+
+static inline struct bkey_packed *
+__btree_node_offset_to_key(const struct btree *b, u16 k)
+{
+	return (void *) ((u64 *) b->data + k + 1);
+}
+
+#define __bkey_idx(_set, _offset)				\
+	((_set)->_data + (_offset))
+
+#define bkey_idx(_set, _offset)					\
+	((typeof(&(_set)->start[0])) __bkey_idx((_set), (_offset)))
+
+#define __bset_bkey_last(_set)					\
+	 __bkey_idx((_set), (_set)->u64s)
+
+#define bset_bkey_last(_set)					\
+	 bkey_idx((_set), le16_to_cpu((_set)->u64s))
+
+#define btree_bkey_first(_b, _t)	(bset(_b, _t)->start)
+
+#define btree_bkey_last(_b, _t)						\
+({									\
+	EBUG_ON(__btree_node_offset_to_key(_b, (_t)->end_offset) !=	\
+		bset_bkey_last(bset(_b, _t)));				\
+									\
+	__btree_node_offset_to_key(_b, (_t)->end_offset);		\
+})
+
+static inline void set_btree_bset_end(struct btree *b, struct bset_tree *t)
+{
+	t->end_offset =
+		__btree_node_key_to_offset(b, bset_bkey_last(bset(b, t)));
+	btree_bkey_last(b, t);
+}
+
+static inline void set_btree_bset(struct btree *b, struct bset_tree *t,
+				  const struct bset *i)
+{
+	t->data_offset = (u64 *) i - (u64 *) b->data;
+
+	EBUG_ON(bset(b, t) != i);
+
+	set_btree_bset_end(b, t);
 }
 
 static inline unsigned bset_byte_offset(struct btree *b, void *i)
@@ -152,6 +264,17 @@ static inline bool btree_node_is_extents(struct btree *b)
 	return btree_node_type(b) == BKEY_TYPE_EXTENTS;
 }
 
+struct btree_root {
+	struct btree		*b;
+
+	struct btree_interior_update *as;
+
+	/* On disk root - see async splits: */
+	__BKEY_PADDED(key, BKEY_BTREE_PTR_VAL_U64s_MAX);
+	u8			level;
+	u8			alive;
+};
+
 /*
  * Optional hook that will be called just prior to a btree node update, when
  * we're holding the write lock and we know what key is about to be overwritten:
@@ -159,6 +282,7 @@ static inline bool btree_node_is_extents(struct btree *b)
 
 struct btree_iter;
 struct bucket_stats_cache_set;
+struct btree_node_iter;
 
 enum extent_insert_hook_ret {
 	BTREE_HOOK_DO_INSERT,
@@ -192,7 +316,7 @@ enum btree_gc_coalesce_fail_reason {
 };
 
 typedef struct btree_nr_keys (*sort_fix_overlapping_fn)(struct bset *,
-							struct btree_keys *,
+							struct btree *,
 							struct btree_node_iter *);
 
 #endif /* _BCACHE_BTREE_TYPES_H */

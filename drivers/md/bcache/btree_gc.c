@@ -148,7 +148,7 @@ static bool btree_gc_mark_node(struct cache_set *c, struct btree *b)
 		struct bkey_s_c k;
 		u8 stale = 0;
 
-		for_each_btree_node_key_unpack(&b->keys, k, &iter,
+		for_each_btree_node_key_unpack(b, k, &iter,
 					       btree_node_is_extents(b),
 					       &unpacked) {
 			bkey_debugcheck(c, b, k);
@@ -201,7 +201,7 @@ static int bch_gc_btree(struct cache_set *c, enum btree_id btree_id)
 	for_each_btree_node(&iter, c, btree_id, POS_MIN, depth, b) {
 		btree_node_range_checks(c, b, &r);
 
-		bch_verify_btree_nr_keys(&b->keys);
+		bch_verify_btree_nr_keys(b);
 
 		should_rewrite = btree_gc_mark_node(c, b);
 
@@ -436,14 +436,14 @@ static void recalc_packed_keys(struct btree *b)
 {
 	struct bkey_packed *k;
 
-	memset(&b->keys.nr, 0, sizeof(b->keys.nr));
+	memset(&b->nr, 0, sizeof(b->nr));
 
-	BUG_ON(b->keys.nsets != 1);
+	BUG_ON(b->nsets != 1);
 
-	for (k = b->keys.set[0].data->start;
-	     k != bset_bkey_last(b->keys.set[0].data);
+	for (k =  btree_bkey_first(b, b->set);
+	     k != btree_bkey_last(b, b->set);
 	     k = bkey_next(k))
-		btree_keys_account_key_add(&b->keys.nr, 0, k);
+		btree_keys_account_key_add(&b->nr, 0, k);
 }
 
 static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
@@ -465,7 +465,7 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 
 	/* Count keys that are not deleted */
 	for (i = 0; i < GC_MERGE_NODES && old_nodes[i]; i++)
-		u64s += old_nodes[i]->keys.nr.live_u64s;
+		u64s += old_nodes[i]->nr.live_u64s;
 
 	nr_old_nodes = nr_new_nodes = i;
 
@@ -503,7 +503,7 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 
 	/* Check if repacking would make any nodes too big to fit */
 	for (i = 0; i < nr_old_nodes; i++)
-		if (!bch_btree_node_format_fits(old_nodes[i], &new_format)) {
+		if (!bch_btree_node_format_fits(c, old_nodes[i], &new_format)) {
 			trace_bcache_btree_gc_coalesce_fail(c,
 					BTREE_GC_COALESCE_FAIL_FORMAT_FITS);
 			goto out;
@@ -554,6 +554,8 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 				    le16_to_cpu(s2->u64s));
 			le16_add_cpu(&s1->u64s, le16_to_cpu(s2->u64s));
 
+			set_btree_bset_end(n1, n1->set);
+
 			six_unlock_write(&n2->lock);
 			bch_btree_node_free_never_inserted(c, n2);
 			six_unlock_intent(&n2->lock);
@@ -565,7 +567,7 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 		} else if (u64s) {
 			/* move part of n2 into n1 */
 			n1->key.k.p = n1->data->max_key =
-				bkey_unpack_key(&n1->keys.format, last).p;
+				bkey_unpack_pos(n1, last);
 
 			n2->data->min_key =
 				btree_type_successor(iter->btree_id,
@@ -579,6 +581,9 @@ static void bch_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 				bset_bkey_idx(s2, u64s),
 				(le16_to_cpu(s2->u64s) - u64s) * sizeof(u64));
 			s2->u64s = cpu_to_le16(le16_to_cpu(s2->u64s) - u64s);
+
+			set_btree_bset_end(n1, n1->set);
+			set_btree_bset_end(n2, n2->set);
 		}
 	}
 
@@ -853,7 +858,7 @@ static void bch_initial_gc_btree(struct cache_set *c, enum btree_id id)
 			struct bkey unpacked;
 			struct bkey_s_c k;
 
-			for_each_btree_node_key_unpack(&b->keys, k, &node_iter,
+			for_each_btree_node_key_unpack(b, k, &node_iter,
 						       btree_node_is_extents(b),
 						       &unpacked)
 				btree_mark_key(c, b, k);

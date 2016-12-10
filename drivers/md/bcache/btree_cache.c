@@ -35,18 +35,18 @@ void bch_recalc_btree_reserve(struct cache_set *c)
 #define mca_can_free(c)						\
 	max_t(int, 0, c->btree_cache_used - c->btree_cache_reserve)
 
-static void __mca_data_free(struct btree *b)
+static void __mca_data_free(struct cache_set *c, struct btree *b)
 {
 	EBUG_ON(btree_node_write_in_flight(b));
 
-	free_pages((unsigned long) b->data, b->keys.page_order);
+	free_pages((unsigned long) b->data, btree_page_order(c));
 	b->data = NULL;
-	bch_btree_keys_free(&b->keys);
+	bch_btree_keys_free(b);
 }
 
 static void mca_data_free(struct cache_set *c, struct btree *b)
 {
-	__mca_data_free(b);
+	__mca_data_free(c, b);
 	c->btree_cache_used--;
 	list_move(&b->list, &c->btree_cache_freed);
 }
@@ -67,7 +67,7 @@ static void mca_data_alloc(struct cache_set *c, struct btree *b, gfp_t gfp)
 	if (!b->data)
 		goto err;
 
-	if (bch_btree_keys_alloc(&b->keys, order, gfp))
+	if (bch_btree_keys_alloc(b, order, gfp))
 		goto err;
 
 	c->btree_cache_used++;
@@ -99,8 +99,7 @@ void mca_hash_remove(struct cache_set *c, struct btree *b)
 {
 	BUG_ON(btree_node_dirty(b));
 
-	b->keys.nsets = 0;
-	b->keys.set[0].data = NULL;
+	b->nsets = 0;
 
 	rhashtable_remove_fast(&c->btree_cache_table, &b->hash,
 			       bch_btree_cache_params);
@@ -128,8 +127,8 @@ int mca_hash_insert(struct cache_set *c, struct btree *b,
 	return 0;
 }
 
-noinline __flatten
-static struct btree *mca_find(struct cache_set *c,
+__flatten
+static inline struct btree *mca_find(struct cache_set *c,
 				     const struct bkey_i *k)
 {
 	return rhashtable_lookup_fast(&c->btree_cache_table, &PTR_HASH(k),
@@ -515,13 +514,12 @@ out_unlock:
 out:
 	b->flags		= 0;
 	b->written		= 0;
-	b->keys.nsets		= 0;
-	b->keys.set[0].data	= NULL;
+	b->nsets		= 0;
 	b->sib_u64s[0]		= 0;
 	b->sib_u64s[1]		= 0;
 	b->whiteout_u64s	= 0;
 	b->uncompacted_whiteout_u64s = 0;
-	bch_btree_keys_init(&b->keys, &c->expensive_debug_checks);
+	bch_btree_keys_init(b, &c->expensive_debug_checks);
 
 	bch_time_stats_update(&c->mca_alloc_time, start_time);
 
@@ -675,9 +673,14 @@ retry:
 		}
 	}
 
-	for_each_bset(&b->keys, t) {
-		prefetch(t->tree);
-		prefetch(t->data);
+	prefetch(b->aux_data);
+
+	for_each_bset(b, t) {
+		void *p = (u64 *) b->aux_data + t->aux_data_offset;
+
+		prefetch(p + L1_CACHE_BYTES * 0);
+		prefetch(p + L1_CACHE_BYTES * 1);
+		prefetch(p + L1_CACHE_BYTES * 2);
 	}
 
 	/* avoid atomic set bit if it's not needed: */

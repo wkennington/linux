@@ -21,12 +21,11 @@ static void verify_no_dups(struct btree *b,
 			   struct bkey_packed *end)
 {
 #ifdef CONFIG_BCACHE_DEBUG
-	const struct bkey_format *f = &b->keys.format;
 	struct bkey_packed *k;
 
 	for (k = start; k != end && bkey_next(k) != end; k = bkey_next(k)) {
-		struct bkey l = bkey_unpack_key(f, k);
-		struct bkey r = bkey_unpack_key(f, bkey_next(k));
+		struct bkey l = bkey_unpack_key(b, k);
+		struct bkey r = bkey_unpack_key(b, bkey_next(k));
 
 		BUG_ON(btree_node_is_extents(b)
 		       ? bkey_cmp(l.p, bkey_start_pos(&r)) > 0
@@ -77,12 +76,12 @@ static void *btree_bounce_alloc(struct cache_set *c, unsigned order,
 	return page_address(mempool_alloc(&c->btree_bounce_pool, GFP_NOIO));
 }
 
-typedef int (*sort_cmp_fn)(struct btree_keys *,
+typedef int (*sort_cmp_fn)(struct btree *,
 			   struct bkey_packed *,
 			   struct bkey_packed *);
 
 struct sort_iter {
-	struct btree_keys	*b;
+	struct btree	*b;
 	unsigned		used;
 
 	struct sort_iter_set {
@@ -90,7 +89,7 @@ struct sort_iter {
 	} data[MAX_BSETS + 1];
 };
 
-static void sort_iter_init(struct sort_iter *iter, struct btree_keys *b)
+static void sort_iter_init(struct sort_iter *iter, struct btree *b)
 {
 	memset(iter, 0, sizeof(*iter));
 	iter->b = b;
@@ -163,11 +162,11 @@ static inline struct bkey_packed *sort_iter_next(struct sort_iter *iter,
 	return ret;
 }
 
-static inline int sort_key_whiteouts_cmp(struct btree_keys *b,
+static inline int sort_key_whiteouts_cmp(struct btree *b,
 					 struct bkey_packed *l,
 					 struct bkey_packed *r)
 {
-	return bkey_cmp_packed(&b->format, l, r);
+	return bkey_cmp_packed(b, l, r);
 }
 
 static unsigned sort_key_whiteouts(struct bkey_packed *dst,
@@ -185,12 +184,12 @@ static unsigned sort_key_whiteouts(struct bkey_packed *dst,
 	return (u64 *) out - (u64 *) dst;
 }
 
-static inline int sort_extent_whiteouts_cmp(struct btree_keys *b,
+static inline int sort_extent_whiteouts_cmp(struct btree *b,
 					    struct bkey_packed *l,
 					    struct bkey_packed *r)
 {
-	struct bkey ul = bkey_unpack_key(&b->format, l);
-	struct bkey ur = bkey_unpack_key(&b->format, r);
+	struct bkey ul = bkey_unpack_key(b, l);
+	struct bkey ur = bkey_unpack_key(b, r);
 
 	return bkey_cmp(bkey_start_pos(&ul), bkey_start_pos(&ur));
 }
@@ -214,7 +213,7 @@ static unsigned sort_extent_whiteouts(struct bkey_packed *dst,
 		EBUG_ON(bkeyp_val_u64s(f, in));
 		EBUG_ON(in->type != KEY_TYPE_DISCARD);
 
-		r.k = bkey_unpack_key(f, in);
+		r.k = bkey_unpack_key(iter->b, in);
 
 		if (prev &&
 		    bkey_cmp(l.k.p, bkey_start_pos(&r.k)) >= 0) {
@@ -263,38 +262,32 @@ static unsigned sort_extent_whiteouts(struct bkey_packed *dst,
 	return (u64 *) out - (u64 *) dst;
 }
 
-enum compact_mode {
-	COMPACT_LAZY,
-	COMPACT_WRITTEN,
-	COMPACT_WRITTEN_NO_WRITE_LOCK,
-};
-
 static unsigned should_compact_bset(struct btree *b, struct bset_tree *t,
 				    bool compacting,
 				    enum compact_mode mode)
 {
-	unsigned live_u64s = b->keys.nr.bset_u64s[t - b->keys.set];
-	unsigned bset_u64s = le16_to_cpu(t->data->u64s);
+	unsigned live_u64s = b->nr.bset_u64s[t - b->set];
+	unsigned bset_u64s = le16_to_cpu(bset(b, t)->u64s);
 
 	if (live_u64s == bset_u64s)
 		return 0;
 
 	if (mode == COMPACT_LAZY) {
 		if (live_u64s * 4 < bset_u64s * 3 ||
-		    (compacting && bset_unwritten(b, t->data)))
+		    (compacting && bset_unwritten(b, bset(b, t))))
 			return bset_u64s - live_u64s;
 	} else {
-		if (bset_written(b, t->data))
+		if (bset_written(b, bset(b, t)))
 			return bset_u64s - live_u64s;
 	}
 
 	return 0;
 }
 
-static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
-				enum compact_mode mode)
+bool __bch_compact_whiteouts(struct cache_set *c, struct btree *b,
+			     enum compact_mode mode)
 {
-	const struct bkey_format *f = &b->keys.format;
+	const struct bkey_format *f = &b->format;
 	struct bset_tree *t;
 	struct bkey_packed *whiteouts = NULL;
 	struct bkey_packed *u_start, *u_pos;
@@ -302,14 +295,14 @@ static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
 	unsigned order, whiteout_u64s = 0, u64s;
 	bool used_mempool, compacting = false;
 
-	for_each_bset(&b->keys, t)
+	for_each_bset(b, t)
 		whiteout_u64s += should_compact_bset(b, t,
 					whiteout_u64s != 0, mode);
 
 	if (!whiteout_u64s)
 		return false;
 
-	sort_iter_init(&sort_iter, &b->keys);
+	sort_iter_init(&sort_iter, b);
 
 	whiteout_u64s += b->whiteout_u64s;
 	order = get_order(whiteout_u64s * sizeof(u64));
@@ -323,15 +316,15 @@ static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
 
 	sort_iter_add(&sort_iter, u_start, u_pos);
 
-	for_each_bset(&b->keys, t) {
-		struct bset *i = t->data;
+	for_each_bset(b, t) {
+		struct bset *i = bset(b, t);
 		struct bkey_packed *k, *n, *out, *start, *end;
 		struct btree_node_entry *src = NULL, *dst = NULL;
 
-		if (t != b->keys.set && bset_unwritten(b, i)) {
+		if (t != b->set && bset_unwritten(b, i)) {
 			src = container_of(i, struct btree_node_entry, keys);
 			dst = max(write_block(b),
-				  (void *) bset_bkey_last(t[-1].data));
+				  (void *) btree_bkey_last(b, t -1));
 		}
 
 		if (!should_compact_bset(b, t, compacting, mode)) {
@@ -339,7 +332,8 @@ static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
 				memmove(dst, src, sizeof(*src) +
 					le16_to_cpu(src->keys.u64s) *
 					sizeof(u64));
-				t->data = &dst->keys;
+				i = &dst->keys;
+				set_btree_bset(b, t, i);
 			}
 			continue;
 		}
@@ -350,12 +344,9 @@ static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
 		end = bset_bkey_last(i);
 
 		if (src != dst) {
-			src = container_of(i, struct btree_node_entry, keys);
-			dst = max(write_block(b),
-				  (void *) bset_bkey_last(t[-1].data));
-
 			memmove(dst, src, sizeof(*src));
-			i = t->data = &dst->keys;
+			i = &dst->keys;
+			set_btree_bset(b, t, i);
 		}
 
 		out = i->start;
@@ -384,14 +375,15 @@ static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
 
 		if (mode != COMPACT_WRITTEN_NO_WRITE_LOCK) {
 			i->u64s = cpu_to_le16((u64 *) out - i->_data);
-			bch_bset_set_no_aux_tree(&b->keys, t);
+			set_btree_bset_end(b, t);
+			bch_bset_set_no_aux_tree(b, t);
 		}
 	}
 
 	b->whiteout_u64s = (u64 *) u_pos - (u64 *) whiteouts;
 
 	BUG_ON((void *) unwritten_whiteouts_start(c, b) <
-	       (void *) bset_bkey_last(btree_bset_last(b)));
+	       (void *) btree_bkey_last(b, bset_tree_last(b)));
 
 	u64s = btree_node_is_extents(b)
 		? sort_extent_whiteouts(unwritten_whiteouts_start(c, b),
@@ -420,14 +412,9 @@ static bool __compact_whiteouts(struct cache_set *c, struct btree *b,
 		bch_btree_build_aux_trees(b);
 
 	bch_btree_keys_u64s_remaining(c, b);
-	bch_verify_btree_nr_keys(&b->keys);
+	bch_verify_btree_nr_keys(b);
 
 	return true;
-}
-
-bool bch_maybe_compact_whiteouts(struct cache_set *c, struct btree *b)
-{
-	return __compact_whiteouts(c, b, COMPACT_LAZY);
 }
 
 static bool bch_drop_whiteouts(struct btree *b)
@@ -435,24 +422,25 @@ static bool bch_drop_whiteouts(struct btree *b)
 	struct bset_tree *t;
 	bool ret = false;
 
-	for_each_bset(&b->keys, t) {
-		struct bset *i = t->data;
+	for_each_bset(b, t) {
+		struct bset *i = bset(b, t);
 		struct bkey_packed *k, *n, *out, *start, *end;
 
 		if (!should_compact_bset(b, t, true, true))
 			continue;
 
-		start = i->start;
-		end = bset_bkey_last(i);
+		start	= btree_bkey_first(b, t);
+		end	= btree_bkey_last(b, t);
 
 		if (bset_unwritten(b, i) &&
-		    t != b->keys.set) {
+		    t != b->set) {
 			struct bset *dst =
 			       max_t(struct bset *, write_block(b),
-				     (void *) bset_bkey_last(t[-1].data));
+				     (void *) btree_bkey_last(b, t -1));
 
 			memmove(dst, i, sizeof(struct bset));
-			i = t->data = dst;
+			i = dst;
+			set_btree_bset(b, t, i);
 		}
 
 		out = i->start;
@@ -467,20 +455,20 @@ static bool bch_drop_whiteouts(struct btree *b)
 		}
 
 		i->u64s = cpu_to_le16((u64 *) out - i->_data);
-		bch_bset_set_no_aux_tree(&b->keys, t);
+		bch_bset_set_no_aux_tree(b, t);
 		ret = true;
 	}
 
-	bch_verify_btree_nr_keys(&b->keys);
+	bch_verify_btree_nr_keys(b);
 
 	return ret;
 }
 
-static int sort_keys_cmp(struct btree_keys *b,
-			 struct bkey_packed *l,
-			 struct bkey_packed *r)
+static inline int sort_keys_cmp(struct btree *b,
+				struct bkey_packed *l,
+				struct bkey_packed *r)
 {
-	return bkey_cmp_packed(&b->format, l, r) ?:
+	return bkey_cmp_packed(b, l, r) ?:
 		(int) bkey_whiteout(r) - (int) bkey_whiteout(l) ?:
 		(int) l->needs_whiteout - (int) r->needs_whiteout;
 }
@@ -501,9 +489,15 @@ static unsigned sort_keys(struct bkey_packed *dst,
 
 		if (bkey_whiteout(in) &&
 		    (next = sort_iter_peek(iter)) &&
-		    !bkey_cmp_packed(f, in, next)) {
+		    !bkey_cmp_packed(iter->b, in, next)) {
 			BUG_ON(in->needs_whiteout &&
 			       next->needs_whiteout);
+			/*
+			 * XXX racy, called with read lock from write path
+			 *
+			 * leads to spurious BUG_ON() in bkey_unpack_key() in
+			 * debug mode
+			 */
 			next->needs_whiteout |= in->needs_whiteout;
 			continue;
 		}
@@ -520,11 +514,11 @@ static unsigned sort_keys(struct bkey_packed *dst,
 	return (u64 *) out - (u64 *) dst;
 }
 
-static inline int sort_extents_cmp(struct btree_keys *b,
+static inline int sort_extents_cmp(struct btree *b,
 				   struct bkey_packed *l,
 				   struct bkey_packed *r)
 {
-	return bkey_cmp_packed(&b->format, l, r) ?:
+	return bkey_cmp_packed(b, l, r) ?:
 		(int) bkey_deleted(l) - (int) bkey_deleted(r);
 }
 
@@ -560,24 +554,26 @@ static void btree_node_sort(struct cache_set *c, struct btree *b,
 	struct btree_node *out;
 	struct sort_iter sort_iter;
 	struct bset_tree *t;
+	struct bset *start_bset = bset(b, &b->set[start_idx]);
 	bool used_mempool = false;
 	u64 start_time;
 	unsigned i, u64s = 0, order, shift = end_idx - start_idx - 1;
 	bool sorting_entire_node = start_idx == 0 &&
-		end_idx == b->keys.nsets;
+		end_idx == b->nsets;
 
-	sort_iter_init(&sort_iter, &b->keys);
+	sort_iter_init(&sort_iter, b);
 
-	for (t = b->keys.set + start_idx;
-	     t < b->keys.set + end_idx;
+	for (t = b->set + start_idx;
+	     t < b->set + end_idx;
 	     t++) {
-		u64s += le16_to_cpu(t->data->u64s);
-		sort_iter_add(&sort_iter, t->data->start,
-			      bset_bkey_last(t->data));
+		u64s += le16_to_cpu(bset(b, t)->u64s);
+		sort_iter_add(&sort_iter,
+			      btree_bkey_first(b, t),
+			      btree_bkey_last(b, t));
 	}
 
 	order = sorting_entire_node
-		? b->keys.page_order
+		? btree_page_order(c)
 		: get_order(__set_bytes(b->data, u64s));
 
 	out = btree_bounce_alloc(c, order, &used_mempool);
@@ -585,7 +581,7 @@ static void btree_node_sort(struct cache_set *c, struct btree *b,
 	start_time = local_clock();
 
 	if (btree_node_is_extents(b))
-		filter_whiteouts = bset_written(b, b->keys.set[start_idx].data);
+		filter_whiteouts = bset_written(b, start_bset);
 
 	u64s = btree_node_is_extents(b)
 		? sort_extents(out->keys.start, &sort_iter, filter_whiteouts)
@@ -600,17 +596,17 @@ static void btree_node_sort(struct cache_set *c, struct btree *b,
 		bch_time_stats_update(&c->btree_sort_time, start_time);
 
 	/* Make sure we preserve bset journal_seq: */
-	for (t = b->keys.set + start_idx + 1;
-	     t < b->keys.set + end_idx;
+	for (t = b->set + start_idx + 1;
+	     t < b->set + end_idx;
 	     t++)
-		b->keys.set[start_idx].data->journal_seq =
-			max(b->keys.set[start_idx].data->journal_seq,
-			    t->data->journal_seq);
+		start_bset->journal_seq =
+			max(start_bset->journal_seq,
+			    bset(b, t)->journal_seq);
 
 	if (sorting_entire_node) {
 		unsigned u64s = le16_to_cpu(out->keys.u64s);
 
-		BUG_ON(order != b->keys.page_order);
+		BUG_ON(order != btree_page_order(c));
 
 		/*
 		 * Our temporary buffer is the same size as the btree node's
@@ -620,43 +616,44 @@ static void btree_node_sort(struct cache_set *c, struct btree *b,
 		*out = *b->data;
 		out->keys.u64s = cpu_to_le16(u64s);
 		swap(out, b->data);
-		b->keys.set->data = &b->data->keys;
+		set_btree_bset(b, b->set, &b->data->keys);
 	} else {
-		b->keys.set[start_idx].data->u64s = out->keys.u64s;
-		memcpy_u64s(b->keys.set[start_idx].data->start,
+		start_bset->u64s = out->keys.u64s;
+		memcpy_u64s(start_bset->start,
 			    out->keys.start,
 			    le16_to_cpu(out->keys.u64s));
 	}
 
 	for (i = start_idx + 1; i < end_idx; i++)
-		b->keys.nr.bset_u64s[start_idx] +=
-			b->keys.nr.bset_u64s[i];
+		b->nr.bset_u64s[start_idx] +=
+			b->nr.bset_u64s[i];
 
-	b->keys.nsets -= shift;
+	b->nsets -= shift;
 
-	for (i = start_idx + 1; i < b->keys.nsets; i++) {
-		b->keys.nr.bset_u64s[i]	= b->keys.nr.bset_u64s[i + shift];
-		b->keys.set[i]		= b->keys.set[i + shift];
+	for (i = start_idx + 1; i < b->nsets; i++) {
+		b->nr.bset_u64s[i]	= b->nr.bset_u64s[i + shift];
+		b->set[i]		= b->set[i + shift];
 	}
 
-	for (i = b->keys.nsets; i < MAX_BSETS; i++)
-		b->keys.nr.bset_u64s[i] = 0;
+	for (i = b->nsets; i < MAX_BSETS; i++)
+		b->nr.bset_u64s[i] = 0;
 
-	bch_bset_set_no_aux_tree(&b->keys, &b->keys.set[start_idx]);
+	set_btree_bset_end(b, &b->set[start_idx]);
+	bch_bset_set_no_aux_tree(b, &b->set[start_idx]);
 
 	btree_bounce_free(c, order, used_mempool, out);
 
-	bch_verify_btree_nr_keys(&b->keys);
+	bch_verify_btree_nr_keys(b);
 }
 
 /* Sort + repack in a new format: */
 static struct btree_nr_keys sort_repack(struct bset *dst,
-					struct btree_keys *src,
+					struct btree *src,
 					struct btree_node_iter *src_iter,
-					struct bkey_format *in_f,
 					struct bkey_format *out_f,
 					bool filter_whiteouts)
 {
+	struct bkey_format *in_f = &src->format;
 	struct bkey_packed *in, *out = bset_bkey_last(dst);
 	struct btree_nr_keys nr;
 
@@ -670,7 +667,7 @@ static struct btree_nr_keys sort_repack(struct bset *dst,
 				       ? in_f : &bch_bkey_format_current, in))
 			out->format = KEY_FORMAT_LOCAL_BTREE;
 		else
-			bkey_unpack((void *) out, in_f, in);
+			bkey_unpack(src, (void *) out, in);
 
 		btree_keys_account_key_add(&nr, 0, out);
 		out = bkey_next(out);
@@ -683,9 +680,8 @@ static struct btree_nr_keys sort_repack(struct bset *dst,
 /* Sort, repack, and merge: */
 static struct btree_nr_keys sort_repack_merge(struct cache_set *c,
 					      struct bset *dst,
-					      struct btree_keys *src,
+					      struct btree *src,
 					      struct btree_node_iter *iter,
-					      struct bkey_format *in_f,
 					      struct bkey_format *out_f,
 					      bool filter_whiteouts,
 					      key_filter_fn filter,
@@ -705,7 +701,7 @@ static struct btree_nr_keys sort_repack_merge(struct cache_set *c,
 		 * The filter might modify pointers, so we have to unpack the
 		 * key and values to &tmp.k:
 		 */
-		bkey_unpack(&tmp.k, in_f, k);
+		bkey_unpack(src, &tmp.k, k);
 
 		if (filter && filter(c, src, bkey_i_to_s(&tmp.k)))
 			continue;
@@ -753,37 +749,37 @@ void bch_btree_sort_into(struct cache_set *c,
 	struct btree_node_iter src_iter;
 	u64 start_time = local_clock();
 
-	BUG_ON(dst->keys.nsets != 1);
+	BUG_ON(dst->nsets != 1);
 
-	bch_bset_set_no_aux_tree(&dst->keys, dst->keys.set);
+	bch_bset_set_no_aux_tree(dst, dst->set);
 
-	bch_btree_node_iter_init_from_start(&src_iter, &src->keys,
+	bch_btree_node_iter_init_from_start(&src_iter, src,
 					    btree_node_is_extents(src));
 
 	if (btree_node_ops(src)->key_normalize ||
 	    btree_node_ops(src)->key_merge)
-		nr = sort_repack_merge(c, dst->keys.set->data,
-				&src->keys, &src_iter,
-				&src->keys.format,
-				&dst->keys.format,
+		nr = sort_repack_merge(c, btree_bset_first(dst),
+				src, &src_iter,
+				&dst->format,
 				true,
 				btree_node_ops(src)->key_normalize,
 				btree_node_ops(src)->key_merge);
 	else
-		nr = sort_repack(dst->keys.set->data,
-				&src->keys, &src_iter,
-				&src->keys.format,
-				&dst->keys.format,
+		nr = sort_repack(btree_bset_first(dst),
+				src, &src_iter,
+				&dst->format,
 				true);
 
 	bch_time_stats_update(&c->btree_sort_time, start_time);
 
-	dst->keys.nr.live_u64s		+= nr.live_u64s;
-	dst->keys.nr.bset_u64s[0]	+= nr.bset_u64s[0];
-	dst->keys.nr.packed_keys	+= nr.packed_keys;
-	dst->keys.nr.unpacked_keys	+= nr.unpacked_keys;
+	set_btree_bset_end(dst, dst->set);
 
-	bch_verify_btree_nr_keys(&dst->keys);
+	dst->nr.live_u64s	+= nr.live_u64s;
+	dst->nr.bset_u64s[0]	+= nr.bset_u64s[0];
+	dst->nr.packed_keys	+= nr.packed_keys;
+	dst->nr.unpacked_keys	+= nr.unpacked_keys;
+
+	bch_verify_btree_nr_keys(dst);
 }
 
 #define SORT_CRIT	(4096 / sizeof(u64))
@@ -799,14 +795,14 @@ static bool btree_node_compact(struct cache_set *c, struct btree *b,
 	bool ret = false;
 
 	for (unwritten_idx = 0;
-	     unwritten_idx < b->keys.nsets;
+	     unwritten_idx < b->nsets;
 	     unwritten_idx++)
-		if (bset_unwritten(b, b->keys.set[unwritten_idx].data))
+		if (bset_unwritten(b, bset(b, &b->set[unwritten_idx])))
 			break;
 
-	if (b->keys.nsets - unwritten_idx > 1) {
+	if (b->nsets - unwritten_idx > 1) {
 		btree_node_sort(c, b, iter, unwritten_idx,
-				b->keys.nsets, false);
+				b->nsets, false);
 		ret = true;
 	}
 
@@ -822,10 +818,10 @@ void bch_btree_build_aux_trees(struct btree *b)
 {
 	struct bset_tree *t;
 
-	for_each_bset(&b->keys, t)
-		bch_bset_build_aux_tree(&b->keys, t,
-				bset_unwritten(b, t->data) &&
-				t == bset_tree_last(&b->keys));
+	for_each_bset(b, t)
+		bch_bset_build_aux_tree(b, t,
+				bset_unwritten(b, bset(b, t)) &&
+				t == bset_tree_last(b));
 }
 
 /*
@@ -850,7 +846,7 @@ void bch_btree_init_next(struct cache_set *c, struct btree *b,
 
 	bne = want_new_bset(c, b);
 	if (bne)
-		bch_bset_init_next(&b->keys, &bne->keys);
+		bch_bset_init_next(b, &bne->keys);
 
 	bch_btree_build_aux_trees(b);
 
@@ -889,7 +885,6 @@ static const char *validate_bset(struct cache_set *c, struct btree *b,
 				 struct bset *i, unsigned sectors,
 				 unsigned *whiteout_u64s)
 {
-	struct bkey_format *f = &b->keys.format;
 	struct bkey_packed *k, *prev = NULL;
 	bool seen_non_whiteout = false;
 
@@ -941,9 +936,9 @@ static const char *validate_bset(struct cache_set *c, struct btree *b,
 		}
 
 		if (BSET_BIG_ENDIAN(i) != CPU_BIG_ENDIAN)
-			bch_bkey_swab(btree_node_type(b), &b->keys.format, k);
+			bch_bkey_swab(btree_node_type(b), &b->format, k);
 
-		u = bkey_disassemble(f, k, &tmp);
+		u = bkey_disassemble(b, k, &tmp);
 
 		invalid = btree_bkey_invalid(c, b, u);
 		if (invalid) {
@@ -968,7 +963,7 @@ static const char *validate_bset(struct cache_set *c, struct btree *b,
 
 		if (!seen_non_whiteout &&
 		    (!bkey_whiteout(k) ||
-		     (prev && bkey_cmp_left_packed(f, prev,
+		     (prev && bkey_cmp_left_packed_byval(b, prev,
 					bkey_start_pos(u.k)) > 0))) {
 			*whiteout_u64s = k->_data - i->_data;
 			seen_non_whiteout = true;
@@ -1050,8 +1045,9 @@ void bch_btree_node_read_done(struct cache_set *c, struct btree *b,
 			if (err)
 				goto err;
 
-			b->keys.format = b->data->format;
-			b->keys.set->data = &b->data->keys;
+			set_btree_bset(b, b->set, &b->data->keys);
+
+			btree_node_set_format(b, b->data->format);
 		} else {
 			bne = write_block(b);
 			i = &bne->keys;
@@ -1085,11 +1081,11 @@ void bch_btree_node_read_done(struct cache_set *c, struct btree *b,
 		if (ret)
 			continue;
 
-		__bch_btree_node_iter_push(iter, &b->keys,
+		__bch_btree_node_iter_push(iter, b,
 					   i->start,
 					   bkey_idx(i, whiteout_u64s));
 
-		__bch_btree_node_iter_push(iter, &b->keys,
+		__bch_btree_node_iter_push(iter, b,
 					   bkey_idx(i, whiteout_u64s),
 					   bset_bkey_last(i));
 	}
@@ -1104,33 +1100,26 @@ void bch_btree_node_read_done(struct cache_set *c, struct btree *b,
 	sorted = btree_bounce_alloc(c, ilog2(btree_pages(c)), &used_mempool);
 	sorted->keys.u64s = 0;
 
-	b->keys.nr = btree_node_is_extents(b)
-		? bch_extent_sort_fix_overlapping(c, &sorted->keys, &b->keys, iter)
-		: bch_key_sort_fix_overlapping(&sorted->keys, &b->keys, iter);
+	b->nr = btree_node_is_extents(b)
+		? bch_extent_sort_fix_overlapping(c, &sorted->keys, b, iter)
+		: bch_key_sort_fix_overlapping(&sorted->keys, b, iter);
 
 	u64s = le16_to_cpu(sorted->keys.u64s);
 	*sorted = *b->data;
 	sorted->keys.u64s = cpu_to_le16(u64s);
 	swap(sorted, b->data);
-	b->keys.set->data = &b->data->keys;
-	b->keys.nsets = 1;
+	set_btree_bset(b, b->set, &b->data->keys);
+	b->nsets = 1;
 
-	BUG_ON(b->keys.nr.live_u64s != u64s);
+	BUG_ON(b->nr.live_u64s != u64s);
 
 	btree_bounce_free(c, ilog2(btree_pages(c)), used_mempool, sorted);
 
-	bch_bset_build_aux_tree(&b->keys, b->keys.set, false);
+	bch_bset_build_aux_tree(b, b->set, false);
 
-	set_needs_whiteout(b->keys.set->data);
+	set_needs_whiteout(btree_bset_first(b));
 
 	btree_node_reset_sib_u64s(b);
-
-	err = "short btree key";
-	if (b->keys.set[0].size &&
-	    bkey_cmp_packed(&b->keys.format, &b->key.k,
-			    &b->keys.set[0].end) < 0)
-		goto err;
-
 out:
 	mempool_free(iter, &c->fill_iter);
 	return;
@@ -1342,20 +1331,19 @@ void __bch_btree_node_write(struct cache_set *c, struct btree *b,
 	BUG_ON(b->written >= c->sb.btree_node_size);
 	BUG_ON(bset_written(b, btree_bset_last(b)));
 	BUG_ON(le64_to_cpu(b->data->magic) != bset_magic(&c->disk_sb));
-	BUG_ON(memcmp(&b->data->format, &b->keys.format,
-		      sizeof(b->keys.format)));
+	BUG_ON(memcmp(&b->data->format, &b->format, sizeof(b->format)));
 
 	if (lock_type_held == SIX_LOCK_intent) {
 		six_lock_write(&b->lock);
-		__compact_whiteouts(c, b, COMPACT_WRITTEN);
+		__bch_compact_whiteouts(c, b, COMPACT_WRITTEN);
 		six_unlock_write(&b->lock);
 	} else {
-		__compact_whiteouts(c, b, COMPACT_WRITTEN_NO_WRITE_LOCK);
+		__bch_compact_whiteouts(c, b, COMPACT_WRITTEN_NO_WRITE_LOCK);
 	}
 
 	BUG_ON(b->uncompacted_whiteout_u64s);
 
-	sort_iter_init(&sort_iter, &b->keys);
+	sort_iter_init(&sort_iter, b);
 
 	bytes = !b->written
 		? sizeof(struct btree_node)
@@ -1363,14 +1351,16 @@ void __bch_btree_node_write(struct cache_set *c, struct btree *b,
 
 	bytes += b->whiteout_u64s * sizeof(u64);
 
-	for_each_bset(&b->keys, t) {
-		i = t->data;
+	for_each_bset(b, t) {
+		i = bset(b, t);
 
 		if (bset_written(b, i))
 			continue;
 
 		bytes += le16_to_cpu(i->u64s) * sizeof(u64);
-		sort_iter_add(&sort_iter, i->start, bset_bkey_last(i));
+		sort_iter_add(&sort_iter,
+			      btree_bkey_first(b, t),
+			      btree_bkey_last(b, t));
 		seq = max(seq, le64_to_cpu(i->journal_seq));
 	}
 
@@ -1538,15 +1528,15 @@ bool bch_btree_post_write_cleanup(struct cache_set *c, struct btree *b)
 	 * XXX: decide if we really want to unconditionally sort down to a
 	 * single bset:
 	 */
-	if (b->keys.nsets > 1) {
-		btree_node_sort(c, b, NULL, 0, b->keys.nsets, true);
+	if (b->nsets > 1) {
+		btree_node_sort(c, b, NULL, 0, b->nsets, true);
 		invalidated_iter = true;
 	} else {
 		invalidated_iter = bch_drop_whiteouts(b);
 	}
 
-	for_each_bset(&b->keys, t)
-		set_needs_whiteout(t->data);
+	for_each_bset(b, t)
+		set_needs_whiteout(bset(b, t));
 
 	bch_btree_verify(c, b);
 
@@ -1558,7 +1548,7 @@ bool bch_btree_post_write_cleanup(struct cache_set *c, struct btree *b)
 
 	bne = want_new_bset(c, b);
 	if (bne)
-		bch_bset_init_next(&b->keys, &bne->keys);
+		bch_bset_init_next(b, &bne->keys);
 
 	bch_btree_build_aux_trees(b);
 
@@ -1662,7 +1652,7 @@ void bch_btree_node_flush_journal_entries(struct cache_set *c,
 					  struct btree *b,
 					  struct closure *cl)
 {
-	int i = b->keys.nsets;
+	int i = b->nsets;
 
 	/*
 	 * Journal sequence numbers in the different bsets will always be in
@@ -1671,7 +1661,7 @@ void bch_btree_node_flush_journal_entries(struct cache_set *c,
 	 * need to loop:
 	 */
 	while (i--) {
-		u64 seq = le64_to_cpu(b->keys.set[i].data->journal_seq);
+		u64 seq = le64_to_cpu(bset(b, &b->set[i])->journal_seq);
 
 		if (seq) {
 			bch_journal_flush_seq_async(&c->journal, seq, cl);
@@ -1679,4 +1669,3 @@ void bch_btree_node_flush_journal_entries(struct cache_set *c,
 		}
 	}
 }
-

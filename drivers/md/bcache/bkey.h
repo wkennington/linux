@@ -9,6 +9,8 @@
 void bch_to_binary(char *, const u64 *, unsigned);
 int bch_bkey_to_text(char *, size_t, const struct bkey *);
 
+#define BKEY_PADDED(key)	__BKEY_PADDED(key, BKEY_EXTENT_VAL_U64s_MAX)
+
 /* bkey with split value, const */
 struct bkey_s_c {
 	const struct bkey	*k;
@@ -76,83 +78,25 @@ static inline void set_bkey_deleted(struct bkey *k)
 #define bkey_whiteout(_k)				\
 	((_k)->type == KEY_TYPE_DELETED || (_k)->type == KEY_TYPE_DISCARD)
 
-static inline void __memcpy_u64s(void *dst, const void *src,
-				 unsigned u64s)
-{
-#ifdef CONFIG_X86_64
-	long d0, d1, d2;
-	asm volatile("rep ; movsq"
-		     : "=&c" (d0), "=&D" (d1), "=&S" (d2)
-		     : "0" (u64s), "1" (dst), "2" (src)
-		     : "memory");
-#else
-	u64 *d = dst;
-	const u64 *s = src;
+#define bkey_packed_typecheck(_k)					\
+({									\
+	BUILD_BUG_ON(!type_is(_k, struct bkey *) &&			\
+		     !type_is(_k, struct bkey_packed *));		\
+	type_is(_k, struct bkey_packed *);				\
+})
 
-	while (u64s--)
-		*d++ = *s++;
-#endif
-}
+enum bkey_lr_packed {
+	BKEY_PACKED_BOTH,
+	BKEY_PACKED_RIGHT,
+	BKEY_PACKED_LEFT,
+	BKEY_PACKED_NONE,
+};
 
-static inline void memcpy_u64s(void *dst, const void *src,
-			       unsigned u64s)
-{
-	EBUG_ON(!(dst >= src + u64s * sizeof(u64) ||
-		 dst + u64s * sizeof(u64) <= src));
+#define bkey_lr_packed_typecheck(_l, _r)				\
+	(!bkey_packed_typecheck(_l) + ((!bkey_packed_typecheck(_r)) << 1))
 
-	__memcpy_u64s(dst, src, u64s);
-}
-
-static inline void __memmove_u64s_down(void *dst, const void *src,
-				       unsigned u64s)
-{
-	__memcpy_u64s(dst, src, u64s);
-}
-
-static inline void memmove_u64s_down(void *dst, const void *src,
-				     unsigned u64s)
-{
-	EBUG_ON(dst > src);
-
-	__memmove_u64s_down(dst, src, u64s);
-}
-
-static inline void __memmove_u64s_up(void *_dst, const void *_src,
-				     unsigned u64s)
-{
-	u64 *dst = (u64 *) _dst + u64s - 1;
-	u64 *src = (u64 *) _src + u64s - 1;
-
-#ifdef CONFIG_X86_64
-	long d0, d1, d2;
-	asm volatile("std ;\n"
-		     "rep ; movsq\n"
-		     "cld ;\n"
-		     : "=&c" (d0), "=&D" (d1), "=&S" (d2)
-		     : "0" (u64s), "1" (dst), "2" (src)
-		     : "memory");
-#else
-	while (u64s--)
-		*dst-- = *src--;
-#endif
-}
-
-static inline void memmove_u64s_up(void *dst, const void *src,
-				   unsigned u64s)
-{
-	EBUG_ON(dst < src);
-
-	__memmove_u64s_up(dst, src, u64s);
-}
-
-static inline void memmove_u64s(void *dst, const void *src,
-				unsigned u64s)
-{
-	if (dst < src)
-		__memmove_u64s_down(dst, src, u64s);
-	else
-		__memmove_u64s_up(dst, src, u64s);
-}
+#define bkey_lr_packed(_l, _r)						\
+	((_l)->format + ((_r)->format << 1))
 
 #define bkey_copy(_dst, _src)					\
 do {								\
@@ -168,7 +112,7 @@ do {								\
 			    ((struct bkey *) (_src))->u64s);	\
 } while (0)
 
-struct btree_keys;
+struct btree;
 
 struct bkey_format_state {
 	u64 field_min[BKEY_NR_FIELDS];
@@ -181,27 +125,75 @@ void bch_bkey_format_add_pos(struct bkey_format_state *, struct bpos);
 struct bkey_format bch_bkey_format_done(struct bkey_format_state *);
 const char *bch_bkey_format_validate(struct bkey_format *);
 
-unsigned bkey_greatest_differing_bit(const struct bkey_format *,
+__pure
+unsigned bkey_greatest_differing_bit(const struct btree *,
 				     const struct bkey_packed *,
 				     const struct bkey_packed *);
-unsigned bkey_ffs(const struct bkey_format *, const struct bkey_packed *);
+__pure
+unsigned bkey_ffs(const struct btree *, const struct bkey_packed *);
 
-int __bkey_cmp_left_packed(const struct bkey_format *,
-			   const struct bkey_packed *,
-			   struct bpos);
+__pure
+int __bkey_cmp_packed_format_checked(const struct bkey_packed *,
+				     const struct bkey_packed *,
+				     const struct btree *);
 
-#define bkey_cmp_left_packed(_format, _l, _r)			\
-({								\
-	const struct bkey *_l_unpacked;				\
-								\
-	unlikely(_l_unpacked = packed_to_bkey_c(_l))		\
-		? bkey_cmp(_l_unpacked->p, _r)			\
-		: __bkey_cmp_left_packed(_format, _l, _r);	\
-})
+__pure
+int __bkey_cmp_left_packed_format_checked(const struct btree *,
+					  const struct bkey_packed *,
+					  const struct bpos *);
 
-int __bkey_cmp_packed(const struct bkey_format *,
+__pure
+int __bkey_cmp_packed(const struct bkey_packed *,
 		      const struct bkey_packed *,
-		      const struct bkey_packed *);
+		      const struct btree *);
+
+__pure
+int bkey_cmp_left_packed(const struct btree *,
+			 const struct bkey_packed *,
+			 const struct bpos *);
+
+/*
+ * we prefer to pass bpos by ref, but it's often enough terribly convenient to
+ * pass it by by val... as much as I hate c++, const ref would be nice here:
+ */
+__pure __flatten
+static inline int bkey_cmp_left_packed_byval(const struct btree *b,
+					     const struct bkey_packed *l,
+					     struct bpos r)
+{
+	return bkey_cmp_left_packed(b, l, &r);
+}
+
+/*
+ * If @_l or @_r are struct bkey * (not bkey_packed *), uses type information to
+ * skip dispatching on k->format:
+ */
+#define bkey_cmp_packed(_b, _l, _r)					\
+({									\
+	int _cmp;							\
+									\
+	switch (bkey_lr_packed_typecheck(_l, _r)) {			\
+	case BKEY_PACKED_NONE:						\
+		_cmp = bkey_cmp(((struct bkey *) (_l))->p,		\
+				((struct bkey *) (_r))->p);		\
+		break;							\
+	case BKEY_PACKED_LEFT:						\
+		_cmp = bkey_cmp_left_packed((_b),			\
+				  (struct bkey_packed *) (_l),		\
+				  &((struct bkey *) (_r))->p);		\
+		break;							\
+	case BKEY_PACKED_RIGHT:						\
+		_cmp = -bkey_cmp_left_packed((_b),			\
+				  (struct bkey_packed *) (_r),		\
+				  &((struct bkey *) (_l))->p);		\
+		break;							\
+	case BKEY_PACKED_BOTH:						\
+		_cmp = __bkey_cmp_packed((void *) (_l),			\
+					 (void *) (_r), (_b));		\
+		break;							\
+	}								\
+	_cmp;								\
+})
 
 #if 1
 static __always_inline int bkey_cmp(struct bpos l, struct bpos r)
@@ -226,9 +218,14 @@ static inline struct bpos bpos_min(struct bpos l, struct bpos r)
 void bch_bpos_swab(struct bpos *);
 void bch_bkey_swab_key(const struct bkey_format *, struct bkey_packed *);
 
+#ifdef CONFIG_BCACHE_DEBUG
+/* statement expressions confusing unlikely()? */
 #define bkey_packed(_k)							\
 	({ EBUG_ON((_k)->format > KEY_FORMAT_CURRENT);			\
 	 (_k)->format != KEY_FORMAT_CURRENT; })
+#else
+#define bkey_packed(_k)		((_k)->format != KEY_FORMAT_CURRENT)
+#endif
 
 /*
  * It's safe to treat an unpacked bkey as a packed one, but not the reverse
@@ -258,50 +255,6 @@ static inline unsigned bkey_format_key_bits(const struct bkey_format *format)
 	return format->bits_per_field[BKEY_FIELD_INODE] +
 		format->bits_per_field[BKEY_FIELD_OFFSET] +
 		format->bits_per_field[BKEY_FIELD_SNAPSHOT];
-}
-
-#define bkey_packed_typecheck(_k)					\
-({									\
-	BUILD_BUG_ON(!type_is(_k, struct bkey *) &&			\
-		     !type_is(_k, struct bkey_packed *));		\
-	type_is(_k, struct bkey_packed *) && bkey_packed(_k);		\
-})
-
-/*
- * If @_l and @_r are in the same format, does the comparison without unpacking.
- * Otherwise, unpacks whichever one is packed.
- */
-#define bkey_cmp_packed(_f, _l, _r)					\
-	((bkey_packed_typecheck(_l) && bkey_packed_typecheck(_r))	\
-	 ? __bkey_cmp_packed(_f, (void *) _l, (void *) _r)		\
-	 : bkey_packed_typecheck(_l)					\
-	 ? __bkey_cmp_left_packed(_f,					\
-				  (struct bkey_packed *) _l,		\
-				  ((struct bkey *) _r)->p)		\
-	 : bkey_packed_typecheck(_r)					\
-	 ? -__bkey_cmp_left_packed(_f,					\
-				   (struct bkey_packed *) _r,		\
-				   ((struct bkey *) _l)->p)		\
-	 : bkey_cmp(((struct bkey *) _l)->p,				\
-		    ((struct bkey *) _r)->p))
-
-/* packed or unpacked */
-static inline int bkey_cmp_p_or_unp(const struct bkey_format *format,
-				    const struct bkey_packed *l,
-				    const struct bkey_packed *r_packed,
-				    struct bpos r)
-{
-	const struct bkey *l_unpacked;
-
-	EBUG_ON(r_packed && !bkey_packed(r_packed));
-
-	if (unlikely(l_unpacked = packed_to_bkey_c(l)))
-		return bkey_cmp(l_unpacked->p, r);
-
-	if (likely(r_packed))
-		return __bkey_cmp_packed(format, l, r_packed);
-
-	return __bkey_cmp_left_packed(format, l, r);
 }
 
 static inline struct bpos bkey_successor(struct bpos p)
@@ -373,8 +326,14 @@ bool bch_bkey_transform(const struct bkey_format *,
 			const struct bkey_format *,
 			const struct bkey_packed *);
 
-struct bkey bkey_unpack_key(const struct bkey_format *,
-			    const struct bkey_packed *);
+struct bkey __bkey_unpack_key(const struct bkey_format *,
+			      const struct bkey_packed *);
+
+#ifndef HAVE_BCACHE_COMPILED_UNPACK
+struct bpos __bkey_unpack_pos(const struct bkey_format *,
+			      const struct bkey_packed *);
+#endif
+
 bool bkey_pack_key(struct bkey_packed *, const struct bkey *,
 		   const struct bkey_format *);
 
@@ -385,15 +344,15 @@ enum bkey_pack_pos_ret {
 };
 
 enum bkey_pack_pos_ret bkey_pack_pos_lossy(struct bkey_packed *, struct bpos,
-					   const struct bkey_format *);
+					   const struct btree *);
 
 static inline bool bkey_pack_pos(struct bkey_packed *out, struct bpos in,
-				 const struct bkey_format *format)
+				 const struct btree *b)
 {
-	return bkey_pack_pos_lossy(out, in, format) == BKEY_PACK_POS_EXACT;
+	return bkey_pack_pos_lossy(out, in, b) == BKEY_PACK_POS_EXACT;
 }
 
-void bkey_unpack(struct bkey_i *, const struct bkey_format *,
+void bkey_unpack(const struct btree *, struct bkey_i *,
 		 const struct bkey_packed *);
 bool bkey_pack(struct bkey_packed *, const struct bkey_i *,
 	       const struct bkey_format *);
@@ -406,26 +365,17 @@ static inline u64 bkey_field_max(const struct bkey_format *f,
 		: U64_MAX;
 }
 
-/* Disassembled bkeys */
+#ifdef CONFIG_X86_64
+#define HAVE_BCACHE_COMPILED_UNPACK	1
 
-static inline struct bkey_s_c bkey_disassemble(const struct bkey_format *f,
-					       const struct bkey_packed *k,
-					       struct bkey *u)
-{
-	*u = bkey_unpack_key(f, k);
+int bch_compile_bkey_format(const struct bkey_format *, void *);
 
-	return (struct bkey_s_c) { u, bkeyp_val(f, k), };
-}
+#else
 
-/* non const version: */
-static inline struct bkey_s __bkey_disassemble(const struct bkey_format *f,
-					       struct bkey_packed *k,
-					       struct bkey *u)
-{
-	*u = bkey_unpack_key(f, k);
+static inline int bch_compile_bkey_format(const struct bkey_format *format,
+					  void *out) { return 0; }
 
-	return (struct bkey_s) { .k = u, .v = bkeyp_val(f, k), };
-}
+#endif
 
 static inline void bkey_reassemble(struct bkey_i *dst,
 				   struct bkey_s_c src)
