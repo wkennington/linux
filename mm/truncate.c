@@ -273,7 +273,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 
 		if (!trylock_page(page))
 			continue;
-		WARN_ON(page_to_pgoff(page) != index);
+		WARN_ON(page_to_index(page) != index);
 		if (PageWriteback(page)) {
 			unlock_page(page);
 			continue;
@@ -334,7 +334,7 @@ do_partial:
 			}
 
 			lock_page(page);
-			WARN_ON(page_to_pgoff(page) != index);
+			WARN_ON(page_to_index(page) != index);
 			wait_on_page_writeback(page);
 			truncate_inode_page(mapping, page);
 			unlock_page(page);
@@ -441,7 +441,7 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 		if (!trylock_page(page))
 			continue;
 
-		WARN_ON(page_to_pgoff(page) != index);
+		WARN_ON(page_to_index(page) != index);
 
 		/* Middle of THP: skip */
 		if (PageTransTail(page)) {
@@ -545,7 +545,7 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
 		}
 
 		lock_page(page);
-		WARN_ON(page_to_pgoff(page) != index);
+		WARN_ON(page_to_index(page) != index);
 		if (page->mapping != mapping) {
 			unlock_page(page);
 			continue;
