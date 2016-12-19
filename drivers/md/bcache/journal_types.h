@@ -7,11 +7,6 @@
 
 struct journal_res;
 
-/* size of allocated buffer, max journal entry size: */
-#define JOURNAL_BUF_BYTES	(256 << 10)
-#define JOURNAL_BUF_SECTORS	(JOURNAL_BUF_BYTES >> 9)
-#define JOURNAL_BUF_ORDER	ilog2(JOURNAL_BUF_BYTES >> PAGE_SHIFT)
-
 /*
  * We put two of these in struct journal; we used them for writes to the
  * journal that are being staged or in flight.
@@ -19,6 +14,12 @@ struct journal_res;
 struct journal_buf {
 	struct jset		*data;
 	struct closure_waitlist	wait;
+
+	/*
+	 * ugh, prio_buckets are stupid - need to convert them to new
+	 * transaction machinery when it arrives
+	 */
+	unsigned		nr_prio_buckets;
 
 	/* bloom filter: */
 	unsigned long		has_inode[1024 / sizeof(unsigned long)];
@@ -64,8 +65,9 @@ struct journal_seq_blacklist {
 struct journal_res {
 	bool			ref;
 	u8			idx;
-	u16			offset;
 	u16			u64s;
+	u32			offset;
+	u64			seq;
 };
 
 union journal_res_state {
@@ -78,19 +80,24 @@ union journal_res_state {
 	};
 
 	struct {
-		u64		cur_entry_offset:16,
+		u64		cur_entry_offset:20,
 				idx:1,
 				prev_buf_unwritten:1,
-				buf0_count:23,
-				buf1_count:23;
+				buf0_count:21,
+				buf1_count:21;
 	};
 };
+
+/* 4 mb, in bytes: */
+#define JOURNAL_ENTRY_SIZE_MAX		(4U << 20)
 
 /*
  * We stash some journal state as sentinal values in cur_entry_offset:
  */
-#define JOURNAL_ENTRY_CLOSED_VAL	(U16_MAX - 1)
-#define JOURNAL_ENTRY_ERROR_VAL		(U16_MAX)
+#define JOURNAL_ENTRY_OFFSET_MAX	((1U << 20) - 1)
+
+#define JOURNAL_ENTRY_CLOSED_VAL	(JOURNAL_ENTRY_OFFSET_MAX - 1)
+#define JOURNAL_ENTRY_ERROR_VAL		(JOURNAL_ENTRY_OFFSET_MAX)
 
 /*
  * JOURNAL_NEED_WRITE - current (pending) journal entry should be written ASAP,
@@ -113,6 +120,7 @@ struct journal {
 	unsigned		cur_entry_u64s;
 	unsigned		prev_buf_sectors;
 	unsigned		cur_buf_sectors;
+	unsigned		entry_size_max; /* bytes */
 
 	/*
 	 * Two journal entries -- one is currently open for new entries, the
@@ -170,6 +178,10 @@ struct journal {
 	/* protects advancing ja->last_idx: */
 	struct mutex		reclaim_lock;
 
+	/*
+	 * ugh: need to get prio_buckets converted over to the eventual new
+	 * transaction machinery
+	 */
 	__le64			prio_buckets[MAX_CACHES_PER_SET];
 	unsigned		nr_prio_buckets;
 
@@ -215,8 +227,7 @@ struct journal_device {
 	unsigned		last_idx;
 
 	/* Bio for journal reads/writes to this device */
-	struct bio		bio;
-	struct bio_vec		bv[JOURNAL_BUF_BYTES / PAGE_SIZE];
+	struct bio		*bio;
 
 	/* for bch_journal_read_device */
 	struct closure		read;

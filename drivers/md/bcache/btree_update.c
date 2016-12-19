@@ -146,7 +146,7 @@ found:
 			     -c->sb.btree_node_size, true, b
 			     ? gc_pos_btree_node(b)
 			     : gc_pos_btree_root(id),
-			     &tmp);
+			     &tmp, 0);
 		/*
 		 * Don't apply tmp - pending deletes aren't tracked in
 		 * cache_set_stats:
@@ -215,7 +215,7 @@ static void bch_btree_node_free_ondisk(struct cache_set *c,
 	bch_mark_key(c, bkey_i_to_s_c(&pending->key),
 		     -c->sb.btree_node_size, true,
 		     gc_phase(GC_PHASE_PENDING_DELETE),
-		     &stats);
+		     &stats, 0);
 	/*
 	 * Don't apply stats - pending deletes aren't tracked in
 	 * cache_set_stats:
@@ -375,7 +375,7 @@ static void bch_btree_set_root_inmem(struct cache_set *c, struct btree *b,
 		bch_mark_key(c, bkey_i_to_s_c(&b->key),
 			     c->sb.btree_node_size, true,
 			     gc_pos_btree_root(b->btree_id),
-			     &stats);
+			     &stats, 0);
 
 		if (old)
 			bch_btree_node_free_index(c, NULL, old->btree_id,
@@ -636,7 +636,7 @@ static void bch_insert_fixup_btree_ptr(struct btree_iter *iter,
 	if (bkey_extent_is_data(&insert->k))
 		bch_mark_key(c, bkey_i_to_s_c(insert),
 			     c->sb.btree_node_size, true,
-			     gc_pos_btree_node(b), &stats);
+			     gc_pos_btree_node(b), &stats, 0);
 
 	while ((k = bch_btree_node_iter_peek_all(node_iter, b)) &&
 	       !btree_iter_pos_cmp_packed(b, &insert->k.p, k, false))
@@ -802,8 +802,14 @@ void bch_btree_journal_key(struct btree_insert *trans,
 				    : btree_node_flush1);
 
 	if (trans->journal_res.ref) {
-		u64 seq = bch_journal_res_seq(j, &trans->journal_res);
+		u64 seq = trans->journal_res.seq;
 		bool needs_whiteout = insert->k.needs_whiteout;
+
+		/*
+		 * have a bug where we're seeing an extent with an invalid crc
+		 * entry in the journal, trying to track it down:
+		 */
+		BUG_ON(bkey_invalid(c, b->btree_id, bkey_i_to_s_c(insert)));
 
 		/* ick */
 		insert->k.needs_whiteout = false;
@@ -1033,7 +1039,7 @@ static void btree_interior_update_updated_btree(struct cache_set *c,
 
 	mutex_unlock(&c->btree_interior_update_lock);
 
-	bch_journal_flush_seq_async(&c->journal, as->journal_seq, &as->cl);
+	bch_journal_wait_on_seq(&c->journal, as->journal_seq, &as->cl);
 
 	continue_at(&as->cl, btree_interior_update_nodes_written,
 		    system_freezable_wq);
@@ -1068,10 +1074,18 @@ static void btree_interior_update_updated_root(struct cache_set *c,
 
 	mutex_unlock(&c->btree_interior_update_lock);
 
-	bch_journal_flush_seq_async(&c->journal, as->journal_seq, &as->cl);
+	bch_journal_wait_on_seq(&c->journal, as->journal_seq, &as->cl);
 
 	continue_at(&as->cl, btree_interior_update_nodes_written,
 		    system_freezable_wq);
+}
+
+static void interior_update_flush(struct journal *j, struct journal_entry_pin *pin)
+{
+	struct btree_interior_update *as =
+		container_of(pin, struct btree_interior_update, journal);
+
+	bch_journal_flush_seq_async(j, as->journal_seq, NULL);
 }
 
 /*
@@ -1108,10 +1122,10 @@ void bch_btree_interior_update_will_free_node(struct cache_set *c,
 	 */
 	bch_journal_pin_add_if_older(&c->journal,
 				     &b->writes[0].journal,
-				     &as->journal, NULL);
+				     &as->journal, interior_update_flush);
 	bch_journal_pin_add_if_older(&c->journal,
 				     &b->writes[1].journal,
-				     &as->journal, NULL);
+				     &as->journal, interior_update_flush);
 
 	mutex_lock(&c->btree_interior_update_lock);
 
@@ -1999,7 +2013,7 @@ retry:
 	}
 unlock:
 	multi_unlock_write(trans);
-	bch_journal_res_put(&c->journal, &trans->journal_res, NULL);
+	bch_journal_res_put(&c->journal, &trans->journal_res);
 
 	if (split)
 		goto split;
