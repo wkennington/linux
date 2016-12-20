@@ -651,6 +651,9 @@ void bch_check_mark_super_slowpath(struct cache_set *c, const struct bkey_i *k,
 	struct bkey_s_c_extent e = bkey_i_to_s_c_extent(k);
 	const struct bch_extent_ptr *ptr;
 
+	if (!CACHE_SET_SYNC(&c->disk_sb))
+		return;
+
 	down(&c->sb_write_mutex);
 
 	/* recheck, might have raced */
@@ -1440,9 +1443,6 @@ static const char *run_cache_set(struct cache_set *c)
 		err = "error writing first journal entry";
 		if (bch_journal_meta(&c->journal))
 			goto err;
-
-		/* Mark cache set as initialized: */
-		SET_CACHE_SET_SYNC(&c->disk_sb, true);
 	}
 
 	if (c->opts.read_only) {
@@ -1459,6 +1459,8 @@ static const char *run_cache_set(struct cache_set *c)
 		c->disk_mi[ca->sb.nr_this_dev].last_mount = cpu_to_le64(now);
 	rcu_read_unlock();
 
+	/* Mark cache set as initialized: */
+	SET_CACHE_SET_SYNC(&c->disk_sb, true);
 	SET_CACHE_SET_CLEAN(&c->disk_sb, false);
 	bcache_write_super(c);
 
@@ -1485,14 +1487,7 @@ static const char *run_cache_set(struct cache_set *c)
 	BUG_ON(!list_empty(&journal));
 	return NULL;
 err:
-	while (!list_empty(&journal)) {
-		struct journal_replay *r =
-			list_first_entry(&journal, struct journal_replay, list);
-
-		list_del(&r->list);
-		kfree(r);
-	}
-
+	bch_journal_entries_free(&journal);
 	set_bit(CACHE_SET_ERROR, &c->flags);
 	bch_cache_set_unregister(c);
 	closure_put(&c->caching);

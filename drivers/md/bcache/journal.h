@@ -256,7 +256,7 @@ static inline void bch_journal_res_put(struct journal *j,
 
 	bch_journal_buf_put(j, res->idx, false);
 
-	memset(res, 0, sizeof(*res));
+	res->ref = 0;
 }
 
 int bch_journal_res_get_slowpath(struct journal *, struct journal_res *,
@@ -339,6 +339,7 @@ static inline bool journal_flushes_device(struct cache *ca)
 
 void bch_journal_start(struct cache_set *);
 void bch_journal_mark(struct cache_set *, struct list_head *);
+void bch_journal_entries_free(struct list_head *);
 const char *bch_journal_read(struct cache_set *, struct list_head *);
 int bch_journal_replay(struct cache_set *, struct list_head *);
 

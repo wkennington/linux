@@ -436,7 +436,7 @@ static enum {
 
 	where = jlist->head;
 add:
-	i = kmalloc(offsetof(struct journal_replay, j) + bytes, GFP_KERNEL);
+	i = kvmalloc(offsetof(struct journal_replay, j) + bytes, GFP_KERNEL);
 	if (!i) {
 		ret = JOURNAL_ENTRY_ADD_ERROR;
 		goto out;
@@ -605,10 +605,18 @@ static enum {
 					     BKEY_TYPE_BTREE, "btree root");
 			break;
 
+		case JOURNAL_ENTRY_PRIO_PTRS:
+			break;
+
 		case JOURNAL_ENTRY_JOURNAL_SEQ_BLACKLISTED:
 			cache_inconsistent_on(le16_to_cpu(entry->u64s) != 1, ca,
 					      "invalid journal seq blacklist entry: bad size");
 
+			break;
+		default:
+			cache_inconsistent(ca,
+					   "invalid journal entry type %llu",
+					   JOURNAL_ENTRY_TYPE(entry));
 			break;
 		}
 	}
@@ -858,15 +866,14 @@ search_done:
 #undef read_bucket
 }
 
-static void journal_entries_free(struct journal *j,
-				 struct list_head *list)
+void bch_journal_entries_free(struct list_head *list)
 {
 
 	while (!list_empty(list)) {
 		struct journal_replay *i =
 			list_first_entry(list, struct journal_replay, list);
 		list_del(&i->list);
-		kfree(i);
+		kvfree(i);
 	}
 }
 
@@ -923,7 +930,7 @@ const char *bch_journal_read(struct cache_set *c, struct list_head *list)
 	closure_sync(&jlist.cl);
 
 	if (jlist.ret) {
-		journal_entries_free(&c->journal, list);
+		bch_journal_entries_free(list);
 
 		return jlist.ret == -ENOMEM
 			? "cannot allocate memory for journal"
@@ -1060,12 +1067,12 @@ static void __bch_journal_next_entry(struct journal *j)
 {
 	struct journal_entry_pin_list pin_list, *p;
 	struct journal_buf *buf;
-	struct jset *jset;
 
 	/*
 	 * The fifo_push() needs to happen at the same time as j->seq is
 	 * incremented for last_seq() to be calculated correctly
 	 */
+	atomic64_inc(&j->seq);
 	BUG_ON(!fifo_push(&j->pin, pin_list));
 	p = &fifo_peek_back(&j->pin);
 
@@ -1080,9 +1087,8 @@ static void __bch_journal_next_entry(struct journal *j)
 	buf = journal_cur_buf(j);
 	memset(buf->has_inode, 0, sizeof(buf->has_inode));
 
-	jset		= buf->data;
-	jset->seq	= cpu_to_le64(atomic64_inc_return(&j->seq));
-	jset->u64s	= 0;
+	buf->data->seq	= cpu_to_le64(atomic64_read(&j->seq));
+	buf->data->u64s	= 0;
 
 	BUG_ON(journal_pin_seq(j, p) != atomic64_read(&j->seq));
 }
@@ -1451,7 +1457,7 @@ err:
 	if (ret)
 		bch_err(c, "journal replay error: %d", ret);
 
-	journal_entries_free(j, list);
+	bch_journal_entries_free(list);
 
 	return ret;
 }
