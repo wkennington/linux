@@ -332,6 +332,11 @@ static inline int bch_journal_error(struct journal *j)
 		? -EIO : 0;
 }
 
+static inline bool is_journal_device(struct cache *ca)
+{
+	return ca->mi.state == CACHE_ACTIVE && ca->mi.tier == 0;
+}
+
 static inline bool journal_flushes_device(struct cache *ca)
 {
 	return true;
@@ -340,12 +345,14 @@ static inline bool journal_flushes_device(struct cache *ca)
 void bch_journal_start(struct cache_set *);
 void bch_journal_mark(struct cache_set *, struct list_head *);
 void bch_journal_entries_free(struct list_head *);
-const char *bch_journal_read(struct cache_set *, struct list_head *);
+int bch_journal_read(struct cache_set *, struct list_head *);
 int bch_journal_replay(struct cache_set *, struct list_head *);
 
 static inline void bch_journal_set_replay_done(struct journal *j)
 {
 	spin_lock(&j->lock);
+	BUG_ON(!test_bit(JOURNAL_STARTED, &j->flags));
+
 	set_bit(JOURNAL_REPLAY_DONE, &j->flags);
 	j->cur_pin_list = &fifo_peek_back(&j->pin);
 	spin_unlock(&j->lock);
