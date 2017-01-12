@@ -1,7 +1,7 @@
 #ifndef _BCACHE_CHECKSUM_H
 #define _BCACHE_CHECKSUM_H
 
-u64 bch_crc64_update(uint64_t, const void *, size_t);
+u64 bch_crc64_update(u64, const void *, size_t);
 
 u64 bch_checksum_update(unsigned, u64, const void *, size_t);
 u64 bch_checksum(unsigned, const void *, size_t);

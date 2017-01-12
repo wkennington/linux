@@ -115,6 +115,8 @@ struct bkey {
 #elif defined (__BIG_ENDIAN_BITFIELD)
 	__u8		needs_whiteout:1,
 			format:7;
+#else
+#error edit for your odd byteorder.
 #endif
 
 	/* Type of the value */
@@ -432,13 +434,15 @@ struct bch_extent_ptr {
 } __attribute__((packed, aligned(8)));
 
 union bch_extent_entry {
-#if defined(__LITTLE_ENDIAN__) ||  BITS_PER_LONG == 64
+#if defined(__LITTLE_ENDIAN) ||  __BITS_PER_LONG == 64
 	unsigned long			type;
-#elif BITS_PER_LONG == 32
+#elif __BITS_PER_LONG == 32
 	struct {
 		unsigned long		pad;
 		unsigned long		type;
 	};
+#else
+#error edit for your odd byteorder.
 #endif
 	struct bch_extent_crc32		crc32;
 	struct bch_extent_crc64		crc64;
