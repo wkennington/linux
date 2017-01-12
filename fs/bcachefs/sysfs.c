@@ -25,31 +25,6 @@
 #include <linux/sort.h>
 #include <linux/sched/clock.h>
 
-static const char * const cache_replacement_policies[] = {
-	"lru",
-	"fifo",
-	"random",
-	NULL
-};
-
-/* Default is -1; we skip past it for struct cached_dev's cache mode */
-static const char * const bch_cache_modes[] = {
-	"default",
-	"writethrough",
-	"writeback",
-	"writearound",
-	"none",
-	NULL
-};
-
-static const char * const bch_cache_state[] = {
-	"active",
-	"readonly",
-	"failed",
-	"spare",
-	NULL
-};
-
 write_attribute(attach);
 write_attribute(detach);
 write_attribute(unregister);
@@ -1238,7 +1213,7 @@ SHOW(bch_cache)
 
 	if (attr == &sysfs_cache_replacement_policy)
 		return bch_snprint_string_list(buf, PAGE_SIZE,
-					       cache_replacement_policies,
+					       bch_cache_replacement_policies,
 					       ca->mi.replacement);
 
 	sysfs_print(tier,		ca->mi.tier);
@@ -1282,7 +1257,7 @@ STORE(__bch_cache)
 	}
 
 	if (attr == &sysfs_cache_replacement_policy) {
-		ssize_t v = bch_read_string_list(buf, cache_replacement_policies);
+		ssize_t v = bch_read_string_list(buf, bch_cache_replacement_policies);
 
 		if (v < 0)
 			return v;
