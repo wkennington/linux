@@ -13,11 +13,13 @@
 #include "btree_gc.h"
 #include "btree_update.h"
 #include "btree_io.h"
+#include "chardev.h"
 #include "checksum.h"
 #include "clock.h"
 #include "compress.h"
 #include "debug.h"
 #include "error.h"
+#include "fs.h"
 #include "fs-gc.h"
 #include "inode.h"
 #include "io.h"
@@ -690,8 +692,6 @@ void bch_check_mark_super_slowpath(struct cache_set *c, const struct bkey_i *k,
  * - allocator depends on the journal (when it rewrites prios and gens)
  */
 
-static void __bch_cache_read_only(struct cache *ca);
-
 static void __bch_cache_set_read_only(struct cache_set *c)
 {
 	struct cache *ca;
@@ -715,8 +715,13 @@ static void __bch_cache_set_read_only(struct cache_set *c)
 	 * Write a journal entry after flushing the btree, so we don't end up
 	 * replaying everything we just flushed:
 	 */
-	if (test_bit(CACHE_SET_INITIAL_GC_DONE, &c->flags))
-		bch_journal_meta(&c->journal);
+	if (test_bit(JOURNAL_STARTED, &c->journal.flags)) {
+		int ret;
+
+		bch_journal_flush_async(&c->journal, NULL);
+		ret = bch_journal_meta(&c->journal);
+		BUG_ON(ret && !bch_journal_error(&c->journal));
+	}
 
 	cancel_delayed_work_sync(&c->journal.write_work);
 	cancel_delayed_work_sync(&c->journal.reclaim_work);
@@ -737,8 +742,8 @@ static void bch_cache_set_read_only_work(struct work_struct *work)
 
 	percpu_ref_put(&c->writes);
 
-	del_timer_sync(&c->foreground_write_wakeup);
-	cancel_delayed_work_sync(&c->pd_controllers_update);
+	del_timer(&c->foreground_write_wakeup);
+	cancel_delayed_work(&c->pd_controllers_update);
 
 	c->foreground_write_pd.rate.rate = UINT_MAX;
 	bch_wake_delayed_writes((unsigned long) c);
@@ -895,6 +900,8 @@ const char *bch_cache_set_read_write(struct cache_set *c)
 
 static void cache_set_free(struct cache_set *c)
 {
+	del_timer_sync(&c->foreground_write_wakeup);
+	cancel_delayed_work_sync(&c->pd_controllers_update);
 	cancel_work_sync(&c->read_only_work);
 	cancel_work_sync(&c->bio_submit_work);
 	cancel_work_sync(&c->read_retry_work);
@@ -905,7 +912,7 @@ static void cache_set_free(struct cache_set *c)
 	bch_io_clock_exit(&c->io_clock[READ]);
 	bch_compress_free(c);
 	bdi_destroy(&c->bdi);
-	free_percpu(c->bucket_stats_lock.lock);
+	lg_lock_free(&c->bucket_stats_lock);
 	free_percpu(c->bucket_stats_percpu);
 	mempool_exit(&c->btree_bounce_pool);
 	mempool_exit(&c->bio_bounce_pages);
@@ -937,19 +944,15 @@ static void cache_set_free(struct cache_set *c)
 void bch_cache_set_release(struct kobject *kobj)
 {
 	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
-
-	/*
-	 * This needs to happen after we've closed the block devices - i.e.
-	 * after all the caches have exited, which happens when they all drop
-	 * their refs on c->kobj:
-	 */
-	if (c->stop_completion)
-		complete(c->stop_completion);
+	struct completion *stop_completion = c->stop_completion;
 
 	bch_notify_cache_set_stopped(c);
 	bch_info(c, "stopped");
 
 	cache_set_free(c);
+
+	if (stop_completion)
+		complete(stop_completion);
 }
 
 /*
@@ -1076,7 +1079,6 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 	sema_init(&c->sb_write_mutex, 1);
 	INIT_RADIX_TREE(&c->devices, GFP_KERNEL);
 	mutex_init(&c->btree_cache_lock);
-	lg_lock_init(&c->bucket_stats_lock);
 	mutex_init(&c->bucket_lock);
 	mutex_init(&c->btree_root_lock);
 	INIT_WORK(&c->read_only_work, bch_cache_set_read_only_work);
@@ -1176,7 +1178,7 @@ static struct cache_set *bch_cache_set_alloc(struct cache_sb *sb,
 					 CRC32_EXTENT_SIZE_MAX) /
 				   PAGE_SECTORS, 0) ||
 	    !(c->bucket_stats_percpu = alloc_percpu(struct bucket_stats_cache_set)) ||
-	    !(c->bucket_stats_lock.lock = alloc_percpu(*c->bucket_stats_lock.lock)) ||
+	    lg_lock_init(&c->bucket_stats_lock) ||
 	    mempool_init_page_pool(&c->btree_bounce_pool, 1,
 				   ilog2(btree_pages(c))) ||
 	    bdi_setup_and_register(&c->bdi, "bcache") ||
@@ -1260,7 +1262,7 @@ static const char *run_cache_set(struct cache_set *c)
 	time64_t now;
 	LIST_HEAD(journal);
 	struct jset *j;
-	int ret;
+	int ret = -EINVAL;
 
 	lockdep_assert_held(&bch_register_lock);
 	BUG_ON(test_bit(CACHE_SET_RUNNING, &c->flags));
@@ -1282,8 +1284,8 @@ static const char *run_cache_set(struct cache_set *c)
 	 */
 
 	if (CACHE_SET_SYNC(&c->disk_sb)) {
-		err = bch_journal_read(c, &journal);
-		if (err)
+		ret = bch_journal_read(c, &journal);
+		if (ret)
 			goto err;
 
 		pr_debug("btree_journal_read() done");
@@ -1291,11 +1293,13 @@ static const char *run_cache_set(struct cache_set *c)
 		j = &list_entry(journal.prev, struct journal_replay, list)->j;
 
 		err = "error reading priorities";
-		for_each_cache(ca, c, i)
-			if (bch_prio_read(ca)) {
+		for_each_cache(ca, c, i) {
+			ret = bch_prio_read(ca);
+			if (ret) {
 				percpu_ref_put(&ca->ref);
 				goto err;
 			}
+		}
 
 		c->prio_clock[READ].hand = le16_to_cpu(j->read_clock);
 		c->prio_clock[WRITE].hand = le16_to_cpu(j->write_clock);
@@ -1355,7 +1359,8 @@ static const char *run_cache_set(struct cache_set *c)
 		bch_verbose(c, "starting journal replay:");
 
 		err = "journal replay failed";
-		if (bch_journal_replay(c, &journal))
+		ret = bch_journal_replay(c, &journal);
+		if (ret)
 			goto err;
 
 		bch_verbose(c, "journal replay done");
@@ -1375,7 +1380,7 @@ static const char *run_cache_set(struct cache_set *c)
 		err = "error in fs gc";
 		ret = bch_gc_inode_nlinks(c);
 		if (ret)
-			goto fsck_err;
+			goto err;
 		bch_verbose(c, "fs gc done");
 
 		if (!c->opts.nofsck) {
@@ -1383,7 +1388,7 @@ static const char *run_cache_set(struct cache_set *c)
 			err = "error in fsck";
 			ret = bch_fsck(c);
 			if (ret)
-				goto fsck_err;
+				goto err;
 			bch_verbose(c, "fsck done");
 		}
 	} else {
@@ -1487,27 +1492,39 @@ static const char *run_cache_set(struct cache_set *c)
 	BUG_ON(!list_empty(&journal));
 	return NULL;
 err:
+	switch (ret) {
+	case BCH_FSCK_ERRORS_NOT_FIXED:
+		bch_err(c, "filesystem contains errors: please report this to the developers");
+		pr_cont("mount with -o fix_errors to repair");
+		err = "fsck error";
+		break;
+	case BCH_FSCK_REPAIR_UNIMPLEMENTED:
+		bch_err(c, "filesystem contains errors: please report this to the developers");
+		pr_cont("repair unimplemented: inform the developers so that it can be added");
+		err = "fsck error";
+		break;
+	case BCH_FSCK_REPAIR_IMPOSSIBLE:
+		bch_err(c, "filesystem contains errors, but repair impossible");
+		err = "fsck error";
+		break;
+	case BCH_FSCK_UNKNOWN_VERSION:
+		err = "unknown metadata version";;
+		break;
+	case -ENOMEM:
+		err = "cannot allocate memory";
+		break;
+	case -EIO:
+		err = "IO error";
+		break;
+	}
+
+	BUG_ON(!err);
+
 	bch_journal_entries_free(&journal);
 	set_bit(CACHE_SET_ERROR, &c->flags);
 	bch_cache_set_unregister(c);
 	closure_put(&c->caching);
 	return err;
-fsck_err:
-	switch (ret) {
-	case BCH_FSCK_OK:
-		break;
-	case BCH_FSCK_ERRORS_NOT_FIXED:
-		bch_err(c, "filesystem contains errors: please report this to the developers");
-		pr_cont("mount with -o fix_errors to repair");
-		goto err;
-	case BCH_FSCK_REPAIR_UNIMPLEMENTED:
-		bch_err(c, "filesystem contains errors: please report this to the developers");
-		pr_cont("repair unimplemented: inform the developers so that it can be added");
-		goto err;
-	default:
-		goto err;
-	}
-	goto err;
 }
 
 static const char *can_add_cache(struct cache_sb *sb,
@@ -1552,27 +1569,6 @@ static const char *can_attach_cache(struct cache_sb *sb, struct cache_set *c)
 
 /* Cache device */
 
-static void __bch_cache_read_only(struct cache *ca)
-{
-	trace_bcache_cache_read_only(ca);
-
-	bch_moving_gc_stop(ca);
-
-	/*
-	 * This stops new data writes (e.g. to existing open data
-	 * buckets) and then waits for all existing writes to
-	 * complete.
-	 */
-	bch_cache_allocator_stop(ca);
-
-	/*
-	 * Device data write barrier -- no non-meta-data writes should
-	 * occur after this point.  However, writes to btree buckets,
-	 * journal buckets, and the superblock can still occur.
-	 */
-	trace_bcache_cache_read_only_done(ca);
-}
-
 bool bch_cache_read_only(struct cache *ca)
 {
 	struct cache_set *c = ca->set;
@@ -1590,10 +1586,25 @@ bool bch_cache_read_only(struct cache *ca)
 		bch_cache_set_read_only_sync(c);
 	}
 
+	trace_bcache_cache_read_only(ca);
+
+	bch_moving_gc_stop(ca);
+
 	/*
-	 * Stop data writes.
+	 * This stops new data writes (e.g. to existing open data
+	 * buckets) and then waits for all existing writes to
+	 * complete.
 	 */
-	__bch_cache_read_only(ca);
+	bch_cache_allocator_stop(ca);
+
+	bch_cache_group_remove_cache(&c->journal.devs, ca);
+
+	/*
+	 * Device data write barrier -- no non-meta-data writes should
+	 * occur after this point.  However, writes to btree buckets,
+	 * journal buckets, and the superblock can still occur.
+	 */
+	trace_bcache_cache_read_only_done(ca);
 
 	bch_notice(c, "%s read only", bdevname(ca->disk_sb.bdev, buf));
 	bch_notify_cache_read_only(ca);
@@ -1603,36 +1614,8 @@ bool bch_cache_read_only(struct cache *ca)
 	return true;
 }
 
-static const char *__bch_cache_read_write(struct cache *ca)
+static const char *__bch_cache_read_write(struct cache_set *c, struct cache *ca)
 {
-	const char *err;
-
-	BUG_ON(ca->mi.state != CACHE_ACTIVE);
-	lockdep_assert_held(&bch_register_lock);
-
-	trace_bcache_cache_read_write(ca);
-
-	trace_bcache_cache_read_write_done(ca);
-
-	/* XXX wtf? */
-	return NULL;
-
-	err = "error starting moving GC thread";
-	if (!bch_moving_gc_thread_start(ca))
-		err = NULL;
-
-	wake_up_process(ca->set->tiering_read);
-
-	bch_notify_cache_read_write(ca);
-
-	return err;
-}
-
-const char *bch_cache_read_write(struct cache *ca)
-{
-	struct cache_set *c = ca->set;
-	const char *err;
-
 	lockdep_assert_held(&bch_register_lock);
 
 	if (ca->mi.state == CACHE_ACTIVE)
@@ -1641,10 +1624,30 @@ const char *bch_cache_read_write(struct cache *ca)
 	if (test_bit(CACHE_DEV_REMOVING, &ca->flags))
 		return "removing";
 
+	trace_bcache_cache_read_write(ca);
+
 	if (bch_cache_allocator_start(ca))
 		return "error starting allocator thread";
 
-	err = __bch_cache_read_write(ca);
+	if (bch_moving_gc_thread_start(ca))
+		return "error starting moving GC thread";
+
+	bch_cache_group_add_cache(&c->journal.devs, ca);
+
+	wake_up_process(c->tiering_read);
+
+	bch_notify_cache_read_write(ca);
+	trace_bcache_cache_read_write_done(ca);
+
+	return NULL;
+}
+
+const char *bch_cache_read_write(struct cache *ca)
+{
+	struct cache_set *c = ca->set;
+	const char *err;
+
+	err = __bch_cache_read_write(c, ca);
 	if (err)
 		return err;
 
@@ -1687,9 +1690,6 @@ static void bch_cache_free_work(struct work_struct *work)
 
 	free_super(&ca->disk_sb);
 
-	if (c)
-		kobject_put(&c->kobj);
-
 	/*
 	 * bch_cache_stop can be called in the middle of initialization
 	 * of the struct cache object.
@@ -1714,6 +1714,9 @@ static void bch_cache_free_work(struct work_struct *work)
 		free_fifo(&ca->free[i]);
 
 	kobject_put(&ca->kobj);
+
+	if (c)
+		kobject_put(&c->kobj);
 }
 
 static void bch_cache_percpu_ref_release(struct percpu_ref *ref)
@@ -2208,11 +2211,7 @@ have_slot:
 	bch_notify_cache_added(ca);
 
 	if (ca->mi.state == CACHE_ACTIVE) {
-		err = "error starting allocator thread";
-		if (bch_cache_allocator_start(ca))
-			goto err_put;
-
-		err = __bch_cache_read_write(ca);
+		err = __bch_cache_read_write(c, ca);
 		if (err)
 			goto err_put;
 	}
@@ -2446,12 +2445,6 @@ static void bcache_exit(void)
 		crypto_free_shash(bch_sha1);
 	unregister_reboot_notifier(&reboot);
 }
-
-static const struct file_operations bch_chardev_fops = {
-	.owner		= THIS_MODULE,
-	.unlocked_ioctl = bch_chardev_ioctl,
-	.open		= nonseekable_open,
-};
 
 static int __init bcache_init(void)
 {

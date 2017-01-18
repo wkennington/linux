@@ -77,7 +77,7 @@ STRTO_H(strtouint, unsigned int)
 STRTO_H(strtoll, long long)
 STRTO_H(strtoull, unsigned long long)
 
-ssize_t bch_hprint(char *buf, int64_t v)
+ssize_t bch_hprint(char *buf, s64 v)
 {
 	static const char units[] = "?kMGTPEZY";
 	char dec[4] = "";
@@ -364,6 +364,7 @@ void bch_bio_map(struct bio *bio, void *base)
 		bv->bv_offset	= 0;
 start:		bv->bv_len	= min_t(size_t, PAGE_SIZE - bv->bv_offset,
 					size);
+		BUG_ON(bio->bi_vcnt >= bio->bi_max_vecs);
 		if (base) {
 			bv->bv_page = is_vmalloc_addr(base)
 				? vmalloc_to_page(base)

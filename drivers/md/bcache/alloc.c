@@ -68,6 +68,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/kthread.h>
+#include <linux/math64.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <trace/events/bcache.h>
@@ -77,7 +78,7 @@ static void __bch_bucket_free(struct cache *, struct bucket *);
 
 /* Allocation groups: */
 
-static void bch_cache_group_remove_cache(struct cache_group *grp, struct cache *ca)
+void bch_cache_group_remove_cache(struct cache_group *grp, struct cache *ca)
 {
 	unsigned i;
 
@@ -95,12 +96,19 @@ static void bch_cache_group_remove_cache(struct cache_group *grp, struct cache *
 	spin_unlock(&grp->lock);
 }
 
-static void bch_cache_group_add_cache(struct cache_group *grp, struct cache *ca)
+void bch_cache_group_add_cache(struct cache_group *grp, struct cache *ca)
 {
+	unsigned i;
+
 	spin_lock(&grp->lock);
+	for (i = 0; i < grp->nr_devices; i++)
+		if (rcu_access_pointer(grp->d[i].dev) == ca)
+			goto out;
+
 	BUG_ON(grp->nr_devices >= MAX_CACHES_PER_SET);
 
 	rcu_assign_pointer(grp->d[grp->nr_devices++].dev, ca);
+out:
 	spin_unlock(&grp->lock);
 }
 
@@ -347,7 +355,7 @@ int bch_prio_read(struct cache *ca)
 	unsigned bucket_nr = 0;
 	u64 bucket, expect, got;
 	size_t b;
-	int ret;
+	int ret = 0;
 
 	spin_lock(&c->journal.lock);
 	bucket = le64_to_cpu(c->journal.prio_buckets[ca->sb.nr_this_dev]);
@@ -359,11 +367,9 @@ int bch_prio_read(struct cache *ca)
 	if (!bucket)
 		return 0;
 
-	if ((bucket < ca->mi.first_bucket && bucket >= ca->mi.nbuckets) ||
-	    bch_meta_read_fault("prio")) {
-		cache_inconsistent(ca, "bad prio bucket %llu", bucket);
-		return -EIO;
-	}
+	unfixable_fsck_err_on(bucket < ca->mi.first_bucket ||
+			      bucket >= ca->mi.nbuckets, c,
+			      "bad prio bucket %llu", bucket);
 
 	for (b = 0; b < ca->mi.nbuckets; b++, d++) {
 		if (d == end) {
@@ -379,19 +385,17 @@ int bch_prio_read(struct cache *ca)
 
 			got = le64_to_cpu(p->magic);
 			expect = pset_magic(&c->disk_sb);
-			if (cache_inconsistent_on(got != expect, ca,
-					"bad magic (got %llu expect %llu) while reading prios from bucket %llu",
-					got, expect, bucket))
-				return -EIO;
+			unfixable_fsck_err_on(got != expect, c,
+				"bad magic (got %llu expect %llu) while reading prios from bucket %llu",
+				got, expect, bucket);
 
 			got = le64_to_cpu(p->csum);
 			expect = bch_checksum(PSET_CSUM_TYPE(p),
 					      &p->magic,
 					      bucket_bytes(ca) - 8);
-			if (cache_inconsistent_on(got != expect, ca,
-					"bad checksum (got %llu expect %llu) while reading prios from bucket %llu",
-					got, expect, bucket))
-				return -EIO;
+			unfixable_fsck_err_on(got != expect, c,
+				"bad checksum (got %llu expect %llu) while reading prios from bucket %llu",
+				got, expect, bucket);
 
 			bucket = le64_to_cpu(p->next_bucket);
 			d = p->data;
@@ -402,7 +406,7 @@ int bch_prio_read(struct cache *ca)
 
 		bucket_cmpxchg(&ca->buckets[b], new, new.gen = d->gen);
 	}
-
+fsck_err:
 	return 0;
 }
 
