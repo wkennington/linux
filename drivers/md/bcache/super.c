@@ -99,14 +99,17 @@ static bool bch_is_open(struct block_device *bdev)
 }
 
 static const char *bch_blkdev_open(const char *path, void *holder,
+				   struct cache_set_opts opts,
 				   struct block_device **ret)
 {
 	struct block_device *bdev;
+	fmode_t mode = opts.no_changes > 0
+		? FMODE_READ
+		: FMODE_READ|FMODE_WRITE|FMODE_EXCL;
 	const char *err;
 
 	*ret = NULL;
-	bdev = blkdev_get_by_path(path, FMODE_READ|FMODE_WRITE|FMODE_EXCL,
-				  holder);
+	bdev = blkdev_get_by_path(path, mode, holder);
 
 	if (bdev == ERR_PTR(-EBUSY)) {
 		bdev = lookup_bdev(path);
@@ -369,6 +372,7 @@ int bch_super_realloc(struct bcache_superblock *sb, unsigned u64s)
 }
 
 static const char *read_super(struct bcache_superblock *sb,
+			      struct cache_set_opts opts,
 			      const char *path)
 {
 	const char *err;
@@ -378,7 +382,7 @@ static const char *read_super(struct bcache_superblock *sb,
 
 	memset(sb, 0, sizeof(*sb));
 
-	err = bch_blkdev_open(path, &sb, &sb->bdev);
+	err = bch_blkdev_open(path, &sb, opts, &sb->bdev);
 	if (err)
 		return err;
 retry:
@@ -614,6 +618,9 @@ static void __bcache_write_super(struct cache_set *c)
 
 	closure_init(cl, &c->cl);
 
+	if (c->opts.no_changes)
+		goto no_io;
+
 	le64_add_cpu(&c->disk_sb.seq, 1);
 
 	for_each_cache(ca, c, i) {
@@ -636,7 +643,7 @@ static void __bcache_write_super(struct cache_set *c)
 		percpu_ref_get(&ca->ref);
 		__write_super(c, &ca->disk_sb);
 	}
-
+no_io:
 	closure_return_with_destructor(cl, bcache_write_super_unlock);
 }
 
@@ -2105,7 +2112,7 @@ int bch_cache_set_add_cache(struct cache_set *c, const char *path)
 
 	mutex_lock(&bch_register_lock);
 
-	err = read_super(&sb, path);
+	err = read_super(&sb, c->opts, path);
 	if (err)
 		goto err_unlock;
 
@@ -2249,7 +2256,7 @@ const char *bch_register_cache_set(char * const *devices, unsigned nr_devices,
 	mutex_lock(&bch_register_lock);
 
 	for (i = 0; i < nr_devices; i++) {
-		err = read_super(&sb[i], devices[i]);
+		err = read_super(&sb[i], opts, devices[i]);
 		if (err)
 			goto err_unlock;
 
@@ -2314,18 +2321,19 @@ err:
 const char *bch_register_one(const char *path)
 {
 	struct bcache_superblock sb;
+	struct cache_set_opts opts = cache_set_opts_empty();
 	const char *err;
 
 	mutex_lock(&bch_register_lock);
 
-	err = read_super(&sb, path);
+	err = read_super(&sb, opts, path);
 	if (err)
 		goto err;
 
 	if (__SB_IS_BDEV(le64_to_cpu(sb.sb->version)))
 		err = bch_backing_dev_register(&sb);
 	else
-		err = register_cache(&sb, cache_set_opts_empty());
+		err = register_cache(&sb, opts);
 
 	free_super(&sb);
 err:
