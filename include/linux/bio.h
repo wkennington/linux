@@ -658,6 +658,13 @@ static inline struct bio *bio_list_get(struct bio_list *bl)
 	return bio;
 }
 
+struct bio_plug_list {
+	struct bio_list		bios;
+	struct request_queue	*q;
+};
+
+void blk_punt_blocked_bios(struct bio_plug_list *);
+
 /*
  * Increment chain count for the bio. Make sure the CHAIN flag update
  * is visible before the raised count.
@@ -687,15 +694,6 @@ struct bio_set {
 	mempool_t bio_integrity_pool;
 	mempool_t bvec_integrity_pool;
 #endif
-
-	/*
-	 * Deadlock avoidance for stacking block drivers: see comments in
-	 * bio_alloc_bioset() for details
-	 */
-	spinlock_t		rescue_lock;
-	struct bio_list		rescue_list;
-	struct work_struct	rescue_work;
-	struct workqueue_struct	*rescue_workqueue;
 };
 
 struct biovec_slab {

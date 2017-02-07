@@ -1762,7 +1762,7 @@ struct task_struct {
 	void *journal_info;
 
 /* stacked block device info */
-	struct bio_list *bio_list;
+	struct bio_plug_list *bio_list;
 
 #ifdef CONFIG_BLOCK
 /* stack plugging */

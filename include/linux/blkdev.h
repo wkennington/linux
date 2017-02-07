@@ -476,6 +476,16 @@ struct request_queue {
 	struct bio_set		*bio_split;
 
 	bool			mq_sysfs_init_done;
+
+	/*
+	 * Deadlock avoidance, to deal with the plugging in
+	 * generic_make_request() that converts recursion to iteration to avoid
+	 * stack overflow:
+	 */
+	spinlock_t		rescue_lock;
+	struct bio_list		rescue_list;
+	struct work_struct	rescue_work;
+	struct workqueue_struct	*rescue_workqueue;
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */

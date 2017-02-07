@@ -3439,6 +3439,10 @@ static inline void sched_submit_work(struct task_struct *tsk)
 {
 	if (!tsk->state || tsk_is_pi_blocked(tsk))
 		return;
+
+	if (tsk->bio_list && !bio_list_empty(&tsk->bio_list->bios))
+		blk_punt_blocked_bios(tsk->bio_list);
+
 	/*
 	 * If we are going to sleep and we have plugged IO queued,
 	 * make sure to submit it to avoid deadlocks.

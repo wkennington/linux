@@ -660,6 +660,8 @@ static void blk_release_queue(struct kobject *kobj)
 
 	blk_trace_shutdown(q);
 
+	if (q->rescue_workqueue)
+		destroy_workqueue(q->rescue_workqueue);
 	if (q->bio_split)
 		bioset_free(q->bio_split);
 
