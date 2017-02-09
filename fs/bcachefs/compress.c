@@ -269,28 +269,20 @@ static int __bio_compress(struct cache_set *c,
 	switch (compression_type) {
 	case BCH_COMPRESSION_LZ4: {
 		void *workspace;
-		int srclen = *src_len;
-
-		*dst_len = dst->bi_iter.bi_size;
-		*src_len = src->bi_iter.bi_size;
+		int srclen = src->bi_iter.bi_size;
+		ret = 0;
 
 		workspace = mempool_alloc(&c->lz4_workspace_pool, GFP_NOIO);
-retry_compress:
-		ret = LZ4_compress_destSize(src_data, dst_data,
-					    &srclen, *dst_len,
-					    workspace);
-		/*
-		 * On error, the compressed data was bigger than dst_len, and
-		 * -ret is the amount of data we were able to compress - round
-		 * down to nearest block and try again:
-		 */
-		if (ret && (*src_len & block_bytes(c))) {
-			*src_len = round_down(*src_len, block_bytes(c));
-			if (!*src_len)
-				goto err;
 
-			goto retry_compress;
+		while (srclen > block_bytes(c) &&
+		       (ret = LZ4_compress_destSize(src_data, dst_data,
+						    &srclen, dst->bi_iter.bi_size,
+						    workspace)) &&
+		       (srclen & (block_bytes(c) - 1))) {
+			/* Round down to nearest block and try again: */
+			srclen = round_down(srclen, block_bytes(c));
 		}
+
 		mempool_free(workspace, &c->lz4_workspace_pool);
 
 		if (!ret)
@@ -353,6 +345,10 @@ zlib_err:
 	}
 
 	BUG_ON(!*dst_len);
+	BUG_ON(*dst_len > dst->bi_iter.bi_size);
+
+	BUG_ON(*src_len & (block_bytes(c) - 1));
+	BUG_ON(*src_len > src->bi_iter.bi_size);
 
 	/* Didn't get smaller: */
 	if (round_up(*dst_len, block_bytes(c)) >= *src_len) {
