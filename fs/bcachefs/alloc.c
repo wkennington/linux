@@ -73,7 +73,6 @@
 #include <linux/rcupdate.h>
 #include <trace/events/bcachefs.h>
 
-static size_t bch_bucket_alloc(struct cache *, enum alloc_reserve);
 static void __bch_bucket_free(struct cache *, struct bucket *);
 
 /* Allocation groups: */
@@ -331,6 +330,9 @@ static int bch_prio_write(struct cache *ca)
 
 	do {
 		unsigned u64s = jset_u64s(0);
+
+		if (!test_bit(JOURNAL_STARTED, &c->journal.flags))
+			break;
 
 		ret = bch_journal_res_get(j, &res, u64s, u64s);
 		if (ret)
@@ -965,7 +967,7 @@ out:
  *
  * Returns index of bucket on success, 0 on failure
  * */
-static size_t bch_bucket_alloc(struct cache *ca, enum alloc_reserve reserve)
+size_t bch_bucket_alloc(struct cache *ca, enum alloc_reserve reserve)
 {
 	struct bucket *g;
 	long r;
