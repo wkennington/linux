@@ -75,6 +75,7 @@
 #include <trace/events/bcachefs.h>
 
 static void __bch_bucket_free(struct bch_dev *, struct bucket *);
+static void bch_recalc_min_prio(struct bch_dev *, int);
 
 /* Allocation groups: */
 
@@ -85,7 +86,7 @@ void bch_dev_group_remove(struct dev_group *grp, struct bch_dev *ca)
 	spin_lock(&grp->lock);
 
 	for (i = 0; i < grp->nr; i++)
-		if (rcu_access_pointer(grp->d[i].dev) == ca) {
+		if (grp->d[i].dev == ca) {
 			grp->nr--;
 			memmove(&grp->d[i],
 				&grp->d[i + 1],
@@ -102,12 +103,12 @@ void bch_dev_group_add(struct dev_group *grp, struct bch_dev *ca)
 
 	spin_lock(&grp->lock);
 	for (i = 0; i < grp->nr; i++)
-		if (rcu_access_pointer(grp->d[i].dev) == ca)
+		if (grp->d[i].dev == ca)
 			goto out;
 
 	BUG_ON(grp->nr>= BCH_SB_MEMBERS_MAX);
 
-	rcu_assign_pointer(grp->d[grp->nr++].dev, ca);
+	grp->d[grp->nr++].dev = ca;
 out:
 	spin_unlock(&grp->lock);
 }
@@ -138,7 +139,8 @@ static void pd_controllers_update(struct work_struct *work)
 				faster_tiers_dirty,
 				-1);
 
-		group_for_each_dev_rcu(ca, &c->tiers[i].devs, iter) {
+		spin_lock(&c->tiers[i].devs.lock);
+		group_for_each_dev(ca, &c->tiers[i].devs, iter) {
 			struct bch_dev_usage stats = bch_dev_usage_read(ca);
 			unsigned bucket_bits = ca->bucket_bits + 9;
 
@@ -173,6 +175,7 @@ static void pd_controllers_update(struct work_struct *work)
 
 			copygc_can_free			+= fragmented;
 		}
+		spin_unlock(&c->tiers[i].devs.lock);
 	}
 
 	rcu_read_unlock();
@@ -439,8 +442,15 @@ int bch_prio_read(struct bch_dev *ca)
 
 		bucket_cmpxchg(&ca->buckets[b], new, new.gen = d->gen);
 	}
+
+	mutex_lock(&c->bucket_lock);
+	bch_recalc_min_prio(ca, READ);
+	bch_recalc_min_prio(ca, WRITE);
+	mutex_unlock(&c->bucket_lock);
+
+	ret = 0;
 fsck_err:
-	return 0;
+	return ret;
 }
 
 #define BUCKET_GC_GEN_MAX	96U
@@ -517,6 +527,8 @@ void bch_recalc_min_prio(struct bch_dev *ca, int rw)
 	struct bucket *g;
 	u16 max_delta = 1;
 	unsigned i;
+
+	lockdep_assert_held(&c->bucket_lock);
 
 	/* Determine min prio for this particular cache */
 	for_each_bucket(g, ca)
@@ -819,8 +831,8 @@ static void bch_find_empty_buckets(struct bch_fs *c, struct bch_dev *ca)
 			spin_lock(&ca->freelist_lock);
 
 			bch_mark_alloc_bucket(ca, g, true);
-			g->read_prio = ca->fs->prio_clock[READ].hand;
-			g->write_prio = ca->fs->prio_clock[WRITE].hand;
+			g->read_prio = c->prio_clock[READ].hand;
+			g->write_prio = c->prio_clock[WRITE].hand;
 
 			verify_not_on_freelist(ca, g - ca->buckets);
 			BUG_ON(!fifo_push(&ca->free_inc, g - ca->buckets));
@@ -1056,7 +1068,6 @@ static enum bucket_alloc_ret bch_bucket_alloc_group(struct bch_fs *c,
 	if (ob->nr_ptrs >= nr_replicas)
 		return ALLOC_SUCCESS;
 
-	rcu_read_lock();
 	spin_lock(&devs->lock);
 
 	for (i = 0; i < devs->nr; i++)
@@ -1126,7 +1137,6 @@ static enum bucket_alloc_ret bch_bucket_alloc_group(struct bch_fs *c,
 err:
 	EBUG_ON(ret != ALLOC_SUCCESS && reserve == RESERVE_MOVINGGC);
 	spin_unlock(&devs->lock);
-	rcu_read_unlock();
 	return ret;
 }
 
@@ -1221,14 +1231,14 @@ static int bch_bucket_alloc_set(struct bch_fs *c, struct write_point *wp,
 static void __bch_open_bucket_put(struct bch_fs *c, struct open_bucket *ob)
 {
 	const struct bch_extent_ptr *ptr;
-	struct bch_dev *ca;
 
 	lockdep_assert_held(&c->open_buckets_lock);
 
-	rcu_read_lock();
-	open_bucket_for_each_online_device(c, ob, ptr, ca)
+	open_bucket_for_each_ptr(ob, ptr) {
+		struct bch_dev *ca = c->devs[ptr->dev];
+
 		bch_mark_alloc_bucket(ca, PTR_BUCKET(ca, ptr), false);
-	rcu_read_unlock();
+	}
 
 	ob->nr_ptrs = 0;
 
@@ -1281,12 +1291,13 @@ static struct open_bucket *bch_open_bucket_get(struct bch_fs *c,
 	return ret;
 }
 
-static unsigned ob_ptr_sectors_free(struct open_bucket *ob,
-				    struct bch_member_rcu *mi,
+static unsigned ob_ptr_sectors_free(struct bch_fs *c,
+				    struct open_bucket *ob,
 				    struct bch_extent_ptr *ptr)
 {
+	struct bch_dev *ca = c->devs[ptr->dev];
 	unsigned i = ptr - ob->ptrs;
-	unsigned bucket_size = mi->m[ptr->dev].bucket_size;
+	unsigned bucket_size = ca->mi.bucket_size;
 	unsigned used = (ptr->offset & (bucket_size - 1)) +
 		ob->ptr_offset[i];
 
@@ -1299,14 +1310,11 @@ static unsigned open_bucket_sectors_free(struct bch_fs *c,
 					 struct open_bucket *ob,
 					 unsigned nr_replicas)
 {
-	struct bch_member_rcu *mi = fs_member_info_get(c);
 	unsigned i, sectors_free = UINT_MAX;
 
 	for (i = 0; i < min(nr_replicas, ob->nr_ptrs); i++)
 		sectors_free = min(sectors_free,
-				   ob_ptr_sectors_free(ob, mi, &ob->ptrs[i]));
-
-	fs_member_info_put();
+				   ob_ptr_sectors_free(c, ob, &ob->ptrs[i]));
 
 	return sectors_free != UINT_MAX ? sectors_free : 0;
 }
@@ -1315,11 +1323,10 @@ static void open_bucket_copy_unused_ptrs(struct bch_fs *c,
 					 struct open_bucket *new,
 					 struct open_bucket *old)
 {
-	struct bch_member_rcu *mi = fs_member_info_get(c);
 	unsigned i;
 
 	for (i = 0; i < old->nr_ptrs; i++)
-		if (ob_ptr_sectors_free(old, mi, &old->ptrs[i])) {
+		if (ob_ptr_sectors_free(c, old, &old->ptrs[i])) {
 			struct bch_extent_ptr tmp = old->ptrs[i];
 
 			tmp.offset += old->ptr_offset[i];
@@ -1327,19 +1334,18 @@ static void open_bucket_copy_unused_ptrs(struct bch_fs *c,
 			new->ptr_offset[new->nr_ptrs] = 0;
 			new->nr_ptrs++;
 		}
-	fs_member_info_put();
 }
 
 static void verify_not_stale(struct bch_fs *c, const struct open_bucket *ob)
 {
 #ifdef CONFIG_BCACHEFS_DEBUG
 	const struct bch_extent_ptr *ptr;
-	struct bch_dev *ca;
 
-	rcu_read_lock();
-	open_bucket_for_each_online_device(c, ob, ptr, ca)
+	open_bucket_for_each_ptr(ob, ptr) {
+		struct bch_dev *ca = c->devs[ptr->dev];
+
 		BUG_ON(ptr_stale(ca, ptr));
-	rcu_read_unlock();
+	}
 #endif
 }
 
@@ -1483,7 +1489,6 @@ void bch_alloc_sectors_append_ptrs(struct bch_fs *c, struct bkey_i_extent *e,
 				   unsigned sectors)
 {
 	struct bch_extent_ptr tmp;
-	struct bch_dev *ca;
 	bool has_data = false;
 	unsigned i;
 
@@ -1498,8 +1503,6 @@ void bch_alloc_sectors_append_ptrs(struct bch_fs *c, struct bkey_i_extent *e,
 	if (nr_replicas < ob->nr_ptrs)
 		has_data = true;
 
-	rcu_read_lock();
-
 	for (i = 0; i < min(ob->nr_ptrs, nr_replicas); i++) {
 		EBUG_ON(bch_extent_has_device(extent_i_to_s_c(e), ob->ptrs[i].dev));
 
@@ -1510,11 +1513,8 @@ void bch_alloc_sectors_append_ptrs(struct bch_fs *c, struct bkey_i_extent *e,
 
 		ob->ptr_offset[i] += sectors;
 
-		if ((ca = PTR_DEV(c, &ob->ptrs[i])))
-			this_cpu_add(*ca->sectors_written, sectors);
+		this_cpu_add(*c->devs[tmp.dev]->sectors_written, sectors);
 	}
-
-	rcu_read_unlock();
 }
 
 /*
@@ -1524,18 +1524,15 @@ void bch_alloc_sectors_append_ptrs(struct bch_fs *c, struct bkey_i_extent *e,
 void bch_alloc_sectors_done(struct bch_fs *c, struct write_point *wp,
 			    struct open_bucket *ob)
 {
-	struct bch_member_rcu *mi = fs_member_info_get(c);
 	bool has_data = false;
 	unsigned i;
 
 	for (i = 0; i < ob->nr_ptrs; i++) {
-		if (!ob_ptr_sectors_free(ob, mi, &ob->ptrs[i]))
+		if (!ob_ptr_sectors_free(c, ob, &ob->ptrs[i]))
 			ob->has_full_ptrs = true;
 		else
 			has_data = true;
 	}
-
-	fs_member_info_put();
 
 	if (likely(has_data))
 		atomic_inc(&ob->pin);
@@ -1598,8 +1595,7 @@ void bch_recalc_capacity(struct bch_fs *c)
 	unsigned long ra_pages = 0;
 	unsigned i, j;
 
-	rcu_read_lock();
-	for_each_member_device_rcu(ca, c, i) {
+	for_each_online_member(ca, c, i) {
 		struct backing_dev_info *bdi = ca->disk_sb.bdev->bd_bdi;
 
 		ra_pages += bdi->ra_pages;
@@ -1629,7 +1625,8 @@ void bch_recalc_capacity(struct bch_fs *c)
 	 * Capacity of the filesystem is the capacity of all the devices in the
 	 * slowest (highest) tier - we don't include lower tier devices.
 	 */
-	group_for_each_dev_rcu(ca, &slowest_tier->devs, i) {
+	spin_lock(&slowest_tier->devs.lock);
+	group_for_each_dev(ca, &slowest_tier->devs, i) {
 		size_t reserve = 0;
 
 		/*
@@ -1665,8 +1662,8 @@ void bch_recalc_capacity(struct bch_fs *c)
 			     ca->mi.first_bucket) <<
 			ca->bucket_bits;
 	}
+	spin_unlock(&slowest_tier->devs.lock);
 set_capacity:
-	rcu_read_unlock();
 	total_capacity = capacity;
 
 	capacity *= (100 - c->opts.gc_reserve_percent);
@@ -1825,6 +1822,8 @@ int bch_dev_allocator_start(struct bch_dev *ca)
 {
 	struct bch_fs *c = ca->fs;
 	struct dev_group *tier = &c->tiers[ca->mi.tier].devs;
+	struct bch_sb_field_journal *journal_buckets;
+	bool has_journal;
 	struct task_struct *k;
 
 	/*
@@ -1842,7 +1841,15 @@ int bch_dev_allocator_start(struct bch_dev *ca)
 
 	bch_dev_group_add(tier, ca);
 	bch_dev_group_add(&c->all_devs, ca);
-	bch_dev_group_add(&c->journal.devs, ca);
+
+	mutex_lock(&c->sb_lock);
+	journal_buckets = bch_sb_get_journal(ca->disk_sb.sb);
+	has_journal = bch_nr_journal_buckets(journal_buckets) >=
+		BCH_JOURNAL_BUCKETS_MIN;
+	mutex_unlock(&c->sb_lock);
+
+	if (has_journal)
+		bch_dev_group_add(&c->journal.devs, ca);
 
 	bch_recalc_capacity(c);
 
