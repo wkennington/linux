@@ -133,7 +133,7 @@ fail:
 
 struct posix_acl *bch_get_acl(struct inode *inode, int type)
 {
-	struct cache_set *c = inode->i_sb->s_fs_info;
+	struct bch_fs *c = inode->i_sb->s_fs_info;
 	int name_index;
 	char *value = NULL;
 	struct posix_acl *acl;
@@ -173,7 +173,7 @@ struct posix_acl *bch_get_acl(struct inode *inode, int type)
 
 int bch_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 {
-	struct cache_set *c = inode->i_sb->s_fs_info;
+	struct bch_fs *c = inode->i_sb->s_fs_info;
 	int name_index;
 	void *value = NULL;
 	size_t size = 0;
@@ -187,7 +187,7 @@ int bch_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 			if (ret < 0)
 				return ret;
 			else {
-				inode->i_ctime = CURRENT_TIME_SEC;
+				inode->i_ctime = current_fs_time(inode->i_sb);
 				mark_inode_dirty(inode);
 				if (ret == 0)
 					acl = NULL;

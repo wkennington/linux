@@ -112,11 +112,6 @@
 
 #include "journal_types.h"
 
-static inline struct jset_entry *jset_keys_next(struct jset_entry *j)
-{
-	return (void *) __bkey_idx(j, le16_to_cpu(j->u64s));
-}
-
 /*
  * Only used for holding the journal entries we read in btree_journal_read()
  * during cache_registration
@@ -140,15 +135,16 @@ void bch_journal_pin_add_if_older(struct journal *,
 				  struct journal_entry_pin *,
 				  struct journal_entry_pin *,
 				  journal_pin_flush_fn);
+void bch_journal_flush_pins(struct journal *);
 
 struct closure;
-struct cache_set;
+struct bch_fs;
 struct keylist;
 
-struct bkey_i *bch_journal_find_btree_root(struct cache_set *, struct jset *,
+struct bkey_i *bch_journal_find_btree_root(struct bch_fs *, struct jset *,
 					   enum btree_id, unsigned *);
 
-int bch_journal_seq_should_ignore(struct cache_set *, u64, struct btree *);
+int bch_journal_seq_should_ignore(struct bch_fs *, u64, struct btree *);
 
 u64 bch_inode_journal_seq(struct journal *, u64);
 
@@ -182,7 +178,7 @@ static inline void bch_journal_add_entry_at(struct journal_buf *buf,
 					    unsigned type, enum btree_id id,
 					    unsigned level, unsigned offset)
 {
-	struct jset_entry *entry = bkey_idx(buf->data, offset);
+	struct jset_entry *entry = vstruct_idx(buf->data, offset);
 
 	entry->u64s = cpu_to_le16(u64s);
 	entry->btree_id = id;
@@ -334,21 +330,16 @@ static inline int bch_journal_error(struct journal *j)
 		? -EIO : 0;
 }
 
-static inline bool is_journal_device(struct cache *ca)
-{
-	return ca->mi.state == CACHE_ACTIVE && ca->mi.tier == 0;
-}
-
-static inline bool journal_flushes_device(struct cache *ca)
+static inline bool journal_flushes_device(struct bch_dev *ca)
 {
 	return true;
 }
 
-void bch_journal_start(struct cache_set *);
-void bch_journal_mark(struct cache_set *, struct list_head *);
+void bch_journal_start(struct bch_fs *);
+void bch_journal_mark(struct bch_fs *, struct list_head *);
 void bch_journal_entries_free(struct list_head *);
-int bch_journal_read(struct cache_set *, struct list_head *);
-int bch_journal_replay(struct cache_set *, struct list_head *);
+int bch_journal_read(struct bch_fs *, struct list_head *);
+int bch_journal_replay(struct bch_fs *, struct list_head *);
 
 static inline void bch_journal_set_replay_done(struct journal *j)
 {
@@ -360,28 +351,23 @@ static inline void bch_journal_set_replay_done(struct journal *j)
 	spin_unlock(&j->lock);
 }
 
-void bch_journal_free(struct journal *);
-int bch_journal_alloc(struct journal *, unsigned);
-
 ssize_t bch_journal_print_debug(struct journal *, char *);
 
-int bch_cache_journal_alloc(struct cache *);
+int bch_dev_journal_alloc(struct bch_dev *);
 
-static inline __le64 *__journal_buckets(struct cache_sb *sb)
+static inline unsigned bch_nr_journal_buckets(struct bch_sb_field_journal *j)
 {
-	return sb->_data + bch_journal_buckets_offset(sb);
+	return j
+		? (__le64 *) vstruct_end(&j->field) - j->buckets
+		: 0;
 }
 
-static inline u64 journal_bucket(struct cache_sb *sb, unsigned nr)
-{
-	return le64_to_cpu(__journal_buckets(sb)[nr]);
-}
+int bch_journal_move(struct bch_dev *);
 
-static inline void set_journal_bucket(struct cache_sb *sb, unsigned nr, u64 bucket)
-{
-	__journal_buckets(sb)[nr] = cpu_to_le64(bucket);
-}
-
-int bch_journal_move(struct cache *);
+void bch_fs_journal_stop(struct journal *);
+void bch_dev_journal_exit(struct bch_dev *);
+int bch_dev_journal_init(struct bch_dev *, struct bch_sb *);
+void bch_fs_journal_exit(struct journal *);
+int bch_fs_journal_init(struct journal *, unsigned);
 
 #endif /* _BCACHE_JOURNAL_H */

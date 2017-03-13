@@ -17,7 +17,7 @@
 	WARN_ON_ONCE(ret);						\
 })
 
-static void notify_get(struct cache_set *c)
+static void notify_get(struct bch_fs *c)
 {
 	struct kobj_uevent_env *env = &c->uevent_env;
 
@@ -25,20 +25,19 @@ static void notify_get(struct cache_set *c)
 	env->envp_idx = 0;
 	env->buflen = 0;
 
-	notify_var(c, "SET_UUID=%pU", c->disk_sb.user_uuid.b);
+	notify_var(c, "SET_UUID=%pU", c->sb.user_uuid.b);
 }
 
-static void notify_get_cache(struct cache *ca)
+static void notify_get_cache(struct bch_dev *ca)
 {
-	struct cache_set *c = ca->set;
-	char buf[BDEVNAME_SIZE];
+	struct bch_fs *c = ca->fs;
 
 	notify_get(c);
-	notify_var(c, "UUID=%pU", ca->disk_sb.sb->disk_uuid.b);
-	notify_var(c, "BLOCKDEV=%s", bdevname(ca->disk_sb.bdev, buf));
+	notify_var(c, "UUID=%pU", ca->uuid.b);
+	notify_var(c, "BLOCKDEV=%s", ca->name);
 }
 
-static void notify_put(struct cache_set *c)
+static void notify_put(struct bch_fs *c)
 {
 	struct kobj_uevent_env *env = &c->uevent_env;
 
@@ -47,84 +46,57 @@ static void notify_put(struct cache_set *c)
 	mutex_unlock(&c->uevent_lock);
 }
 
-void bch_notify_cache_set_read_write(struct cache_set *c)
+void bch_notify_fs_read_write(struct bch_fs *c)
 {
 	notify_get(c);
 	notify_var(c, "STATE=active");
 	notify_put(c);
 }
 
-void bch_notify_cache_set_read_only(struct cache_set *c)
+void bch_notify_fs_read_only(struct bch_fs *c)
 {
 	notify_get(c);
 	notify_var(c, "STATE=readonly");
 	notify_put(c);
 }
 
-void bch_notify_cache_set_stopped(struct cache_set *c)
+void bch_notify_fs_stopped(struct bch_fs *c)
 {
 	notify_get(c);
 	notify_var(c, "STATE=stopped");
 	notify_put(c);
 }
 
-void bch_notify_cache_read_write(struct cache *ca)
+void bch_notify_dev_read_write(struct bch_dev *ca)
 {
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 
 	notify_get_cache(ca);
 	notify_var(c, "STATE=active");
 	notify_put(c);
 }
 
-void bch_notify_cache_read_only(struct cache *ca)
+void bch_notify_dev_read_only(struct bch_dev *ca)
 {
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 
 	notify_get_cache(ca);
 	notify_var(c, "STATE=readonly");
 	notify_put(c);
 }
 
-void bch_notify_cache_added(struct cache *ca)
+void bch_notify_dev_added(struct bch_dev *ca)
 {
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 
 	notify_get_cache(ca);
 	notify_var(c, "STATE=removing");
 	notify_put(c);
 }
 
-void bch_notify_cache_removing(struct cache *ca)
+void bch_notify_dev_error(struct bch_dev *ca, bool fatal)
 {
-	struct cache_set *c = ca->set;
-
-	notify_get_cache(ca);
-	notify_var(c, "STATE=removing");
-	notify_put(c);
-}
-
-void bch_notify_cache_remove_failed(struct cache *ca)
-{
-	struct cache_set *c = ca->set;
-
-	notify_get_cache(ca);
-	notify_var(c, "STATE=remove_failed");
-	notify_put(c);
-}
-
-void bch_notify_cache_removed(struct cache *ca)
-{
-	struct cache_set *c = ca->set;
-
-	notify_get_cache(ca);
-	notify_var(c, "STATE=removed");
-	notify_put(c);
-}
-
-void bch_notify_cache_error(struct cache *ca, bool fatal)
-{
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 
 	notify_get_cache(ca);
 	notify_var(c, "STATE=error");

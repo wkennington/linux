@@ -37,7 +37,7 @@ static void btree_verify_endio(struct bio *bio)
 	closure_put(cl);
 }
 
-void __bch_btree_verify(struct cache_set *c, struct btree *b)
+void __bch_btree_verify(struct bch_fs *c, struct btree *b)
 {
 	struct btree *v = c->verify_data;
 	struct btree_node *n_ondisk, *n_sorted, *n_inmemory;
@@ -88,7 +88,7 @@ void __bch_btree_verify(struct cache_set *c, struct btree *b)
 	bch_btree_node_read_done(c, v, pick.ca, &pick.ptr);
 	n_sorted = c->verify_data->data;
 
-	percpu_ref_put(&pick.ca->ref);
+	percpu_ref_put(&pick.ca->io_ref);
 
 	sorted = &n_sorted->keys;
 	inmemory = &n_inmemory->keys;
@@ -96,7 +96,7 @@ void __bch_btree_verify(struct cache_set *c, struct btree *b)
 	if (inmemory->u64s != sorted->u64s ||
 	    memcmp(inmemory->start,
 		   sorted->start,
-		   (void *) bset_bkey_last(inmemory) - (void *) inmemory->start)) {
+		   vstruct_end(inmemory) - (void *) inmemory->start)) {
 		unsigned offset = 0, sectors;
 		struct bset *i;
 		unsigned j;
@@ -112,18 +112,14 @@ void __bch_btree_verify(struct cache_set *c, struct btree *b)
 		while (offset < b->written) {
 			if (!offset ) {
 				i = &n_ondisk->keys;
-				sectors = __set_blocks(n_ondisk,
-						       le16_to_cpu(n_ondisk->keys.u64s),
-						       block_bytes(c)) <<
+				sectors = vstruct_blocks(n_ondisk, c->block_bits) <<
 					c->block_bits;
 			} else {
 				struct btree_node_entry *bne =
 					(void *) n_ondisk + (offset << 9);
 				i = &bne->keys;
 
-				sectors = __set_blocks(bne,
-						       le16_to_cpu(bne->keys.u64s),
-						       block_bytes(c)) <<
+				sectors = vstruct_blocks(bne, c->block_bits) <<
 					c->block_bits;
 			}
 
@@ -190,11 +186,11 @@ out_put:
 
 #ifdef CONFIG_DEBUG_FS
 
-/* XXX: cache set refcounting */
+/* XXX: bch_fs refcounting */
 
 struct dump_iter {
 	struct bpos		from;
-	struct cache_set	*c;
+	struct bch_fs	*c;
 	enum btree_id		id;
 
 	char			buf[PAGE_SIZE];
@@ -235,7 +231,7 @@ static int bch_dump_open(struct inode *inode, struct file *file)
 
 	file->private_data = i;
 	i->from = POS_MIN;
-	i->c	= container_of(bd, struct cache_set, btree_debug[bd->id]);
+	i->c	= container_of(bd, struct bch_fs, btree_debug[bd->id]);
 	i->id	= bd->id;
 
 	return 0;
@@ -413,13 +409,13 @@ static const struct file_operations bfloat_failed_debug_ops = {
 	.read		= bch_read_bfloat_failed,
 };
 
-void bch_debug_exit_cache_set(struct cache_set *c)
+void bch_fs_debug_exit(struct bch_fs *c)
 {
 	if (!IS_ERR_OR_NULL(c->debug))
 		debugfs_remove_recursive(c->debug);
 }
 
-void bch_debug_init_cache_set(struct cache_set *c)
+void bch_fs_debug_init(struct bch_fs *c)
 {
 	struct btree_debug *bd;
 	char name[100];
@@ -427,7 +423,7 @@ void bch_debug_init_cache_set(struct cache_set *c)
 	if (IS_ERR_OR_NULL(bch_debug))
 		return;
 
-	snprintf(name, sizeof(name), "%pU", c->disk_sb.user_uuid.b);
+	snprintf(name, sizeof(name), "%pU", c->sb.user_uuid.b);
 	c->debug = debugfs_create_dir(name, bch_debug);
 	if (IS_ERR_OR_NULL(c->debug))
 		return;
@@ -436,18 +432,18 @@ void bch_debug_init_cache_set(struct cache_set *c)
 	     bd < c->btree_debug + ARRAY_SIZE(c->btree_debug);
 	     bd++) {
 		bd->id = bd - c->btree_debug;
-		bd->btree = debugfs_create_file(bch_btree_id_names[bd->id],
+		bd->btree = debugfs_create_file(bch_btree_ids[bd->id],
 						0400, c->debug, bd,
 						&btree_debug_ops);
 
 		snprintf(name, sizeof(name), "%s-formats",
-			 bch_btree_id_names[bd->id]);
+			 bch_btree_ids[bd->id]);
 
 		bd->btree_format = debugfs_create_file(name, 0400, c->debug, bd,
 						       &btree_format_debug_ops);
 
 		snprintf(name, sizeof(name), "%s-bfloat-failed",
-			 bch_btree_id_names[bd->id]);
+			 bch_btree_ids[bd->id]);
 
 		bd->failed = debugfs_create_file(name, 0400, c->debug, bd,
 						 &bfloat_failed_debug_ops);

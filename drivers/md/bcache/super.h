@@ -3,158 +3,134 @@
 
 #include "extents.h"
 
-static inline size_t sector_to_bucket(const struct cache *ca, sector_t s)
+#include <linux/bcache-ioctl.h>
+
+static inline size_t sector_to_bucket(const struct bch_dev *ca, sector_t s)
 {
 	return s >> ca->bucket_bits;
 }
 
-static inline sector_t bucket_to_sector(const struct cache *ca, size_t b)
+static inline sector_t bucket_to_sector(const struct bch_dev *ca, size_t b)
 {
 	return ((sector_t) b) << ca->bucket_bits;
 }
 
-static inline sector_t bucket_remainder(const struct cache *ca, sector_t s)
+static inline sector_t bucket_remainder(const struct bch_dev *ca, sector_t s)
 {
 	return s & (ca->mi.bucket_size - 1);
 }
 
-#define cache_member_info_get(_c)					\
-	(rcu_read_lock(), rcu_dereference((_c)->members))
-
-#define cache_member_info_put()	rcu_read_unlock()
-
-static inline struct cache *bch_next_cache_rcu(struct cache_set *c,
-					       unsigned *iter)
+static inline struct bch_dev *__bch_next_dev(struct bch_fs *c, unsigned *iter)
 {
-	struct cache *ret = NULL;
+	struct bch_dev *ca = NULL;
 
-	while (*iter < c->sb.nr_in_set &&
-	       !(ret = rcu_dereference(c->cache[*iter])))
+	while (*iter < c->sb.nr_devices &&
+	       !(ca = rcu_dereference_check(c->devs[*iter],
+					    lockdep_is_held(&c->state_lock))))
 		(*iter)++;
 
-	return ret;
+	return ca;
 }
 
-#define for_each_cache_rcu(ca, c, iter)					\
-	for ((iter) = 0; ((ca) = bch_next_cache_rcu((c), &(iter))); (iter)++)
+#define __for_each_member_device(ca, c, iter)				\
+	for ((iter) = 0; ((ca) = __bch_next_dev((c), &(iter))); (iter)++)
 
-static inline struct cache *bch_get_next_cache(struct cache_set *c,
-					       unsigned *iter)
+#define for_each_member_device_rcu(ca, c, iter)				\
+	__for_each_member_device(ca, c, iter)
+
+static inline struct bch_dev *bch_get_next_dev(struct bch_fs *c, unsigned *iter)
 {
-	struct cache *ret;
+	struct bch_dev *ca;
 
 	rcu_read_lock();
-	if ((ret = bch_next_cache_rcu(c, iter)))
-		percpu_ref_get(&ret->ref);
+	if ((ca = __bch_next_dev(c, iter)))
+		percpu_ref_get(&ca->ref);
 	rcu_read_unlock();
 
-	return ret;
+	return ca;
 }
 
 /*
- * If you break early, you must drop your ref on the current cache
+ * If you break early, you must drop your ref on the current device
  */
-#define for_each_cache(ca, c, iter)					\
+#define for_each_member_device(ca, c, iter)				\
 	for ((iter) = 0;						\
-	     (ca = bch_get_next_cache(c, &(iter)));			\
+	     (ca = bch_get_next_dev(c, &(iter)));			\
 	     percpu_ref_put(&ca->ref), (iter)++)
 
-void bch_check_mark_super_slowpath(struct cache_set *,
-				   const struct bkey_i *, bool);
-
-static inline bool bch_check_super_marked(struct cache_set *c,
-					  const struct bkey_i *k, bool meta)
+static inline struct bch_dev *bch_get_next_online_dev(struct bch_fs *c,
+						      unsigned *iter,
+						      int state_mask)
 {
-	struct bkey_s_c_extent e = bkey_i_to_s_c_extent(k);
-	const struct bch_extent_ptr *ptr;
-	struct cache_member_cpu *mi = cache_member_info_get(c)->m;
-	bool ret = true;
+	struct bch_dev *ca;
 
-	extent_for_each_ptr(e, ptr)
-		if (!(meta
-		      ? mi[ptr->dev].has_metadata
-		      : mi[ptr->dev].has_data) &&
-		    bch_extent_ptr_is_dirty(c, e, ptr)) {
-			ret = false;
-			break;
-		}
+	rcu_read_lock();
+	while ((ca = __bch_next_dev(c, iter)) &&
+	       (!((1 << ca->mi.state) & state_mask) ||
+		!percpu_ref_tryget(&ca->io_ref)))
+		(*iter)++;
+	rcu_read_unlock();
 
-	cache_member_info_put();
-
-	return ret;
+	return ca;
 }
 
-static inline void bch_check_mark_super(struct cache_set *c,
-					const struct bkey_i *k, bool meta)
-{
-	if (bch_check_super_marked(c, k, meta))
-		return;
+#define __for_each_online_member(ca, c, iter, state_mask)		\
+	for ((iter) = 0;						\
+	     (ca = bch_get_next_online_dev(c, &(iter), state_mask));	\
+	     percpu_ref_put(&ca->io_ref), (iter)++)
 
-	bch_check_mark_super_slowpath(c, k, meta);
-}
+#define for_each_online_member(ca, c, iter)				\
+	__for_each_online_member(ca, c, iter, ~0)
 
-static inline bool bch_cache_may_remove(struct cache *ca)
-{
-	struct cache_set *c = ca->set;
-	struct cache_group *tier = &c->cache_tiers[ca->mi.tier];
+#define for_each_rw_member(ca, c, iter)					\
+	__for_each_online_member(ca, c, iter, 1 << BCH_MEMBER_STATE_RW)
 
-	/*
-	 * Right now, we can't remove the last device from a tier,
-	 * - For tier 0, because all metadata lives in tier 0 and because
-	 *   there is no way to have foreground writes go directly to tier 1.
-	 * - For tier 1, because the code doesn't completely support an
-	 *   empty tier 1.
-	 */
+#define for_each_readable_member(ca, c, iter)				\
+	__for_each_online_member(ca, c, iter,				\
+		(1 << BCH_MEMBER_STATE_RW)|(1 << BCH_MEMBER_STATE_RO))
 
-	/*
-	 * Turning a device read-only removes it from the cache group,
-	 * so there may only be one read-write device in a tier, and yet
-	 * the device we are removing is in the same tier, so we have
-	 * to check for identity.
-	 * Removing the last RW device from a tier requires turning the
-	 * whole cache set RO.
-	 */
+struct bch_fs *bch_bdev_to_fs(struct block_device *);
+struct bch_fs *bch_uuid_to_fs(uuid_le);
+int bch_congested(struct bch_fs *, int);
 
-	return tier->nr_devices != 1 ||
-		rcu_access_pointer(tier->d[0].dev) != ca;
-}
+void bch_dev_release(struct kobject *);
 
-void free_super(struct bcache_superblock *);
-int bch_super_realloc(struct bcache_superblock *, unsigned);
-void bcache_write_super(struct cache_set *);
-void __write_super(struct cache_set *, struct bcache_superblock *);
+bool bch_dev_state_allowed(struct bch_fs *, struct bch_dev *,
+			   enum bch_member_state, int);
+int __bch_dev_set_state(struct bch_fs *, struct bch_dev *,
+			enum bch_member_state, int);
+int bch_dev_set_state(struct bch_fs *, struct bch_dev *,
+		      enum bch_member_state, int);
 
-void bch_cache_set_release(struct kobject *);
-void bch_cache_release(struct kobject *);
+int bch_dev_fail(struct bch_dev *, int);
+int bch_dev_remove(struct bch_fs *, struct bch_dev *, int);
+int bch_dev_add(struct bch_fs *, const char *);
+int bch_dev_online(struct bch_fs *, const char *);
+int bch_dev_offline(struct bch_fs *, struct bch_dev *, int);
+int bch_dev_evacuate(struct bch_fs *, struct bch_dev *);
 
-void bch_cache_set_unregister(struct cache_set *);
-void bch_cache_set_stop(struct cache_set *);
+void bch_fs_detach(struct bch_fs *);
 
-const char *bch_register_one(const char *path);
-const char *bch_register_cache_set(char * const *, unsigned,
-				   struct cache_set_opts,
-				   struct cache_set **);
+bool bch_fs_emergency_read_only(struct bch_fs *);
+void bch_fs_read_only(struct bch_fs *);
+const char *bch_fs_read_write(struct bch_fs *);
 
-bool bch_cache_set_read_only(struct cache_set *);
-bool bch_cache_set_emergency_read_only(struct cache_set *);
-void bch_cache_set_read_only_sync(struct cache_set *);
-const char *bch_cache_set_read_write(struct cache_set *);
+void bch_fs_release(struct kobject *);
+void bch_fs_stop_async(struct bch_fs *);
+void bch_fs_stop(struct bch_fs *);
 
-bool bch_cache_read_only(struct cache *);
-const char *bch_cache_read_write(struct cache *);
-bool bch_cache_remove(struct cache *, bool force);
-int bch_cache_set_add_cache(struct cache_set *, const char *);
+const char *bch_fs_start(struct bch_fs *);
+const char *bch_fs_open(char * const *, unsigned, struct bch_opts,
+			struct bch_fs **);
+const char *bch_fs_open_incremental(const char *path);
 
-extern struct mutex bch_register_lock;
-extern struct list_head bch_cache_sets;
-extern struct idr bch_cache_set_minor;
 extern struct workqueue_struct *bcache_io_wq;
-extern struct crypto_shash *bch_sha1;
+extern struct crypto_shash *bch_sha256;
 
-extern struct kobj_type bch_cache_set_ktype;
-extern struct kobj_type bch_cache_set_internal_ktype;
-extern struct kobj_type bch_cache_set_time_stats_ktype;
-extern struct kobj_type bch_cache_set_opts_dir_ktype;
-extern struct kobj_type bch_cache_ktype;
+extern struct kobj_type bch_fs_ktype;
+extern struct kobj_type bch_fs_internal_ktype;
+extern struct kobj_type bch_fs_time_stats_ktype;
+extern struct kobj_type bch_fs_opts_dir_ktype;
+extern struct kobj_type bch_dev_ktype;
 
 #endif /* _BCACHE_SUPER_H */

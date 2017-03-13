@@ -203,8 +203,8 @@
 
 #include <linux/dynamic_fault.h>
 
-#define cache_set_init_fault(name)					\
-	dynamic_fault("bcache:cache_set_init:" name)
+#define bch_fs_init_fault(name)						\
+	dynamic_fault("bcache:bch_fs_init:" name)
 #define bch_meta_read_fault(name)					\
 	 dynamic_fault("bcache:meta:read:" name)
 #define bch_meta_write_fault(name)					\
@@ -313,10 +313,12 @@ do {									\
 #define BTREE_NODE_RESERVE		(BTREE_RESERVE_MAX * 2)
 
 struct btree;
-struct cache;
+struct crypto_blkcipher;
+struct crypto_ahash;
 
 enum gc_phase {
-	GC_PHASE_PENDING_DELETE		= BTREE_ID_NR + 1,
+	GC_PHASE_SB_METADATA		= BTREE_ID_NR + 1,
+	GC_PHASE_PENDING_DELETE,
 	GC_PHASE_DONE
 };
 
@@ -326,13 +328,12 @@ struct gc_pos {
 	unsigned		level;
 };
 
-struct cache_member_cpu {
+struct bch_member_cpu {
 	u64			nbuckets;	/* device size */
 	u16			first_bucket;   /* index of first bucket used */
 	u16			bucket_size;	/* sectors */
 	u8			state;
 	u8			tier;
-	u8			replication_set;
 	u8			has_metadata;
 	u8			has_data;
 	u8			replacement;
@@ -340,41 +341,27 @@ struct cache_member_cpu {
 	u8			valid;
 };
 
-struct cache_member_rcu {
-	struct rcu_head		rcu;
-	unsigned		nr_in_set;
-	struct cache_member_cpu	m[];
-};
-
-/* cache->flags: */
-enum {
-	CACHE_DEV_REMOVING,
-	CACHE_DEV_FORCE_REMOVE,
-};
-
-struct cache {
+struct bch_dev {
+	struct kobject		kobj;
 	struct percpu_ref	ref;
-	struct rcu_head		free_rcu;
-	struct work_struct	free_work;
-	struct work_struct	remove_work;
-	unsigned long		flags;
+	struct percpu_ref	io_ref;
+	struct completion	stop_complete;
+	struct completion	offline_complete;
 
-	struct cache_set	*set;
+	struct bch_fs		*fs;
 
-	struct cache_group	self;
-
+	u8			dev_idx;
 	/*
 	 * Cached version of this device's member info from superblock
-	 * Committed by write_super()
+	 * Committed by bch_write_super() -> bch_fs_mi_update()
 	 */
-	struct {
-		u8		nr_this_dev;
-	}			sb;
-	struct cache_member_cpu	mi;
+	struct bch_member_cpu	mi;
+	uuid_le			uuid;
+	char			name[BDEVNAME_SIZE];
 
 	struct bcache_superblock disk_sb;
 
-	struct kobject		kobj;
+	struct dev_group	self;
 
 	/* biosets used in cloned bios for replicas and moving_gc */
 	struct bio_set		replica_set;
@@ -424,8 +411,8 @@ struct cache {
 	 * second contains a saved copy of the stats from the beginning
 	 * of GC.
 	 */
-	struct bucket_stats_cache __percpu *bucket_stats_percpu;
-	struct bucket_stats_cache	bucket_stats_cached;
+	struct bch_dev_usage __percpu *usage_percpu;
+	struct bch_dev_usage	usage_cached;
 
 	atomic_long_t		saturated_count;
 	size_t			inc_gen_needs_gc;
@@ -461,34 +448,20 @@ struct cache {
  * Flag bits for what phase of startup/shutdown the cache set is at, how we're
  * shutting down, etc.:
  *
- * CACHE_SET_UNREGISTERING means we're not just shutting down, we're detaching
+ * BCH_FS_UNREGISTERING means we're not just shutting down, we're detaching
  * all the backing devices first (their cached data gets invalidated, and they
  * won't automatically reattach).
- *
- * CACHE_SET_STOPPING always gets set first when we're closing down a cache set;
- * we'll continue to run normally for awhile with CACHE_SET_STOPPING set (i.e.
- * flushing dirty data).
- *
- * CACHE_SET_RUNNING means all cache devices have been registered and journal
- * replay is complete.
  */
 enum {
-	/* Startup: */
-	CACHE_SET_INITIAL_GC_DONE,
-	CACHE_SET_RUNNING,
-
-	/* Shutdown: */
-	CACHE_SET_UNREGISTERING,
-	CACHE_SET_STOPPING,
-	CACHE_SET_RO,
-	CACHE_SET_RO_COMPLETE,
-	CACHE_SET_EMERGENCY_RO,
-	CACHE_SET_WRITE_DISABLE_COMPLETE,
-	CACHE_SET_GC_STOPPING,
-	CACHE_SET_GC_FAILURE,
-	CACHE_SET_BDEV_MOUNTED,
-	CACHE_SET_ERROR,
-	CACHE_SET_FSCK_FIXED_ERRORS,
+	BCH_FS_INITIAL_GC_DONE,
+	BCH_FS_DETACHING,
+	BCH_FS_EMERGENCY_RO,
+	BCH_FS_WRITE_DISABLE_COMPLETE,
+	BCH_FS_GC_STOPPING,
+	BCH_FS_GC_FAILURE,
+	BCH_FS_BDEV_MOUNTED,
+	BCH_FS_ERROR,
+	BCH_FS_FSCK_FIXED_ERRORS,
 };
 
 struct btree_debug {
@@ -498,7 +471,22 @@ struct btree_debug {
 	struct dentry		*failed;
 };
 
-struct cache_set {
+struct bch_tier {
+	unsigned		idx;
+	struct task_struct	*migrate;
+	struct bch_pd_controller pd;
+
+	struct dev_group	devs;
+};
+
+enum bch_fs_state {
+	BCH_FS_STARTING		= 0,
+	BCH_FS_STOPPING,
+	BCH_FS_RO,
+	BCH_FS_RW,
+};
+
+struct bch_fs {
 	struct closure		cl;
 
 	struct list_head	list;
@@ -506,7 +494,6 @@ struct cache_set {
 	struct kobject		internal;
 	struct kobject		opts_dir;
 	struct kobject		time_stats;
-	struct completion	*stop_completion;
 	unsigned long		flags;
 
 	int			minor;
@@ -514,40 +501,47 @@ struct cache_set {
 	struct super_block	*vfs_sb;
 	char			name[40];
 
+	/* ro/rw, add/remove devices: */
+	struct mutex		state_lock;
+	enum bch_fs_state	state;
+
 	/* Counts outstanding writes, for clean transition to read-only */
 	struct percpu_ref	writes;
 	struct work_struct	read_only_work;
 
-	struct cache __rcu	*cache[MAX_CACHES_PER_SET];
+	struct bch_dev __rcu	*devs[BCH_SB_MEMBERS_MAX];
 
-	struct mutex		mi_lock;
-	struct cache_member_rcu __rcu *members;
-	struct cache_member	*disk_mi; /* protected by register_lock */
+	struct bch_opts		opts;
 
-	struct cache_set_opts	opts;
-
-	/*
-	 * Cached copy in native endianness:
-	 * Set by cache_sb_to_cache_set:
-	 */
+	/* Updated by bch_sb_update():*/
 	struct {
+		uuid_le		uuid;
+		uuid_le		user_uuid;
+
 		u16		block_size;
 		u16		btree_node_size;
 
-		u8		nr_in_set;
+		u8		nr_devices;
 		u8		clean;
 
 		u8		meta_replicas_have;
 		u8		data_replicas_have;
 
 		u8		str_hash_type;
+		u8		encryption_type;
+
+		u64		time_base_lo;
+		u32		time_base_hi;
+		u32		time_precision;
 	}			sb;
 
-	struct cache_sb		disk_sb;
+	struct bch_sb		*disk_sb;
+	unsigned		disk_sb_order;
+
 	unsigned short		block_bits;	/* ilog2(block_size) */
 
 	struct closure		sb_write;
-	struct semaphore	sb_write_mutex;
+	struct mutex		sb_lock;
 
 	struct backing_dev_info bdi;
 
@@ -630,8 +624,10 @@ struct cache_set {
 	 * These contain all r/w devices - i.e. devices we can currently
 	 * allocate from:
 	 */
-	struct cache_group	cache_all;
-	struct cache_group	cache_tiers[CACHE_TIERS];
+	struct dev_group	all_devs;
+	struct bch_tier		tiers[BCH_TIER_MAX];
+	/* NULL if we only have devices in one tier: */
+	struct bch_tier		*fastest_tier;
 
 	u64			capacity; /* sectors */
 
@@ -644,14 +640,13 @@ struct cache_set {
 
 	atomic64_t		sectors_available;
 
-	struct bucket_stats_cache_set __percpu *bucket_stats_percpu;
-	struct bucket_stats_cache_set	bucket_stats_cached;
-	struct lglock		bucket_stats_lock;
+	struct bch_fs_usage __percpu *usage_percpu;
+	struct bch_fs_usage	usage_cached;
+	struct lglock		usage_lock;
 
 	struct mutex		bucket_lock;
 
 	struct closure_waitlist	freelist_wait;
-
 
 	/*
 	 * When we invalidate buckets, we use both the priority and the amount
@@ -724,6 +719,11 @@ struct cache_set {
 	struct bio_decompress_worker __percpu
 				*bio_decompress_worker;
 
+	struct crypto_blkcipher	*chacha20;
+	struct crypto_shash	*poly1305;
+
+	atomic64_t		key_version;
+
 	/* For punting bio submissions to workqueue, io.c */
 	struct bio_list		bio_submit_list;
 	struct work_struct	bio_submit_work;
@@ -738,10 +738,6 @@ struct cache_set {
 	atomic_t		writeback_pages;
 	unsigned		writeback_pages_max;
 	atomic_long_t		nr_inodes;
-
-	/* TIERING */
-	struct task_struct	*tiering_read;
-	struct bch_pd_controller tiering_pd;
 
 	/* NOTIFICATIONS */
 	struct mutex		uevent_lock;
@@ -814,17 +810,22 @@ struct cache_set {
 #undef BCH_TIME_STAT
 };
 
-static inline unsigned bucket_pages(const struct cache *ca)
+static inline bool bch_fs_running(struct bch_fs *c)
+{
+	return c->state == BCH_FS_RO || c->state == BCH_FS_RW;
+}
+
+static inline unsigned bucket_pages(const struct bch_dev *ca)
 {
 	return ca->mi.bucket_size / PAGE_SECTORS;
 }
 
-static inline unsigned bucket_bytes(const struct cache *ca)
+static inline unsigned bucket_bytes(const struct bch_dev *ca)
 {
 	return ca->mi.bucket_size << 9;
 }
 
-static inline unsigned block_bytes(const struct cache_set *c)
+static inline unsigned block_bytes(const struct bch_fs *c)
 {
 	return c->sb.block_size << 9;
 }

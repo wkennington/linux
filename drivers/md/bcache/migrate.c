@@ -11,12 +11,13 @@
 #include "keylist.h"
 #include "migrate.h"
 #include "move.h"
+#include "super-io.h"
 
-static int issue_migration_move(struct cache *ca,
+static int issue_migration_move(struct bch_dev *ca,
 				struct moving_context *ctxt,
 				struct bkey_s_c k)
 {
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 	struct disk_reservation res;
 	const struct bch_extent_ptr *ptr;
 	int ret;
@@ -25,7 +26,7 @@ static int issue_migration_move(struct cache *ca,
 		return -ENOSPC;
 
 	extent_for_each_ptr(bkey_s_c_to_extent(k), ptr)
-		if (ptr->dev == ca->sb.nr_this_dev)
+		if (ptr->dev == ca->dev_idx)
 			goto found;
 
 	BUG();
@@ -54,15 +55,19 @@ found:
  * land in the same device even if there are others available.
  */
 
-int bch_move_data_off_device(struct cache *ca)
+int bch_move_data_off_device(struct bch_dev *ca)
 {
 	struct moving_context ctxt;
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
+	struct bch_sb_field_members *mi;
 	unsigned pass = 0;
 	u64 seen_key_count;
 	int ret = 0;
 
-	BUG_ON(ca->mi.state == CACHE_ACTIVE);
+	BUG_ON(ca->mi.state == BCH_MEMBER_STATE_RW);
+
+	if (!ca->mi.has_data)
+		return 0;
 
 	bch_move_ctxt_init(&ctxt, NULL, SECTORS_IN_FLIGHT_PER_DEVICE);
 	ctxt.avoid = ca;
@@ -99,7 +104,7 @@ int bch_move_data_off_device(struct cache *ca)
 		       !(ret = btree_iter_err(k))) {
 			if (!bkey_extent_is_data(k.k) ||
 			    !bch_extent_has_device(bkey_s_c_to_extent(k),
-						   ca->sb.nr_this_dev))
+						   ca->dev_idx))
 				goto next;
 
 			ret = issue_migration_move(ca, &ctxt, k);
@@ -136,6 +141,13 @@ next:
 		return -1;
 	}
 
+	mutex_lock(&c->sb_lock);
+	mi = bch_sb_get_members(c->disk_sb);
+	SET_BCH_MEMBER_HAS_DATA(&mi->members[ca->dev_idx], false);
+
+	bch_write_super(c);
+	mutex_unlock(&c->sb_lock);
+
 	return 0;
 }
 
@@ -143,22 +155,22 @@ next:
  * This walks the btree, and for any node on the relevant device it moves the
  * node elsewhere.
  */
-static int bch_move_btree_off(struct cache *ca, enum btree_id id)
+static int bch_move_btree_off(struct bch_dev *ca, enum btree_id id)
 {
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 	struct btree_iter iter;
 	struct closure cl;
 	struct btree *b;
 	int ret;
 
-	BUG_ON(ca->mi.state == CACHE_ACTIVE);
+	BUG_ON(ca->mi.state == BCH_MEMBER_STATE_RW);
 
 	closure_init_stack(&cl);
 
 	for_each_btree_node(&iter, c, id, POS_MIN, 0, b) {
 		struct bkey_s_c_extent e = bkey_i_to_s_c_extent(&b->key);
 retry:
-		if (!bch_extent_has_device(e, ca->sb.nr_this_dev))
+		if (!bch_extent_has_device(e, ca->dev_idx))
 			continue;
 
 		ret = bch_btree_node_rewrite(&iter, b, &cl);
@@ -188,7 +200,7 @@ retry:
 		for_each_btree_node(&iter, c, id, POS_MIN, 0, b) {
 			struct bkey_s_c_extent e = bkey_i_to_s_c_extent(&b->key);
 
-			BUG_ON(bch_extent_has_device(e, ca->sb.nr_this_dev));
+			BUG_ON(bch_extent_has_device(e, ca->dev_idx));
 		}
 		bch_btree_iter_unlock(&iter);
 	}
@@ -240,10 +252,17 @@ retry:
  *   is written.
  */
 
-int bch_move_meta_data_off_device(struct cache *ca)
+int bch_move_metadata_off_device(struct bch_dev *ca)
 {
+	struct bch_fs *c = ca->fs;
+	struct bch_sb_field_members *mi;
 	unsigned i;
 	int ret;
+
+	BUG_ON(ca->mi.state == BCH_MEMBER_STATE_RW);
+
+	if (!ca->mi.has_metadata)
+		return 0;
 
 	/* 1st, Move the btree nodes off the device */
 
@@ -261,6 +280,13 @@ int bch_move_meta_data_off_device(struct cache *ca)
 	if (ret)
 		return ret;
 
+	mutex_lock(&c->sb_lock);
+	mi = bch_sb_get_members(c->disk_sb);
+	SET_BCH_MEMBER_HAS_METADATA(&mi->members[ca->dev_idx], false);
+
+	bch_write_super(c);
+	mutex_unlock(&c->sb_lock);
+
 	return 0;
 }
 
@@ -270,19 +296,19 @@ int bch_move_meta_data_off_device(struct cache *ca)
  */
 
 static int bch_flag_key_bad(struct btree_iter *iter,
-			    struct cache *ca,
+			    struct bch_dev *ca,
 			    struct bkey_s_c_extent orig)
 {
 	BKEY_PADDED(key) tmp;
 	struct bkey_s_extent e;
 	struct bch_extent_ptr *ptr;
-	struct cache_set *c = ca->set;
+	struct bch_fs *c = ca->fs;
 
 	bkey_reassemble(&tmp.key, orig.s_c);
 	e = bkey_i_to_s_extent(&tmp.key);
 
 	extent_for_each_ptr_backwards(e, ptr)
-		if (ptr->dev == ca->sb.nr_this_dev)
+		if (ptr->dev == ca->dev_idx)
 			bch_extent_drop_ptr(e, ptr);
 
 	/*
@@ -303,19 +329,19 @@ static int bch_flag_key_bad(struct btree_iter *iter,
  * and don't have other valid pointers.  If there are valid pointers,
  * the necessary pointers to the removed device are replaced with
  * bad pointers instead.
+ *
  * This is only called if bch_move_data_off_device above failed, meaning
  * that we've already tried to move the data MAX_DATA_OFF_ITER times and
  * are not likely to succeed if we try again.
  */
-
-int bch_flag_data_bad(struct cache *ca)
+int bch_flag_data_bad(struct bch_dev *ca)
 {
 	int ret = 0;
 	struct bkey_s_c k;
 	struct bkey_s_c_extent e;
 	struct btree_iter iter;
 
-	bch_btree_iter_init(&iter, ca->set, BTREE_ID_EXTENTS, POS_MIN);
+	bch_btree_iter_init(&iter, ca->fs, BTREE_ID_EXTENTS, POS_MIN);
 
 	while ((k = bch_btree_iter_peek(&iter)).k &&
 	       !(ret = btree_iter_err(k))) {
@@ -323,7 +349,7 @@ int bch_flag_data_bad(struct cache *ca)
 			goto advance;
 
 		e = bkey_s_c_to_extent(k);
-		if (!bch_extent_has_device(e, ca->sb.nr_this_dev))
+		if (!bch_extent_has_device(e, ca->dev_idx))
 			goto advance;
 
 		ret = bch_flag_key_bad(&iter, ca, e);

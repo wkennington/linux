@@ -34,16 +34,32 @@ static inline u8 mode_to_type(umode_t mode)
 	return (mode >> 12) & 15;
 }
 
+static inline unsigned nlink_bias(umode_t mode)
+{
+	return S_ISDIR(mode) ? 2 : 1;
+}
+
+struct bch_inode_unpacked;
+
+#ifndef NO_BCACHE_FS
+
 /* returns 0 if we want to do the update, or error is passed up */
 typedef int (*inode_set_fn)(struct bch_inode_info *,
-			    struct bch_inode *, void *);
+			    struct bch_inode_unpacked *, void *);
 
-int __must_check __bch_write_inode(struct cache_set *, struct bch_inode_info *,
+int __must_check __bch_write_inode(struct bch_fs *, struct bch_inode_info *,
 				   inode_set_fn, void *);
-int __must_check bch_write_inode(struct cache_set *,
+int __must_check bch_write_inode(struct bch_fs *,
 				 struct bch_inode_info *);
 
-void bch_fs_exit(void);
-int bch_fs_init(void);
+void bch_vfs_exit(void);
+int bch_vfs_init(void);
+
+#else
+
+static inline void bch_vfs_exit(void) {}
+static inline int bch_vfs_init(void) { return 0; }
+
+#endif
 
 #endif /* _BCACHE_FS_H */

@@ -113,7 +113,7 @@ enum {
 	JOURNAL_NEED_WRITE,
 };
 
-/* Embedded in struct cache_set */
+/* Embedded in struct bch_fs */
 struct journal {
 	/* Fastpath stuff up front: */
 
@@ -174,7 +174,7 @@ struct journal {
 	struct list_head	seq_blacklist;
 
 	BKEY_PADDED(key);
-	struct cache_group	devs;
+	struct dev_group	devs;
 
 	struct delayed_work	reclaim_work;
 	unsigned long		last_flushed;
@@ -186,7 +186,7 @@ struct journal {
 	 * ugh: need to get prio_buckets converted over to the eventual new
 	 * transaction machinery
 	 */
-	__le64			prio_buckets[MAX_CACHES_PER_SET];
+	__le64			prio_buckets[BCH_SB_MEMBERS_MAX];
 	unsigned		nr_prio_buckets;
 
 	unsigned		write_delay_ms;
@@ -207,8 +207,8 @@ struct journal {
 };
 
 /*
- * Embedded in struct cache. First three fields refer to the array of journal
- * buckets, in cache_sb.
+ * Embedded in struct bch_dev. First three fields refer to the array of journal
+ * buckets, in bch_sb.
  */
 struct journal_device {
 	/*
@@ -229,6 +229,8 @@ struct journal_device {
 	 * sufficient to read:
 	 */
 	unsigned		last_idx;
+	unsigned		nr;
+	u64			*buckets;
 
 	/* Bio for journal reads/writes to this device */
 	struct bio		*bio;

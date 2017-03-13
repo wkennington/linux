@@ -9,7 +9,6 @@
 
 #include <linux/posix_acl_xattr.h>
 #include <linux/xattr.h>
-#include <crypto/hash.h>
 
 struct xattr_search_key {
 	u8		type;
@@ -22,37 +21,13 @@ struct xattr_search_key {
 static u64 bch_xattr_hash(const struct bch_hash_info *info,
 			  const struct xattr_search_key *key)
 {
-	switch (info->type) {
-	case BCH_STR_HASH_SHA1: {
-		SHASH_DESC_ON_STACK(desc, bch_sha1);
-		u8 digest[SHA1_DIGEST_SIZE];
-		u64 ret;
+	struct bch_str_hash_ctx ctx;
 
-		desc->tfm = bch_sha1;
-		desc->flags = 0;
-		crypto_shash_init(desc);
+	bch_str_hash_init(&ctx, info);
+	bch_str_hash_update(&ctx, info, &key->type, sizeof(key->type));
+	bch_str_hash_update(&ctx, info, key->name.name, key->name.len);
 
-		crypto_shash_update(desc, (void *) &info->seed, sizeof(info->seed));
-
-		crypto_shash_update(desc, (void *) &key->type, sizeof(key->type));
-		crypto_shash_update(desc, (void *) key->name.name, key->name.len);
-
-		crypto_shash_final(desc, digest);
-		memcpy(&ret, &digest, sizeof(ret));
-		return ret >> 1;
-	}
-	default: {
-		struct bch_str_hash_ctx ctx;
-
-		bch_str_hash_init(&ctx, info->type);
-		bch_str_hash_update(&ctx, info->type, &info->seed, sizeof(info->seed));
-
-		bch_str_hash_update(&ctx, info->type, &key->type, sizeof(key->type));
-		bch_str_hash_update(&ctx, info->type, key->name.name, key->name.len);
-
-		return bch_str_hash_end(&ctx, info->type);
-	}
-	}
+	return bch_str_hash_end(&ctx, info);
 }
 
 #define xattr_val(_xattr)	((_xattr)->x_name + (_xattr)->x_name_len)
@@ -100,7 +75,7 @@ static const struct bch_hash_desc xattr_hash_desc = {
 	.cmp_bkey	= xattr_cmp_bkey,
 };
 
-static const char *bch_xattr_invalid(const struct cache_set *c,
+static const char *bch_xattr_invalid(const struct bch_fs *c,
 				     struct bkey_s_c k)
 {
 	switch (k.k->type) {
@@ -119,7 +94,7 @@ static const char *bch_xattr_invalid(const struct cache_set *c,
 	}
 }
 
-static void bch_xattr_to_text(struct cache_set *c, char *buf,
+static void bch_xattr_to_text(struct bch_fs *c, char *buf,
 			      size_t size, struct bkey_s_c k)
 {
 	struct bkey_s_c_xattr xattr;
@@ -162,7 +137,7 @@ const struct bkey_ops bch_bkey_xattr_ops = {
 	.val_to_text	= bch_xattr_to_text,
 };
 
-int bch_xattr_get(struct cache_set *c, struct inode *inode,
+int bch_xattr_get(struct bch_fs *c, struct inode *inode,
 		  const char *name, void *buffer, size_t size, int type)
 {
 	struct bch_inode_info *ei = to_bch_ei(inode);
@@ -190,18 +165,18 @@ int bch_xattr_get(struct cache_set *c, struct inode *inode,
 	return ret;
 }
 
-int bch_xattr_set(struct cache_set *c, struct inode *inode,
-		  const char *name, const void *value, size_t size,
-		  int flags, int type)
+int __bch_xattr_set(struct bch_fs *c, u64 inum,
+		    const struct bch_hash_info *hash_info,
+		    const char *name, const void *value, size_t size,
+		    int flags, int type, u64 *journal_seq)
 {
-	struct bch_inode_info *ei = to_bch_ei(inode);
 	struct xattr_search_key search = X_SEARCH(type, name, strlen(name));
 	int ret;
 
 	if (!value) {
-		ret = bch_hash_delete(xattr_hash_desc, &ei->str_hash,
-				      c, ei->vfs_inode.i_ino,
-				      &ei->journal_seq, &search);
+		ret = bch_hash_delete(xattr_hash_desc, hash_info,
+				      c, inum,
+				      journal_seq, &search);
 	} else {
 		struct bkey_i_xattr *xattr;
 		unsigned u64s = BKEY_U64s +
@@ -224,8 +199,8 @@ int bch_xattr_set(struct cache_set *c, struct inode *inode,
 		memcpy(xattr->v.x_name, search.name.name, search.name.len);
 		memcpy(xattr_val(&xattr->v), value, size);
 
-		ret = bch_hash_set(xattr_hash_desc, &ei->str_hash, c,
-				ei->vfs_inode.i_ino, &ei->journal_seq,
+		ret = bch_hash_set(xattr_hash_desc, hash_info, c,
+				inum, journal_seq,
 				&xattr->k_i,
 				(flags & XATTR_CREATE ? BCH_HASH_SET_MUST_CREATE : 0)|
 				(flags & XATTR_REPLACE ? BCH_HASH_SET_MUST_REPLACE : 0));
@@ -236,6 +211,17 @@ int bch_xattr_set(struct cache_set *c, struct inode *inode,
 		ret = flags & XATTR_REPLACE ? -ENODATA : 0;
 
 	return ret;
+}
+
+int bch_xattr_set(struct bch_fs *c, struct inode *inode,
+		  const char *name, const void *value, size_t size,
+		  int flags, int type)
+{
+	struct bch_inode_info *ei = to_bch_ei(inode);
+
+	return __bch_xattr_set(c, inode->i_ino, &ei->str_hash,
+			       name, value, size, flags, type,
+			       &ei->journal_seq);
 }
 
 static const struct xattr_handler *bch_xattr_type_to_handler(unsigned);
@@ -267,7 +253,7 @@ static size_t bch_xattr_emit(struct dentry *dentry,
 
 ssize_t bch_xattr_list(struct dentry *dentry, char *buffer, size_t buffer_size)
 {
-	struct cache_set *c = dentry->d_sb->s_fs_info;
+	struct bch_fs *c = dentry->d_sb->s_fs_info;
 	struct btree_iter iter;
 	struct bkey_s_c k;
 	const struct bch_xattr *xattr;
@@ -309,7 +295,7 @@ static int bch_xattr_get_handler(const struct xattr_handler *handler,
 				 struct dentry *dentry, struct inode *inode,
 				 const char *name, void *buffer, size_t size)
 {
-	struct cache_set *c = inode->i_sb->s_fs_info;
+	struct bch_fs *c = inode->i_sb->s_fs_info;
 
 	return bch_xattr_get(c, inode, name, buffer, size, handler->flags);
 }
@@ -319,7 +305,7 @@ static int bch_xattr_set_handler(const struct xattr_handler *handler,
 				 const char *name, const void *value,
 				 size_t size, int flags)
 {
-	struct cache_set *c = inode->i_sb->s_fs_info;
+	struct bch_fs *c = inode->i_sb->s_fs_info;
 
 	return bch_xattr_set(c, inode, name, value, size, flags,
 			     handler->flags);

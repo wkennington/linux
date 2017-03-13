@@ -8,9 +8,11 @@
 #include "bcache.h"
 #include "alloc.h"
 #include "blockdev.h"
+#include "compress.h"
 #include "sysfs.h"
 #include "btree_cache.h"
 #include "btree_iter.h"
+#include "btree_update.h"
 #include "btree_gc.h"
 #include "buckets.h"
 #include "inode.h"
@@ -19,6 +21,8 @@
 #include "move.h"
 #include "opts.h"
 #include "request.h"
+#include "super-io.h"
+#include "tier.h"
 #include "writeback.h"
 
 #include <linux/blkdev.h>
@@ -33,7 +37,6 @@ write_attribute(trigger_btree_coalesce);
 write_attribute(trigger_gc);
 write_attribute(prune_cache);
 write_attribute(blockdev_volume_create);
-write_attribute(add_device);
 
 read_attribute(uuid);
 read_attribute(minor);
@@ -118,6 +121,8 @@ rw_attribute(cache_replacement_policy);
 rw_attribute(foreground_write_ratelimit_enabled);
 rw_attribute(copy_gc_enabled);
 sysfs_pd_controller_attribute(copy_gc);
+
+rw_attribute(tier);
 rw_attribute(tiering_enabled);
 rw_attribute(tiering_percent);
 sysfs_pd_controller_attribute(tiering);
@@ -131,7 +136,6 @@ rw_attribute(foreground_target_percent);
 rw_attribute(size);
 read_attribute(meta_replicas_have);
 read_attribute(data_replicas_have);
-read_attribute(tier);
 
 #define BCH_DEBUG_PARAM(name, description)				\
 	rw_attribute(name);
@@ -139,14 +143,13 @@ read_attribute(tier);
 	BCH_DEBUG_PARAMS()
 #undef BCH_DEBUG_PARAM
 
-#define CACHE_SET_OPT(_name, _choices, _min, _max, _sb_opt, _perm)	\
+#define BCH_OPT(_name, _mode, ...)					\
 	static struct attribute sysfs_opt_##_name = {			\
-		.name = #_name,						\
-		.mode = S_IRUGO|(_perm ? S_IWUSR : 0)			\
+		.name = #_name,	.mode = _mode,				\
 	};
 
-	CACHE_SET_VISIBLE_OPTS()
-#undef CACHE_SET_OPT
+	BCH_VISIBLE_OPTS()
+#undef BCH_OPT
 
 #define BCH_TIME_STAT(name, frequency_units, duration_units)		\
 	sysfs_time_stats_attribute(name, frequency_units, duration_units);
@@ -155,7 +158,7 @@ read_attribute(tier);
 
 static struct attribute sysfs_state_rw = {
 	.name = "state",
-	.mode = S_IRUGO|S_IWUSR
+	.mode = S_IRUGO
 };
 
 SHOW(bch_cached_dev)
@@ -193,8 +196,8 @@ SHOW(bch_cached_dev)
 	sysfs_print(state,		states[BDEV_STATE(dc->disk_sb.sb)]);
 
 	if (attr == &sysfs_label) {
-		memcpy(buf, dc->disk_sb.sb->label, SB_LABEL_SIZE);
-		buf[SB_LABEL_SIZE + 1] = '\0';
+		memcpy(buf, dc->disk_sb.sb->label, BCH_SB_LABEL_SIZE);
+		buf[BCH_SB_LABEL_SIZE + 1] = '\0';
 		strcat(buf, "\n");
 		return strlen(buf);
 	}
@@ -203,12 +206,10 @@ SHOW(bch_cached_dev)
 	return 0;
 }
 
-STORE(__cached_dev)
+STORE(bch_cached_dev)
 {
 	struct cached_dev *dc = container_of(kobj, struct cached_dev,
 					     disk.kobj);
-	unsigned v = size;
-	struct cache_set *c;
 	struct kobj_uevent_env *env;
 
 #define d_strtoul(var)		sysfs_strtoul(var, dc->var)
@@ -224,6 +225,13 @@ STORE(__cached_dev)
 
 	d_strtoi_h(sequential_cutoff);
 	d_strtoi_h(readahead);
+
+	if (attr == &sysfs_writeback_running)
+		bch_writeback_queue(dc);
+
+	if (attr == &sysfs_writeback_percent)
+		schedule_delayed_work(&dc->writeback_pd_update,
+				      dc->writeback_pd_update_seconds * HZ);
 
 	if (attr == &sysfs_clear_stats)
 		bch_cache_accounting_clear(&dc->accounting);
@@ -248,24 +256,25 @@ STORE(__cached_dev)
 		u64 journal_seq = 0;
 		int ret = 0;
 
-		if (size > SB_LABEL_SIZE)
+		if (size > BCH_SB_LABEL_SIZE)
 			return -EINVAL;
 
 		mutex_lock(&dc->disk.inode_lock);
 
 		memcpy(dc->disk_sb.sb->label, buf, size);
-		if (size < SB_LABEL_SIZE)
+		if (size < BCH_SB_LABEL_SIZE)
 			dc->disk_sb.sb->label[size] = '\0';
 		if (size && dc->disk_sb.sb->label[size - 1] == '\n')
 			dc->disk_sb.sb->label[size - 1] = '\0';
 
 		memcpy(dc->disk.inode.v.i_label,
-		       dc->disk_sb.sb->label, SB_LABEL_SIZE);
+		       dc->disk_sb.sb->label, BCH_SB_LABEL_SIZE);
 
 		bch_write_bdev_super(dc, NULL);
 
 		if (dc->disk.c)
-			ret = bch_inode_update(dc->disk.c, &dc->disk.inode.k_i,
+			ret = bch_btree_update(dc->disk.c, BTREE_ID_INODES,
+					       &dc->disk.inode.k_i,
 					       &journal_seq);
 
 		mutex_unlock(&dc->disk.inode_lock);
@@ -291,17 +300,25 @@ STORE(__cached_dev)
 	}
 
 	if (attr == &sysfs_attach) {
-		if (uuid_parse(buf, &dc->disk_sb.sb->user_uuid))
+		struct bch_fs *c;
+		uuid_le uuid;
+		int ret;
+
+		if (uuid_parse(buf, &uuid))
 			return -EINVAL;
 
-		list_for_each_entry(c, &bch_cache_sets, list) {
-			v = bch_cached_dev_attach(dc, c);
-			if (!v)
-				return size;
+		c = bch_uuid_to_fs(uuid);
+		if (!c) {
+			pr_err("Can't attach %s: cache set not found", buf);
+			return -ENOENT;
 		}
 
-		pr_err("Can't attach %s: cache set not found", buf);
-		size = v;
+		dc->disk_sb.sb->set_uuid = uuid;
+
+		ret = bch_cached_dev_attach(dc, c);
+		closure_put(&c->cl);
+		if (ret)
+			return ret;
 	}
 
 	if (attr == &sysfs_detach && dc->disk.c)
@@ -310,25 +327,6 @@ STORE(__cached_dev)
 	if (attr == &sysfs_stop)
 		bch_blockdev_stop(&dc->disk);
 
-	return size;
-}
-
-STORE(bch_cached_dev)
-{
-	struct cached_dev *dc = container_of(kobj, struct cached_dev,
-					     disk.kobj);
-
-	mutex_lock(&bch_register_lock);
-	size = __cached_dev_store(kobj, attr, buf, size);
-
-	if (attr == &sysfs_writeback_running)
-		bch_writeback_queue(dc);
-
-	if (attr == &sysfs_writeback_percent)
-		schedule_delayed_work(&dc->writeback_pd_update,
-				      dc->writeback_pd_update_seconds * HZ);
-
-	mutex_unlock(&bch_register_lock);
 	return size;
 }
 
@@ -367,8 +365,8 @@ SHOW(bch_blockdev_volume)
 	sysfs_hprint(size,	le64_to_cpu(d->inode.v.i_size));
 
 	if (attr == &sysfs_label) {
-		memcpy(buf, d->inode.v.i_label, SB_LABEL_SIZE);
-		buf[SB_LABEL_SIZE + 1] = '\0';
+		memcpy(buf, d->inode.v.i_label, BCH_SB_LABEL_SIZE);
+		buf[BCH_SB_LABEL_SIZE + 1] = '\0';
 		strcat(buf, "\n");
 		return strlen(buf);
 	}
@@ -376,7 +374,7 @@ SHOW(bch_blockdev_volume)
 	return 0;
 }
 
-STORE(__bch_blockdev_volume)
+STORE(bch_blockdev_volume)
 {
 	struct bcache_device *d = container_of(kobj, struct bcache_device,
 					       kobj);
@@ -397,7 +395,8 @@ STORE(__bch_blockdev_volume)
 			}
 		}
 		d->inode.v.i_size = cpu_to_le64(v);
-		ret = bch_inode_update(d->c, &d->inode.k_i, &journal_seq);
+		ret = bch_btree_update(d->c, BTREE_ID_INODES,
+				       &d->inode.k_i, &journal_seq);
 
 		mutex_unlock(&d->inode_lock);
 
@@ -417,8 +416,9 @@ STORE(__bch_blockdev_volume)
 
 		mutex_lock(&d->inode_lock);
 
-		memcpy(d->inode.v.i_label, buf, SB_LABEL_SIZE);
-		ret = bch_inode_update(d->c, &d->inode.k_i, &journal_seq);
+		memcpy(d->inode.v.i_label, buf, BCH_SB_LABEL_SIZE);
+		ret = bch_btree_update(d->c, BTREE_ID_INODES,
+				       &d->inode.k_i, &journal_seq);
 
 		mutex_unlock(&d->inode_lock);
 
@@ -432,7 +432,6 @@ STORE(__bch_blockdev_volume)
 
 	return size;
 }
-STORE_LOCKED(bch_blockdev_volume)
 
 static struct attribute *bch_blockdev_volume_files[] = {
 	&sysfs_unregister,
@@ -442,7 +441,7 @@ static struct attribute *bch_blockdev_volume_files[] = {
 };
 KTYPE(bch_blockdev_volume);
 
-static int bch_bset_print_stats(struct cache_set *c, char *buf)
+static int bch_bset_print_stats(struct bch_fs *c, char *buf)
 {
 	struct bset_stats stats;
 	size_t nodes = 0;
@@ -485,7 +484,7 @@ static int bch_bset_print_stats(struct cache_set *c, char *buf)
 			stats.failed_overflow);
 }
 
-static unsigned bch_root_usage(struct cache_set *c)
+static unsigned bch_root_usage(struct bch_fs *c)
 {
 	unsigned bytes = 0;
 	struct bkey_packed *k;
@@ -509,7 +508,7 @@ lock_root:
 	return (bytes * 100) / btree_bytes(c);
 }
 
-static size_t bch_cache_size(struct cache_set *c)
+static size_t bch_btree_cache_size(struct bch_fs *c)
 {
 	size_t ret = 0;
 	struct btree *b;
@@ -522,20 +521,20 @@ static size_t bch_cache_size(struct cache_set *c)
 	return ret;
 }
 
-static unsigned bch_cache_available_percent(struct cache_set *c)
+static unsigned bch_fs_available_percent(struct bch_fs *c)
 {
 	return div64_u64((u64) sectors_available(c) * 100,
 			 c->capacity ?: 1);
 }
 
 #if 0
-static unsigned bch_btree_used(struct cache_set *c)
+static unsigned bch_btree_used(struct bch_fs *c)
 {
 	return div64_u64(c->gc_stats.key_bytes * 100,
 			 (c->gc_stats.nodes ?: 1) * btree_bytes(c));
 }
 
-static unsigned bch_average_key_size(struct cache_set *c)
+static unsigned bch_average_key_size(struct bch_fs *c)
 {
 	return c->gc_stats.nkeys
 		? div64_u64(c->gc_stats.data, c->gc_stats.nkeys)
@@ -543,9 +542,9 @@ static unsigned bch_average_key_size(struct cache_set *c)
 }
 #endif
 
-static ssize_t show_cache_set_alloc_debug(struct cache_set *c, char *buf)
+static ssize_t show_fs_alloc_debug(struct bch_fs *c, char *buf)
 {
-	struct bucket_stats_cache_set stats = bch_bucket_stats_read_cache_set(c);
+	struct bch_fs_usage stats = bch_fs_usage_read(c);
 
 	return scnprintf(buf, PAGE_SIZE,
 			 "capacity:\t\t%llu\n"
@@ -570,7 +569,7 @@ static ssize_t show_cache_set_alloc_debug(struct cache_set *c, char *buf)
 			 stats.online_reserved);
 }
 
-static ssize_t bch_compression_stats(struct cache_set *c, char *buf)
+static ssize_t bch_compression_stats(struct bch_fs *c, char *buf)
 {
 	struct btree_iter iter;
 	struct bkey_s_c k;
@@ -618,9 +617,9 @@ static ssize_t bch_compression_stats(struct cache_set *c, char *buf)
 			compressed_sectors_uncompressed << 9);
 }
 
-SHOW(bch_cache_set)
+SHOW(bch_fs)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, kobj);
 
 	sysfs_print(minor,			c->minor);
 
@@ -633,8 +632,8 @@ SHOW(bch_cache_set)
 	sysfs_hprint(btree_node_size,		c->sb.btree_node_size << 9);
 	sysfs_print(btree_node_size_bytes,	c->sb.btree_node_size << 9);
 
-	sysfs_hprint(btree_cache_size,		bch_cache_size(c));
-	sysfs_print(cache_available_percent,	bch_cache_available_percent(c));
+	sysfs_hprint(btree_cache_size,		bch_btree_cache_size(c));
+	sysfs_print(cache_available_percent,	bch_fs_available_percent(c));
 
 	sysfs_print(btree_gc_running,		c->gc_pos.phase != GC_PHASE_DONE);
 
@@ -675,12 +674,11 @@ SHOW(bch_cache_set)
 
 	sysfs_printf(tiering_enabled,		"%i", c->tiering_enabled);
 	sysfs_print(tiering_percent,		c->tiering_percent);
-	sysfs_pd_controller_show(tiering,	&c->tiering_pd);
 
-	sysfs_printf(meta_replicas_have, "%llu",
-		     CACHE_SET_META_REPLICAS_HAVE(&c->disk_sb));
-	sysfs_printf(data_replicas_have, "%llu",
-		     CACHE_SET_DATA_REPLICAS_HAVE(&c->disk_sb));
+	sysfs_pd_controller_show(tiering,	&c->tiers[1].pd); /* XXX */
+
+	sysfs_printf(meta_replicas_have, "%u",	c->sb.meta_replicas_have);
+	sysfs_printf(data_replicas_have, "%u",	c->sb.data_replicas_have);
 
 	/* Debugging: */
 
@@ -691,13 +689,13 @@ SHOW(bch_cache_set)
 	BCH_DEBUG_PARAMS()
 #undef BCH_DEBUG_PARAM
 
-	if (!test_bit(CACHE_SET_RUNNING, &c->flags))
+	if (!bch_fs_running(c))
 		return -EPERM;
 
 	if (attr == &sysfs_bset_tree_stats)
 		return bch_bset_print_stats(c, buf);
 	if (attr == &sysfs_alloc_debug)
-		return show_cache_set_alloc_debug(c, buf);
+		return show_fs_alloc_debug(c, buf);
 
 	sysfs_print(tree_depth, c->btree_roots[BTREE_ID_EXTENTS].b->level);
 	sysfs_print(root_usage_percent,		bch_root_usage(c));
@@ -705,22 +703,22 @@ SHOW(bch_cache_set)
 	if (attr == &sysfs_compression_stats)
 		return bch_compression_stats(c, buf);
 
-	sysfs_printf(internal_uuid, "%pU", c->disk_sb.set_uuid.b);
+	sysfs_printf(internal_uuid, "%pU", c->sb.uuid.b);
 
 	return 0;
 }
 
-STORE(__bch_cache_set)
+STORE(__bch_fs)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, kobj);
 
 	if (attr == &sysfs_unregister) {
-		bch_cache_set_unregister(c);
+		bch_fs_detach(c);
 		return size;
 	}
 
 	if (attr == &sysfs_stop) {
-		bch_cache_set_stop(c);
+		bch_fs_stop_async(c);
 		return size;
 	}
 
@@ -755,12 +753,12 @@ STORE(__bch_cache_set)
 		      c->foreground_write_ratelimit_enabled);
 
 	if (attr == &sysfs_copy_gc_enabled) {
-		struct cache *ca;
+		struct bch_dev *ca;
 		unsigned i;
 		ssize_t ret = strtoul_safe(buf, c->copy_gc_enabled)
 			?: (ssize_t) size;
 
-		for_each_cache(ca, c, i)
+		for_each_member_device(ca, c, i)
 			if (ca->moving_gc_read)
 				wake_up_process(ca->moving_gc_read);
 		return ret;
@@ -770,25 +768,18 @@ STORE(__bch_cache_set)
 		ssize_t ret = strtoul_safe(buf, c->tiering_enabled)
 			?: (ssize_t) size;
 
-		if (c->tiering_read)
-			wake_up_process(c->tiering_read);
+		bch_tiering_start(c); /* issue wakeups */
 		return ret;
 	}
 
 	sysfs_pd_controller_store(foreground_write, &c->foreground_write_pd);
-
-	if (attr == &sysfs_journal_flush) {
-		bch_journal_meta_async(&c->journal, NULL);
-
-		return size;
-	}
 
 	sysfs_strtoul(pd_controllers_update_seconds,
 		      c->pd_controllers_update_seconds);
 	sysfs_strtoul(foreground_target_percent, c->foreground_target_percent);
 
 	sysfs_strtoul(tiering_percent,		c->tiering_percent);
-	sysfs_pd_controller_store(tiering,	&c->tiering_pd);
+	sysfs_pd_controller_store(tiering,	&c->tiers[1].pd); /* XXX */
 
 	/* Debugging: */
 
@@ -796,11 +787,14 @@ STORE(__bch_cache_set)
 	BCH_DEBUG_PARAMS()
 #undef BCH_DEBUG_PARAM
 
-	if (!test_bit(CACHE_SET_RUNNING, &c->flags))
+	if (!bch_fs_running(c))
 		return -EPERM;
 
-	if (test_bit(CACHE_SET_STOPPING, &c->flags))
-		return -EINTR;
+	if (attr == &sysfs_journal_flush) {
+		bch_journal_meta_async(&c->journal, NULL);
+
+		return size;
+	}
 
 	if (attr == &sysfs_blockdev_volume_create) {
 		u64 v = strtoi_h_or_return(buf);
@@ -829,34 +823,24 @@ STORE(__bch_cache_set)
 	return size;
 }
 
-STORE(bch_cache_set)
+STORE(bch_fs)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, kobj);
 
-	mutex_lock(&bch_register_lock);
-	size = __bch_cache_set_store(kobj, attr, buf, size);
-	mutex_unlock(&bch_register_lock);
-
-	if (attr == &sysfs_add_device) {
-		char *path = kstrdup(buf, GFP_KERNEL);
-		int r = bch_cache_set_add_cache(c, strim(path));
-
-		kfree(path);
-		if (r)
-			return r;
-	}
+	mutex_lock(&c->state_lock);
+	size = __bch_fs_store(kobj, attr, buf, size);
+	mutex_unlock(&c->state_lock);
 
 	return size;
 }
 
-static struct attribute *bch_cache_set_files[] = {
+static struct attribute *bch_fs_files[] = {
 	&sysfs_unregister,
 	&sysfs_stop,
 	&sysfs_journal_write_delay_ms,
 	&sysfs_journal_reclaim_delay_ms,
 	&sysfs_journal_entry_size_max,
 	&sysfs_blockdev_volume_create,
-	&sysfs_add_device,
 
 	&sysfs_block_size,
 	&sysfs_block_size_bytes,
@@ -886,27 +870,27 @@ static struct attribute *bch_cache_set_files[] = {
 	&sysfs_journal_flush,
 	NULL
 };
-KTYPE(bch_cache_set);
+KTYPE(bch_fs);
 
 /* internal dir - just a wrapper */
 
-SHOW(bch_cache_set_internal)
+SHOW(bch_fs_internal)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, internal);
-	return bch_cache_set_show(&c->kobj, attr, buf);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, internal);
+	return bch_fs_show(&c->kobj, attr, buf);
 }
 
-STORE(bch_cache_set_internal)
+STORE(bch_fs_internal)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, internal);
-	return bch_cache_set_store(&c->kobj, attr, buf, size);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, internal);
+	return bch_fs_store(&c->kobj, attr, buf, size);
 }
 
-static void bch_cache_set_internal_release(struct kobject *k)
+static void bch_fs_internal_release(struct kobject *k)
 {
 }
 
-static struct attribute *bch_cache_set_internal_files[] = {
+static struct attribute *bch_fs_internal_files[] = {
 	&sysfs_journal_debug,
 
 	&sysfs_alloc_debug,
@@ -937,77 +921,72 @@ static struct attribute *bch_cache_set_internal_files[] = {
 
 	NULL
 };
-KTYPE(bch_cache_set_internal);
+KTYPE(bch_fs_internal);
 
 /* options */
 
-SHOW(bch_cache_set_opts_dir)
+SHOW(bch_fs_opts_dir)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, opts_dir);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, opts_dir);
 
-#define CACHE_SET_OPT(_name, _choices, _min, _max, _sb_opt, _perm)	\
-	if (attr == &sysfs_opt_##_name)					\
-		return _choices == bch_bool_opt || _choices == bch_uint_opt\
-			? snprintf(buf, PAGE_SIZE, "%i\n", c->opts._name)\
-			: bch_snprint_string_list(buf, PAGE_SIZE,	\
-						_choices, c->opts._name);\
-
-	CACHE_SET_VISIBLE_OPTS()
-#undef CACHE_SET_OPT
-
-	return 0;
+	return bch_opt_show(&c->opts, attr->name, buf, PAGE_SIZE);
 }
 
-STORE(bch_cache_set_opts_dir)
+STORE(bch_fs_opts_dir)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, opts_dir);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, opts_dir);
+	const struct bch_option *opt;
+	enum bch_opt_id id;
+	u64 v;
 
-#define CACHE_SET_OPT(_name, _choices, _min, _max, _sb_opt, _perm)	\
-	if (attr == &sysfs_opt_##_name) {				\
-		ssize_t v = (_choices == bch_bool_opt ||		\
-			     _choices == bch_uint_opt)			\
-			? strtoul_restrict_or_return(buf, _min, _max - 1)\
-			: bch_read_string_list(buf, _choices);		\
-									\
-		if (v < 0)						\
-			return v;					\
-									\
-		c->opts._name = v;					\
-									\
-		if (_sb_opt##_BITS && v != _sb_opt(&c->disk_sb)) {	\
-			SET_##_sb_opt(&c->disk_sb, v);			\
-			bcache_write_super(c);				\
-		}							\
-									\
-		return size;						\
+	id = bch_parse_sysfs_opt(attr->name, buf, &v);
+	if (id < 0)
+		return id;
+
+	opt = &bch_opt_table[id];
+
+	mutex_lock(&c->sb_lock);
+
+	if (id == Opt_compression) {
+		int ret = bch_check_set_has_compressed_data(c, v);
+		if (ret) {
+			mutex_unlock(&c->sb_lock);
+			return ret;
+		}
 	}
 
-	CACHE_SET_VISIBLE_OPTS()
-#undef CACHE_SET_OPT
+	if (opt->set_sb != SET_NO_SB_OPT) {
+		opt->set_sb(c->disk_sb, v);
+		bch_write_super(c);
+	}
+
+	bch_opt_set(&c->opts, id, v);
+
+	mutex_unlock(&c->sb_lock);
 
 	return size;
 }
 
-static void bch_cache_set_opts_dir_release(struct kobject *k)
+static void bch_fs_opts_dir_release(struct kobject *k)
 {
 }
 
-static struct attribute *bch_cache_set_opts_dir_files[] = {
-#define CACHE_SET_OPT(_name, _choices, _min, _max, _sb_opt, _perm)	\
+static struct attribute *bch_fs_opts_dir_files[] = {
+#define BCH_OPT(_name, ...)						\
 	&sysfs_opt_##_name,
 
-	CACHE_SET_VISIBLE_OPTS()
-#undef CACHE_SET_OPT
+	BCH_VISIBLE_OPTS()
+#undef BCH_OPT
 
 	NULL
 };
-KTYPE(bch_cache_set_opts_dir);
+KTYPE(bch_fs_opts_dir);
 
 /* time stats */
 
-SHOW(bch_cache_set_time_stats)
+SHOW(bch_fs_time_stats)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, time_stats);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, time_stats);
 
 #define BCH_TIME_STAT(name, frequency_units, duration_units)		\
 	sysfs_print_time_stats(&c->name##_time, name,			\
@@ -1018,9 +997,9 @@ SHOW(bch_cache_set_time_stats)
 	return 0;
 }
 
-STORE(bch_cache_set_time_stats)
+STORE(bch_fs_time_stats)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, time_stats);
+	struct bch_fs *c = container_of(kobj, struct bch_fs, time_stats);
 
 #define BCH_TIME_STAT(name, frequency_units, duration_units)		\
 	sysfs_clear_time_stats(&c->name##_time, name);
@@ -1030,11 +1009,11 @@ STORE(bch_cache_set_time_stats)
 	return size;
 }
 
-static void bch_cache_set_time_stats_release(struct kobject *k)
+static void bch_fs_time_stats_release(struct kobject *k)
 {
 }
 
-static struct attribute *bch_cache_set_time_stats_files[] = {
+static struct attribute *bch_fs_time_stats_files[] = {
 #define BCH_TIME_STAT(name, frequency_units, duration_units)		\
 	sysfs_time_stats_attribute_list(name, frequency_units, duration_units)
 	BCH_TIME_STATS()
@@ -1042,31 +1021,31 @@ static struct attribute *bch_cache_set_time_stats_files[] = {
 
 	NULL
 };
-KTYPE(bch_cache_set_time_stats);
+KTYPE(bch_fs_time_stats);
 
-typedef unsigned (bucket_map_fn)(struct cache *, struct bucket *, void *);
+typedef unsigned (bucket_map_fn)(struct bch_dev *, struct bucket *, void *);
 
-static unsigned bucket_priority_fn(struct cache *ca, struct bucket *g,
+static unsigned bucket_priority_fn(struct bch_dev *ca, struct bucket *g,
 				   void *private)
 {
 	int rw = (private ? 1 : 0);
 
-	return ca->set->prio_clock[rw].hand - g->prio[rw];
+	return ca->fs->prio_clock[rw].hand - g->prio[rw];
 }
 
-static unsigned bucket_sectors_used_fn(struct cache *ca, struct bucket *g,
+static unsigned bucket_sectors_used_fn(struct bch_dev *ca, struct bucket *g,
 				       void *private)
 {
 	return bucket_sectors_used(g);
 }
 
-static unsigned bucket_oldest_gen_fn(struct cache *ca, struct bucket *g,
+static unsigned bucket_oldest_gen_fn(struct bch_dev *ca, struct bucket *g,
 				     void *private)
 {
 	return bucket_gc_gen(ca, g);
 }
 
-static ssize_t show_quantiles(struct cache *ca, char *buf,
+static ssize_t show_quantiles(struct bch_dev *ca, char *buf,
 			      bucket_map_fn *fn, void *private)
 {
 	int cmp(const void *l, const void *r)
@@ -1104,7 +1083,7 @@ static ssize_t show_quantiles(struct cache *ca, char *buf,
 
 }
 
-static ssize_t show_reserve_stats(struct cache *ca, char *buf)
+static ssize_t show_reserve_stats(struct bch_dev *ca, char *buf)
 {
 	enum alloc_reserve i;
 	ssize_t ret;
@@ -1127,10 +1106,10 @@ static ssize_t show_reserve_stats(struct cache *ca, char *buf)
 	return ret;
 }
 
-static ssize_t show_cache_alloc_debug(struct cache *ca, char *buf)
+static ssize_t show_dev_alloc_debug(struct bch_dev *ca, char *buf)
 {
-	struct cache_set *c = ca->set;
-	struct bucket_stats_cache stats = bch_bucket_stats_read_cache(ca);
+	struct bch_fs *c = ca->fs;
+	struct bch_dev_usage stats = bch_dev_usage_read(ca);
 
 	return scnprintf(buf, PAGE_SIZE,
 		"free_inc:               %zu/%zu\n"
@@ -1153,13 +1132,13 @@ static ssize_t show_cache_alloc_debug(struct cache *ca, char *buf)
 		stats.buckets_alloc,			ca->mi.nbuckets - ca->mi.first_bucket,
 		stats.buckets_meta,			ca->mi.nbuckets - ca->mi.first_bucket,
 		stats.buckets_dirty,			ca->mi.nbuckets - ca->mi.first_bucket,
-		__buckets_available_cache(ca, stats),	ca->mi.nbuckets - ca->mi.first_bucket,
+		__dev_buckets_available(ca, stats),	ca->mi.nbuckets - ca->mi.first_bucket,
 		c->freelist_wait.list.first		? "waiting" : "empty",
 		c->open_buckets_nr_free, OPEN_BUCKETS_COUNT, BTREE_NODE_RESERVE,
 		c->open_buckets_wait.list.first		? "waiting" : "empty");
 }
 
-static u64 sectors_written(struct cache *ca)
+static u64 sectors_written(struct bch_dev *ca)
 {
 	u64 ret = 0;
 	int cpu;
@@ -1170,13 +1149,13 @@ static u64 sectors_written(struct cache *ca)
 	return ret;
 }
 
-SHOW(bch_cache)
+SHOW(bch_dev)
 {
-	struct cache *ca = container_of(kobj, struct cache, kobj);
-	struct cache_set *c = ca->set;
-	struct bucket_stats_cache stats = bch_bucket_stats_read_cache(ca);
+	struct bch_dev *ca = container_of(kobj, struct bch_dev, kobj);
+	struct bch_fs *c = ca->fs;
+	struct bch_dev_usage stats = bch_dev_usage_read(ca);
 
-	sysfs_printf(uuid,		"%pU\n", ca->disk_sb.sb->disk_uuid.b);
+	sysfs_printf(uuid,		"%pU\n", ca->uuid.b);
 
 	sysfs_hprint(bucket_size,	bucket_bytes(ca));
 	sysfs_print(bucket_size_bytes,	bucket_bytes(ca));
@@ -1195,16 +1174,16 @@ SHOW(bch_cache)
 	sysfs_print(io_errors,
 		    atomic_read(&ca->io_errors) >> IO_ERROR_SHIFT);
 
-	sysfs_hprint(dirty_data,	stats.sectors_dirty << 9);
-	sysfs_print(dirty_bytes,	stats.sectors_dirty << 9);
+	sysfs_hprint(dirty_data,	stats.sectors[S_DIRTY] << 9);
+	sysfs_print(dirty_bytes,	stats.sectors[S_DIRTY] << 9);
 	sysfs_print(dirty_buckets,	stats.buckets_dirty);
-	sysfs_hprint(cached_data,	stats.sectors_cached << 9);
-	sysfs_print(cached_bytes,	stats.sectors_cached << 9);
+	sysfs_hprint(cached_data,	stats.sectors[S_CACHED] << 9);
+	sysfs_print(cached_bytes,	stats.sectors[S_CACHED] << 9);
 	sysfs_print(cached_buckets,	stats.buckets_cached);
 	sysfs_print(meta_buckets,	stats.buckets_meta);
 	sysfs_print(alloc_buckets,	stats.buckets_alloc);
-	sysfs_print(available_buckets,	buckets_available_cache(ca));
-	sysfs_print(free_buckets,	buckets_free_cache(ca));
+	sysfs_print(available_buckets,	dev_buckets_available(ca));
+	sysfs_print(free_buckets,	dev_buckets_free(ca));
 	sysfs_print(has_data,		ca->mi.has_data);
 	sysfs_print(has_metadata,	ca->mi.has_metadata);
 
@@ -1219,7 +1198,7 @@ SHOW(bch_cache)
 
 	if (attr == &sysfs_state_rw)
 		return bch_snprint_string_list(buf, PAGE_SIZE,
-					       bch_cache_state,
+					       bch_dev_state,
 					       ca->mi.state);
 
 	if (attr == &sysfs_read_priority_stats)
@@ -1233,26 +1212,30 @@ SHOW(bch_cache)
 	if (attr == &sysfs_reserve_stats)
 		return show_reserve_stats(ca, buf);
 	if (attr == &sysfs_alloc_debug)
-		return show_cache_alloc_debug(ca, buf);
+		return show_dev_alloc_debug(ca, buf);
 
 	return 0;
 }
 
-STORE(__bch_cache)
+STORE(bch_dev)
 {
-	struct cache *ca = container_of(kobj, struct cache, kobj);
-	struct cache_set *c = ca->set;
-	struct cache_member *mi = &c->disk_mi[ca->sb.nr_this_dev];
+	struct bch_dev *ca = container_of(kobj, struct bch_dev, kobj);
+	struct bch_fs *c = ca->fs;
+	struct bch_member *mi;
 
 	sysfs_pd_controller_store(copy_gc, &ca->moving_gc_pd);
 
 	if (attr == &sysfs_discard) {
 		bool v = strtoul_or_return(buf);
 
-		if (v != CACHE_DISCARD(mi)) {
-			SET_CACHE_DISCARD(mi, v);
-			bcache_write_super(c);
+		mutex_lock(&c->sb_lock);
+		mi = &bch_sb_get_members(c->disk_sb)->members[ca->dev_idx];
+
+		if (v != BCH_MEMBER_DISCARD(mi)) {
+			SET_BCH_MEMBER_DISCARD(mi, v);
+			bch_write_super(c);
 		}
+		mutex_unlock(&c->sb_lock);
 	}
 
 	if (attr == &sysfs_cache_replacement_policy) {
@@ -1261,56 +1244,39 @@ STORE(__bch_cache)
 		if (v < 0)
 			return v;
 
-		if ((unsigned) v != CACHE_REPLACEMENT(mi)) {
-			SET_CACHE_REPLACEMENT(mi, v);
-			bcache_write_super(c);
+		mutex_lock(&c->sb_lock);
+		mi = &bch_sb_get_members(c->disk_sb)->members[ca->dev_idx];
+
+		if ((unsigned) v != BCH_MEMBER_REPLACEMENT(mi)) {
+			SET_BCH_MEMBER_REPLACEMENT(mi, v);
+			bch_write_super(c);
 		}
+		mutex_unlock(&c->sb_lock);
 	}
 
-	if (attr == &sysfs_state_rw) {
-		char name[BDEVNAME_SIZE];
-		const char *err = NULL;
-		ssize_t v = bch_read_string_list(buf, bch_cache_state);
+	if (attr == &sysfs_tier) {
+		unsigned prev_tier;
+		unsigned v = strtoul_restrict_or_return(buf,
+					0, BCH_TIER_MAX - 1);
 
-		if (v < 0)
-			return v;
+		mutex_lock(&c->sb_lock);
+		prev_tier = ca->mi.tier;
 
-		if (v == ca->mi.state)
+		if (v == ca->mi.tier) {
+			mutex_unlock(&c->sb_lock);
 			return size;
-
-		switch (v) {
-		case CACHE_ACTIVE:
-			err = bch_cache_read_write(ca);
-			break;
-		case CACHE_RO:
-			bch_cache_read_only(ca);
-			break;
-		case CACHE_FAILED:
-		case CACHE_SPARE:
-			/*
-			 * XXX: need to migrate data off and set correct state
-			 */
-			pr_err("can't set %s %s: not supported",
-			       bdevname(ca->disk_sb.bdev, name),
-			       bch_cache_state[v]);
-			return -EINVAL;
 		}
 
-		if (err) {
-			pr_err("can't set %s %s: %s",
-			       bdevname(ca->disk_sb.bdev, name),
-			       bch_cache_state[v], err);
-			return -EINVAL;
-		}
-	}
+		mi = &bch_sb_get_members(c->disk_sb)->members[ca->dev_idx];
+		SET_BCH_MEMBER_TIER(mi, v);
+		bch_write_super(c);
 
-	if (attr == &sysfs_unregister) {
-		bool force = false;
+		bch_dev_group_remove(&c->tiers[prev_tier].devs, ca);
+		bch_dev_group_add(&c->tiers[ca->mi.tier].devs, ca);
+		mutex_unlock(&c->sb_lock);
 
-		if (!strncmp(buf, "force", 5) &&
-		    (buf[5] == '\0' || buf[5] == '\n'))
-			force = true;
-		bch_cache_remove(ca, force);
+		bch_recalc_capacity(c);
+		bch_tiering_start(c);
 	}
 
 	if (attr == &sysfs_clear_stats) {
@@ -1327,11 +1293,9 @@ STORE(__bch_cache)
 
 	return size;
 }
-STORE_LOCKED(bch_cache)
 
-static struct attribute *bch_cache_files[] = {
+static struct attribute *bch_dev_files[] = {
 	&sysfs_uuid,
-	&sysfs_unregister,
 	&sysfs_bucket_size,
 	&sysfs_bucket_size_bytes,
 	&sysfs_block_size,
@@ -1369,4 +1333,4 @@ static struct attribute *bch_cache_files[] = {
 	sysfs_pd_controller_files(copy_gc),
 	NULL
 };
-KTYPE(bch_cache);
+KTYPE(bch_dev);

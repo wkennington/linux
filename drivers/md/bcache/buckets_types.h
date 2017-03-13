@@ -1,6 +1,14 @@
 #ifndef _BUCKETS_TYPES_H
 #define _BUCKETS_TYPES_H
 
+enum bucket_data_type {
+	BUCKET_DATA	= 0,
+	BUCKET_BTREE,
+	BUCKET_PRIOS,
+	BUCKET_JOURNAL,
+	BUCKET_SB,
+};
+
 struct bucket_mark {
 	union {
 	struct {
@@ -12,23 +20,30 @@ struct bucket_mark {
 
 		/* generation copygc is going to move this bucket into */
 		unsigned	copygc:1;
-		unsigned	wait_on_journal:1;
+
+		unsigned	journal_seq_valid:1;
 
 		/*
-		 * If this bucket ever had metadata in it, the allocator must
-		 * increment its gen before we reuse it:
+		 * If this bucket had metadata while at the current generation
+		 * number, the allocator must increment its gen before we reuse
+		 * it:
 		 */
 		unsigned	had_metadata:1;
 
 		unsigned	owned_by_allocator:1;
-		unsigned	is_metadata:1;
 
-		u16		cached_sectors;
+		unsigned	data_type:3;
+
+		unsigned	nouse:1;
+
 		u16		dirty_sectors;
+		u16		cached_sectors;
 
 		/*
 		 * low bits of journal sequence number when this bucket was most
-		 * recently modified:
+		 * recently modified: if journal_seq_valid is set, this bucket
+		 * can't be reused until the journal sequence number written to
+		 * disk is >= the bucket's journal sequence number:
 		 */
 		u16		journal_seq;
 	};
@@ -50,15 +65,10 @@ struct bucket {
 	};
 };
 
-struct bucket_stats_cache {
-	u64			buckets_dirty;
-	u64			buckets_cached;
-	u64			buckets_meta;
-	u64			buckets_alloc;
-
-	u64			sectors_dirty;
-	u64			sectors_cached;
-	u64			sectors_meta;
+enum s_compressed {
+	S_COMPRESSED,
+	S_UNCOMPRESSED,
+	S_COMPRESSED_NR,
 };
 
 enum s_alloc {
@@ -68,13 +78,16 @@ enum s_alloc {
 	S_ALLOC_NR,
 };
 
-enum s_compressed {
-	S_COMPRESSED,
-	S_UNCOMPRESSED,
-	S_COMPRESSED_NR,
+struct bch_dev_usage {
+	u64			buckets_dirty;
+	u64			buckets_cached;
+	u64			buckets_meta;
+	u64			buckets_alloc;
+
+	u64			sectors[S_ALLOC_NR];
 };
 
-struct bucket_stats_cache_set {
+struct bch_fs_usage {
 	/* all fields are in units of 512 byte sectors: */
 	u64			s[S_COMPRESSED_NR][S_ALLOC_NR];
 	u64			persistent_reserved;
