@@ -14,6 +14,7 @@ struct bch_dev;
 struct bch_fs;
 struct keylist;
 struct moving_queue;
+struct bch_read_bio;
 
 DECLARE_EVENT_CLASS(bcache_request,
 	TP_PROTO(struct bcache_device *d, struct bio *bio),
@@ -138,6 +139,16 @@ DEFINE_EVENT(bcache_bio, bcache_promote,
 DEFINE_EVENT(bkey, bcache_promote_collision,
 	TP_PROTO(const struct bkey *k),
 	TP_ARGS(k)
+);
+
+DEFINE_EVENT(bcache_bio, bcache_read_split,
+	TP_PROTO(struct bio *bio),
+	TP_ARGS(bio)
+);
+
+DEFINE_EVENT(bcache_bio, bcache_read_bounce,
+	TP_PROTO(struct bio *bio),
+	TP_ARGS(bio)
 );
 
 TRACE_EVENT(bcache_read,

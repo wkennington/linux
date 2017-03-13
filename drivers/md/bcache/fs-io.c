@@ -522,6 +522,17 @@ static bool bio_can_add_page_contig(struct bio *bio, struct page *page)
 		bio_end_sector(bio) == offset;
 }
 
+static void __bio_add_page(struct bio *bio, struct page *page)
+{
+	bio->bi_io_vec[bio->bi_vcnt++] = (struct bio_vec) {
+		.bv_page = page,
+		.bv_len = PAGE_SIZE,
+		.bv_offset = 0,
+	};
+
+	bio->bi_iter.bi_size += PAGE_SIZE;
+}
+
 static int bio_add_page_contig(struct bio *bio, struct page *page)
 {
 	sector_t offset = (sector_t) page->index << (PAGE_SHIFT - 9);
@@ -533,14 +544,7 @@ static int bio_add_page_contig(struct bio *bio, struct page *page)
 	else if (!bio_can_add_page_contig(bio, page))
 		return -1;
 
-	bio->bi_io_vec[bio->bi_vcnt++] = (struct bio_vec) {
-		.bv_page = page,
-		.bv_len = PAGE_SIZE,
-		.bv_offset = 0,
-	};
-
-	bio->bi_iter.bi_size += PAGE_SIZE;
-
+	__bio_add_page(bio, page);
 	return 0;
 }
 
@@ -564,36 +568,51 @@ static void bch_readpages_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
-static inline struct page *__readpage_next_page(struct address_space *mapping,
-						struct list_head *pages,
-						unsigned *nr_pages)
+struct readpages_iter {
+	struct address_space	*mapping;
+	struct list_head	pages;
+	unsigned		nr_pages;
+};
+
+static int readpage_add_page(struct readpages_iter *iter, struct page *page)
 {
-	struct page *page;
 	int ret;
 
-	while (*nr_pages) {
-		page = list_entry(pages->prev, struct page, lru);
+	prefetchw(&page->flags);
+	ret = add_to_page_cache_lru(page, iter->mapping,
+				    page->index, GFP_NOFS);
+	if (!ret) {
+		struct bch_page_state *s = page_state(page);
+
+		BUG_ON(s->reserved);
+		s->allocated = 1;
+		s->sectors = 0;
+	}
+
+	put_page(page);
+	return ret;
+}
+
+static inline struct page *readpage_iter_next(struct readpages_iter *iter)
+{
+	while (iter->nr_pages) {
+		struct page *page =
+			list_last_entry(&iter->pages, struct page, lru);
+
 		prefetchw(&page->flags);
 		list_del(&page->lru);
+		iter->nr_pages--;
 
-		ret = add_to_page_cache_lru(page, mapping, page->index, GFP_NOFS);
-
-		/* if add_to_page_cache_lru() succeeded, page is locked: */
-		put_page(page);
-
-		if (!ret)
+		if (!readpage_add_page(iter, page))
 			return page;
-
-		(*nr_pages)--;
 	}
 
 	return NULL;
 }
 
-#define for_each_readpage_page(_mapping, _pages, _nr_pages, _page)	\
+#define for_each_readpage_page(_iter, _page)				\
 	for (;								\
-	     ((_page) = __readpage_next_page(_mapping, _pages, &(_nr_pages)));\
-	     (_nr_pages)--)
+	     ((_page) = __readpage_next_page(&(_iter)));)		\
 
 static void bch_mark_pages_unalloc(struct bio *bio)
 {
@@ -628,51 +647,81 @@ static void bch_add_page_sectors(struct bio *bio, struct bkey_s_c k)
 	}
 }
 
-static void bchfs_read(struct bch_fs *c, struct bch_read_bio *rbio, u64 inode)
+static void readpage_bio_extend(struct readpages_iter *iter,
+				struct bio *bio, u64 offset,
+				bool get_more)
 {
-	struct bio *bio = &rbio->bio;
-	struct btree_iter iter;
-	struct bkey_s_c k;
-	struct bio_vec *bv;
-	unsigned i;
+	struct page *page;
+	pgoff_t page_offset;
 	int ret;
 
-	bch_increment_clock(c, bio_sectors(bio), READ);
+	while (bio_end_sector(bio) < offset &&
+	       bio->bi_vcnt < bio->bi_max_vecs) {
+		page_offset = bio_end_sector(bio) >> PAGE_SECTOR_SHIFT;
 
-	/*
-	 * Initialize page state:
-	 * If a page is partly allocated and partly a hole, we want it to be
-	 * marked BCH_PAGE_UNALLOCATED - so we initially mark all pages
-	 * allocated and then mark them unallocated as we find holes:
-	 *
-	 * Note that the bio hasn't been split yet - it's the only bio that
-	 * points to these pages. As we walk extents and split @bio, that
-	 * necessarily be true, the splits won't necessarily be on page
-	 * boundaries:
-	 */
-	bio_for_each_segment_all(bv, bio, i) {
-		struct bch_page_state *s = page_state(bv->bv_page);
+		if (iter->nr_pages) {
+			page = list_last_entry(&iter->pages, struct page, lru);
+			if (page->index != page_offset)
+				break;
 
-		EBUG_ON(s->reserved);
+			list_del(&page->lru);
+			iter->nr_pages--;
+		} else if (get_more) {
+			rcu_read_lock();
+			page = radix_tree_lookup(&iter->mapping->page_tree, page_offset);
+			rcu_read_unlock();
 
-		s->allocated = 1;
-		s->sectors = 0;
+			if (page && !radix_tree_exceptional_entry(page))
+				break;
+
+			page = __page_cache_alloc(readahead_gfp_mask(iter->mapping));
+			if (!page)
+				break;
+
+			ClearPageReadahead(bio->bi_io_vec[bio->bi_vcnt - 1].bv_page);
+		} else {
+			break;
+		}
+
+		ret = readpage_add_page(iter, page);
+		if (ret)
+			break;
+
+		__bio_add_page(bio, page);
 	}
 
-	for_each_btree_key_with_holes(&iter, c, BTREE_ID_EXTENTS,
-				      POS(inode, bio->bi_iter.bi_sector), k) {
+	if (!iter->nr_pages)
+		SetPageReadahead(bio->bi_io_vec[bio->bi_vcnt - 1].bv_page);
+}
+
+static void __bchfs_read(struct bch_fs *c, struct btree_iter *iter,
+			 struct bch_read_bio *rbio, u64 inode,
+			 struct readpages_iter *readpages_iter)
+{
+	struct bio *bio = &rbio->bio;
+
+	bch_btree_iter_set_pos(iter, POS(inode, bio->bi_iter.bi_sector));
+
+	while (1) {
 		BKEY_PADDED(k) tmp;
 		struct extent_pick_ptr pick;
-		unsigned bytes, sectors;
+		unsigned bytes;
 		bool is_last;
+		struct bkey_s_c k = bch_btree_iter_peek_with_holes(iter);
+
+		BUG_ON(!k.k);
+
+		if (IS_ERR(k.k)) {
+			int ret = bch_btree_iter_unlock(iter);
+			BUG_ON(!ret);
+			bcache_io_error(c, bio, "btree IO error %i", ret);
+			bio_endio(bio);
+			return;
+		}
 
 		bkey_reassemble(&tmp.k, k);
-		bch_btree_iter_unlock(&iter);
+		bch_btree_iter_unlock(iter);
 		k = bkey_i_to_s_c(&tmp.k);
-
-		if (!bkey_extent_is_allocation(k.k) ||
-		    bkey_extent_is_compressed(k))
-			bch_mark_pages_unalloc(bio);
 
 		bch_extent_pick_ptr(c, k, &pick);
 		if (IS_ERR(pick.ca)) {
@@ -681,14 +730,24 @@ static void bchfs_read(struct bch_fs *c, struct bch_read_bio *rbio, u64 inode)
 			return;
 		}
 
-		sectors = min_t(u64, k.k->p.offset, bio_end_sector(bio)) -
-			bio->bi_iter.bi_sector;
-		bytes = sectors << 9;
+		if (readpages_iter)
+			readpage_bio_extend(readpages_iter,
+					    bio, k.k->p.offset,
+					    pick.ca &&
+					    (pick.crc.csum_type ||
+					     pick.crc.compression_type));
+
+		bytes = (min_t(u64, k.k->p.offset, bio_end_sector(bio)) -
+			 bio->bi_iter.bi_sector) << 9;
 		is_last = bytes == bio->bi_iter.bi_size;
 		swap(bio->bi_iter.bi_size, bytes);
 
 		if (bkey_extent_is_allocation(k.k))
 			bch_add_page_sectors(bio, k);
+
+		if (!bkey_extent_is_allocation(k.k) ||
+		    bkey_extent_is_compressed(k))
+			bch_mark_pages_unalloc(bio);
 
 		if (pick.ca) {
 			PTR_BUCKET(pick.ca, &pick.ptr)->read_prio =
@@ -711,15 +770,6 @@ static void bchfs_read(struct bch_fs *c, struct bch_read_bio *rbio, u64 inode)
 		swap(bio->bi_iter.bi_size, bytes);
 		bio_advance(bio, bytes);
 	}
-
-	/*
-	 * If we get here, it better have been because there was an error
-	 * reading a btree node
-	 */
-	ret = bch_btree_iter_unlock(&iter);
-	BUG_ON(!ret);
-	bcache_io_error(c, bio, "btree IO error %i", ret);
-	bio_endio(bio);
 }
 
 int bch_readpages(struct file *file, struct address_space *mapping,
@@ -727,41 +777,69 @@ int bch_readpages(struct file *file, struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct bch_fs *c = inode->i_sb->s_fs_info;
-	struct bch_read_bio *rbio = NULL;
+	struct btree_iter iter;
 	struct page *page;
+	struct readpages_iter readpages_iter = {
+		.mapping = mapping, .nr_pages = nr_pages
+	};
 
-	pr_debug("reading %u pages", nr_pages);
+	bch_btree_iter_init(&iter, c, BTREE_ID_EXTENTS, POS_MIN);
+
+	INIT_LIST_HEAD(&readpages_iter.pages);
+	list_add(&readpages_iter.pages, pages);
+	list_del_init(pages);
 
 	if (current->pagecache_lock != &mapping->add_lock)
 		pagecache_add_get(&mapping->add_lock);
 
-	for_each_readpage_page(mapping, pages, nr_pages, page) {
-again:
-		if (!rbio) {
-			rbio = container_of(bio_alloc_bioset(GFP_NOFS,
-						min_t(unsigned, nr_pages,
-						      BIO_MAX_PAGES),
-						&c->bio_read),
-					   struct bch_read_bio, bio);
+	while ((page = readpage_iter_next(&readpages_iter))) {
+		unsigned n = max(min_t(unsigned, readpages_iter.nr_pages + 1,
+				       BIO_MAX_PAGES),
+				 BCH_ENCODED_EXTENT_MAX >> PAGE_SECTOR_SHIFT);
 
-			rbio->bio.bi_end_io = bch_readpages_end_io;
-		}
+		struct bch_read_bio *rbio =
+			container_of(bio_alloc_bioset(GFP_NOFS, n,
+						      &c->bio_read),
+				     struct bch_read_bio, bio);
 
-		if (bio_add_page_contig(&rbio->bio, page)) {
-			bchfs_read(c, rbio, inode->i_ino);
-			rbio = NULL;
-			goto again;
-		}
+		rbio->bio.bi_end_io = bch_readpages_end_io;
+		bio_add_page_contig(&rbio->bio, page);
+		__bchfs_read(c, &iter, rbio, inode->i_ino, &readpages_iter);
 	}
-
-	if (rbio)
-		bchfs_read(c, rbio, inode->i_ino);
 
 	if (current->pagecache_lock != &mapping->add_lock)
 		pagecache_add_put(&mapping->add_lock);
 
-	pr_debug("success");
 	return 0;
+}
+
+static void __bchfs_readpage(struct bch_fs *c, struct bch_read_bio *rbio,
+			     u64 inode, struct page *page)
+{
+	struct btree_iter iter;
+
+	/*
+	 * Initialize page state:
+	 * If a page is partly allocated and partly a hole, we want it to be
+	 * marked BCH_PAGE_UNALLOCATED - so we initially mark all pages
+	 * allocated and then mark them unallocated as we find holes:
+	 *
+	 * Note that the bio hasn't been split yet - it's the only bio that
+	 * points to these pages. As we walk extents and split @bio, that
+	 * necessarily be true, the splits won't necessarily be on page
+	 * boundaries:
+	 */
+	struct bch_page_state *s = page_state(page);
+
+	EBUG_ON(s->reserved);
+	s->allocated = 1;
+	s->sectors = 0;
+
+	bio_set_op_attrs(&rbio->bio, REQ_OP_READ, REQ_SYNC);
+	bio_add_page_contig(&rbio->bio, page);
+
+	bch_btree_iter_init(&iter, c, BTREE_ID_EXTENTS, POS_MIN);
+	__bchfs_read(c, &iter, rbio, inode, NULL);
 }
 
 int bch_readpage(struct file *file, struct page *page)
@@ -774,12 +852,9 @@ int bch_readpage(struct file *file, struct page *page)
 	rbio = container_of(bio_alloc_bioset(GFP_NOFS, 1,
 					    &c->bio_read),
 			   struct bch_read_bio, bio);
-	bio_set_op_attrs(&rbio->bio, REQ_OP_READ, REQ_SYNC);
 	rbio->bio.bi_end_io = bch_readpages_end_io;
 
-	bio_add_page_contig(&rbio->bio, page);
-	bchfs_read(c, rbio, inode->i_ino);
-
+	__bchfs_readpage(c, rbio, inode->i_ino, page);
 	return 0;
 }
 
@@ -1163,12 +1238,10 @@ static int bch_read_single_page(struct page *page,
 	rbio = container_of(bio_alloc_bioset(GFP_NOFS, 1,
 					     &c->bio_read),
 			    struct bch_read_bio, bio);
-	bio_set_op_attrs(&rbio->bio, REQ_OP_READ, REQ_SYNC);
 	rbio->bio.bi_private = &done;
 	rbio->bio.bi_end_io = bch_read_single_page_end_io;
-	bio_add_page_contig(&rbio->bio, page);
 
-	bchfs_read(c, rbio, inode->i_ino);
+	__bchfs_readpage(c, rbio, inode->i_ino, page);
 	wait_for_completion(&done);
 
 	ret = rbio->bio.bi_error;

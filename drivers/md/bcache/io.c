@@ -1119,8 +1119,7 @@ static void bch_read_endio(struct bio *bio)
 		return;
 	}
 
-	if (rbio->crc.compression_type != BCH_COMPRESSION_NONE ||
-	    bch_csum_type_is_encryption(rbio->crc.csum_type)) {
+	if (rbio->crc.csum_type || rbio->crc.compression_type) {
 		struct bio_decompress_worker *d;
 
 		preempt_disable();
@@ -1154,6 +1153,8 @@ void bch_read_extent_iter(struct bch_fs *c, struct bch_read_bio *orig,
 	struct cache_promote_op *promote_op = NULL;
 	unsigned skip = iter.bi_sector - bkey_start_offset(k.k);
 	bool bounce = false, split, read_full = false;
+
+	bch_increment_clock(c, bio_sectors(&orig->bio), READ);
 
 	EBUG_ON(bkey_start_offset(k.k) > iter.bi_sector ||
 		k.k->p.offset < bvec_iter_end_sector(iter));
@@ -1310,6 +1311,12 @@ void bch_read_extent_iter(struct bch_fs *c, struct bch_read_bio *orig,
 
 	rbio->submit_time_us = local_clock_us();
 
+	if (bounce)
+		trace_bcache_read_bounce(&rbio->bio);
+
+	if (!(flags & BCH_READ_IS_LAST))
+		trace_bcache_read_split(&rbio->bio);
+
 #ifndef CONFIG_BCACHE_NO_IO
 	generic_make_request(&rbio->bio);
 #else
@@ -1392,8 +1399,6 @@ static void bch_read_iter(struct bch_fs *c, struct bch_read_bio *rbio,
 
 void bch_read(struct bch_fs *c, struct bch_read_bio *bio, u64 inode)
 {
-	bch_increment_clock(c, bio_sectors(&bio->bio), READ);
-
 	bch_read_iter(c, bio, bio->bio.bi_iter, inode,
 		      BCH_READ_FORCE_BOUNCE|
 		      BCH_READ_RETRY_IF_STALE|
