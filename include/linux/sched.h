@@ -1024,7 +1024,7 @@ struct task_struct {
 #ifdef CONFIG_UPROBES
 	struct uprobe_task		*utask;
 #endif
-#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE) || defined(CONFIG_BCACHEFS_FS) || defined(CONFIG_BCACHEFS_FS_MODULE)
 	unsigned int			sequential_io;
 	unsigned int			sequential_io_avg;
 #endif
