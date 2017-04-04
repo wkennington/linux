@@ -865,6 +865,7 @@ static int bch2_allocator_thread(void *arg)
 {
 	struct bch_dev *ca = arg;
 	struct bch_fs *c = ca->fs;
+	long bucket;
 	int ret;
 
 	set_freezable();
@@ -879,7 +880,7 @@ static int bch2_allocator_thread(void *arg)
 		 */
 
 		while (!fifo_empty(&ca->free_inc)) {
-			long bucket = fifo_peek(&ca->free_inc);
+			bucket = fifo_peek(&ca->free_inc);
 
 			/*
 			 * Don't remove from free_inc until after it's added
@@ -962,12 +963,8 @@ static int bch2_allocator_thread(void *arg)
 			 * consistent-ish:
 			 */
 			spin_lock(&ca->freelist_lock);
-			while (!fifo_empty(&ca->free_inc)) {
-				long bucket;
-
-				fifo_pop(&ca->free_inc, bucket);
+			while (fifo_pop(&ca->free_inc, bucket))
 				bch2_mark_free_bucket(ca, ca->buckets + bucket);
-			}
 			spin_unlock(&ca->freelist_lock);
 			goto out;
 		}
