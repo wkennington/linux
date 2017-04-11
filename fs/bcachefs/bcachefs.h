@@ -418,8 +418,8 @@ struct bch_dev {
 	atomic_long_t		saturated_count;
 	size_t			inc_gen_needs_gc;
 
-	struct mutex		heap_lock;
-	bucket_heap		heap;
+	bucket_heap		alloc_heap;
+	bucket_heap		copygc_heap;
 
 	/* Moving GC: */
 	struct task_struct	*moving_gc_read;

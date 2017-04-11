@@ -604,7 +604,7 @@ static unsigned bucket_priority_fn(struct bch_dev *ca, struct bucket *g,
 static unsigned bucket_sectors_used_fn(struct bch_dev *ca, struct bucket *g,
 				       void *private)
 {
-	return bucket_sectors_used(g);
+	return bucket_sectors_used(g->mark);
 }
 
 static unsigned bucket_oldest_gen_fn(struct bch_dev *ca, struct bucket *g,
