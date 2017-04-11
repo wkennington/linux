@@ -95,15 +95,6 @@ static inline u8 ptr_stale(const struct bch_dev *ca,
 	return gen_after(PTR_BUCKET(ca, ptr)->mark.gen, ptr->gen);
 }
 
-/* bucket heaps */
-
-static inline int bucket_entry_cmp(bucket_heap *h,
-				   struct bucket_heap_entry l,
-				   struct bucket_heap_entry r)
-{
-	return (l.val > r.val) - (l.val < r.val);
-}
-
 /* bucket gc marks */
 
 /* The dirty and cached sector counts saturate. If this occurs,
@@ -111,14 +102,16 @@ static inline int bucket_entry_cmp(bucket_heap *h,
  * GC must be performed. */
 #define GC_MAX_SECTORS_USED ((1U << 15) - 1)
 
-static inline bool bucket_unused(struct bucket *g)
+static inline unsigned bucket_sectors_used(struct bucket_mark mark)
 {
-	return !g->mark.counter;
+	return mark.dirty_sectors + mark.cached_sectors;
 }
 
-static inline unsigned bucket_sectors_used(struct bucket *g)
+static inline bool bucket_unused(struct bucket_mark mark)
 {
-	return g->mark.dirty_sectors + g->mark.cached_sectors;
+	return !mark.owned_by_allocator &&
+		!mark.data_type &&
+		!bucket_sectors_used(mark);
 }
 
 /* Per device stats: */
