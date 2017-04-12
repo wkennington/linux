@@ -100,6 +100,8 @@ struct bucket_heap_entry {
 	unsigned long val;
 };
 
+typedef HEAP(struct bucket_heap_entry) bucket_heap;
+
 /*
  * A reservation for space on disk:
  */

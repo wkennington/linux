@@ -200,7 +200,8 @@ static void bch2_moving_gc(struct bch_dev *ca)
 		if (sectors_used >= ca->mi.bucket_size)
 			continue;
 
-		bucket_heap_push(ca, g, sectors_used);
+		e = (struct bucket_heap_entry) { g, sectors_used };
+		heap_add_or_replace(&ca->heap, e, -bucket_entry_cmp);
 	}
 
 	sectors_to_move = 0;
@@ -208,7 +209,7 @@ static void bch2_moving_gc(struct bch_dev *ca)
 		sectors_to_move += ca->heap.data[i].val;
 
 	while (sectors_to_move > COPYGC_SECTORS_PER_ITER(ca)) {
-		BUG_ON(!heap_pop(&ca->heap, e, bucket_min_cmp));
+		BUG_ON(!heap_pop(&ca->heap, e, -bucket_entry_cmp));
 		sectors_to_move -= e.val;
 	}
 
