@@ -97,29 +97,11 @@ static inline u8 ptr_stale(const struct bch_dev *ca,
 
 /* bucket heaps */
 
-static inline bool bucket_min_cmp(struct bucket_heap_entry l,
-				  struct bucket_heap_entry r)
+static inline int bucket_entry_cmp(bucket_heap *h,
+				   struct bucket_heap_entry l,
+				   struct bucket_heap_entry r)
 {
-	return l.val < r.val;
-}
-
-static inline bool bucket_max_cmp(struct bucket_heap_entry l,
-				  struct bucket_heap_entry r)
-{
-	return l.val > r.val;
-}
-
-static inline void bucket_heap_push(struct bch_dev *ca, struct bucket *g,
-				    unsigned long val)
-{
-	struct bucket_heap_entry new = { g, val };
-
-	if (!heap_full(&ca->heap))
-		heap_add(&ca->heap, new, bucket_min_cmp);
-	else if (bucket_min_cmp(new, heap_peek(&ca->heap))) {
-		ca->heap.data[0] = new;
-		heap_sift(&ca->heap, 0, bucket_min_cmp);
-	}
+	return (l.val > r.val) - (l.val < r.val);
 }
 
 /* bucket gc marks */

@@ -419,7 +419,7 @@ struct bch_dev {
 	size_t			inc_gen_needs_gc;
 
 	struct mutex		heap_lock;
-	DECLARE_HEAP(struct bucket_heap_entry, heap);
+	bucket_heap		heap;
 
 	/* Moving GC: */
 	struct task_struct	*moving_gc_read;

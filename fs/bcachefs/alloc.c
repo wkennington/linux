@@ -708,7 +708,8 @@ static void invalidate_buckets_lru(struct bch_dev *ca)
 		if (!bch2_can_invalidate_bucket(ca, g))
 			continue;
 
-		bucket_heap_push(ca, g, bucket_sort_key(g));
+		e = (struct bucket_heap_entry) { g, bucket_sort_key(g) };
+		heap_add_or_replace(&ca->heap, e, -bucket_entry_cmp);
 	}
 
 	/* Sort buckets by physical location on disk for better locality */
@@ -718,14 +719,14 @@ static void invalidate_buckets_lru(struct bch_dev *ca)
 		e->val = e->g - ca->buckets;
 	}
 
-	heap_resort(&ca->heap, bucket_max_cmp);
+	heap_resort(&ca->heap, bucket_entry_cmp);
 
 	/*
 	 * If we run out of buckets to invalidate, bch2_allocator_thread() will
 	 * kick stuff and retry us
 	 */
 	while (!fifo_full(&ca->free_inc) &&
-	       heap_pop(&ca->heap, e, bucket_max_cmp)) {
+	       heap_pop(&ca->heap, e, bucket_entry_cmp)) {
 		BUG_ON(!bch2_can_invalidate_bucket(ca, e.g));
 		bch2_invalidate_one_bucket(ca, e.g);
 	}
