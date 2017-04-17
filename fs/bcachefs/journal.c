@@ -1921,6 +1921,9 @@ void bch2_journal_flush_pins(struct journal *j, u64 seq_to_flush)
 	struct journal_entry_pin *pin;
 	u64 pin_seq;
 
+	if (!test_bit(JOURNAL_STARTED, &j->flags))
+		return;
+
 	while ((pin = journal_get_next_pin(j, seq_to_flush, &pin_seq)))
 		pin->flush(j, pin, pin_seq);
 
