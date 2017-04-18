@@ -1651,7 +1651,7 @@ static int bch2_set_nr_journal_buckets(struct bch_fs *c, struct bch_dev *ca,
 	}
 	spin_unlock(&j->lock);
 
-	BUG_ON(bch2_validate_journal_layout(ca->disk_sb.sb, ca->mi));
+	BUG_ON(bch2_sb_validate_journal(ca->disk_sb.sb, ca->mi));
 
 	bch2_write_super(c);
 
@@ -1720,7 +1720,7 @@ int bch2_dev_journal_alloc(struct bch_dev *ca)
 	if (i < nr)
 		return -ENOSPC;
 
-	BUG_ON(bch2_validate_journal_layout(ca->disk_sb.sb, ca->mi));
+	BUG_ON(bch2_sb_validate_journal(ca->disk_sb.sb, ca->mi));
 
 	ja->nr = nr;
 
@@ -2324,7 +2324,8 @@ static void journal_write(struct closure *cl)
 		closure_return_with_destructor(cl, journal_write_done);
 	}
 
-	bch2_check_mark_super(c, &j->key, true);
+	bch2_check_mark_super(c, bkey_i_to_s_c_extent(&j->key),
+			      BCH_DATA_JOURNAL);
 
 	/*
 	 * XXX: we really should just disable the entire journal in nochanges
@@ -2380,7 +2381,7 @@ no_io:
 
 	closure_return_with_destructor(cl, journal_write_done);
 err:
-	bch2_fatal_error(c);
+	bch2_inconsistent_error(c);
 	closure_return_with_destructor(cl, journal_write_done);
 }
 

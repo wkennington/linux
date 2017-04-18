@@ -329,11 +329,21 @@ struct bch_member_cpu {
 	u16			bucket_size;	/* sectors */
 	u8			state;
 	u8			tier;
-	u8			has_metadata;
-	u8			has_data;
 	u8			replacement;
 	u8			discard;
 	u8			valid;
+};
+
+struct bch_replicas_cpu_entry {
+	u8			data_type;
+	u8			devs[BCH_SB_MEMBERS_MAX / 8];
+};
+
+struct bch_replicas_cpu {
+	struct rcu_head		rcu;
+	unsigned		nr;
+	unsigned		entry_size;
+	struct bch_replicas_cpu_entry entries[];
 };
 
 struct bch_dev {
@@ -458,6 +468,7 @@ enum {
 	BCH_FS_FSCK_FIXED_ERRORS,
 	BCH_FS_FSCK_DONE,
 	BCH_FS_FIXED_GENS,
+	BCH_FS_REBUILD_REPLICAS,
 };
 
 struct btree_debug {
@@ -507,6 +518,10 @@ struct bch_fs {
 
 	struct bch_dev __rcu	*devs[BCH_SB_MEMBERS_MAX];
 
+	struct bch_replicas_cpu __rcu *replicas;
+	struct bch_replicas_cpu __rcu *replicas_gc;
+	struct mutex		replicas_gc_lock;
+
 	struct bch_opts		opts;
 
 	/* Updated by bch2_sb_update():*/
@@ -519,9 +534,6 @@ struct bch_fs {
 
 		u8		nr_devices;
 		u8		clean;
-
-		u8		meta_replicas_have;
-		u8		data_replicas_have;
 
 		u8		str_hash_type;
 		u8		encryption_type;

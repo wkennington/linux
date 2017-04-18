@@ -3,6 +3,7 @@
 
 #include "util.h"
 
+/* kill, switch to bch_data_types */
 enum bucket_data_type {
 	BUCKET_DATA	= 0,
 	BUCKET_BTREE,

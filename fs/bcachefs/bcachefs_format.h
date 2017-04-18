@@ -2,7 +2,7 @@
 #define _BCACHEFS_FORMAT_H
 
 /*
- * Bcache on disk data structures
+ * bcachefs on disk data structures
  */
 
 #include <asm/types.h>
@@ -752,8 +752,7 @@ struct bch_member {
 
 LE64_BITMASK(BCH_MEMBER_STATE,		struct bch_member, flags[0],  0,  4)
 LE64_BITMASK(BCH_MEMBER_TIER,		struct bch_member, flags[0],  4,  8)
-LE64_BITMASK(BCH_MEMBER_HAS_METADATA,	struct bch_member, flags[0],  8,  9)
-LE64_BITMASK(BCH_MEMBER_HAS_DATA,	struct bch_member, flags[0],  9, 10)
+/* 8-10 unused, was HAS_(META)DATA */
 LE64_BITMASK(BCH_MEMBER_REPLACEMENT,	struct bch_member, flags[0], 10, 14)
 LE64_BITMASK(BCH_MEMBER_DISCARD,	struct bch_member, flags[0], 14, 15);
 
@@ -800,7 +799,8 @@ enum bch_sb_field_type {
 	BCH_SB_FIELD_journal	= 0,
 	BCH_SB_FIELD_members	= 1,
 	BCH_SB_FIELD_crypt	= 2,
-	BCH_SB_FIELD_NR		= 3,
+	BCH_SB_FIELD_replicas	= 3,
+	BCH_SB_FIELD_NR		= 4,
 };
 
 struct bch_sb_field_journal {
@@ -861,8 +861,24 @@ LE64_BITMASK(BCH_KDF_SCRYPT_N,	struct bch_sb_field_crypt, kdf_flags,  0, 16);
 LE64_BITMASK(BCH_KDF_SCRYPT_R,	struct bch_sb_field_crypt, kdf_flags, 16, 32);
 LE64_BITMASK(BCH_KDF_SCRYPT_P,	struct bch_sb_field_crypt, kdf_flags, 32, 48);
 
-struct bch_sb_field_replication {
+enum bch_data_types {
+	BCH_DATA_NONE		= 0,
+	BCH_DATA_SB		= 1,
+	BCH_DATA_JOURNAL	= 2,
+	BCH_DATA_BTREE		= 3,
+	BCH_DATA_USER		= 4,
+	BCH_DATA_NR		= 5,
+};
+
+struct bch_replicas_entry {
+	u8			data_type;
+	u8			nr;
+	u8			devs[0];
+};
+
+struct bch_sb_field_replicas {
 	struct bch_sb_field	field;
+	struct bch_replicas_entry entries[0];
 };
 
 /*
@@ -937,8 +953,7 @@ LE64_BITMASK(BCH_SB_DATA_CSUM_TYPE,	struct bch_sb, flags[0], 44, 48);
 LE64_BITMASK(BCH_SB_META_REPLICAS_WANT,	struct bch_sb, flags[0], 48, 52);
 LE64_BITMASK(BCH_SB_DATA_REPLICAS_WANT,	struct bch_sb, flags[0], 52, 56);
 
-LE64_BITMASK(BCH_SB_META_REPLICAS_HAVE,	struct bch_sb, flags[0], 56, 60);
-LE64_BITMASK(BCH_SB_DATA_REPLICAS_HAVE,	struct bch_sb, flags[0], 60, 64);
+/* 56-64 unused, was REPLICAS_HAVE */
 
 LE64_BITMASK(BCH_SB_STR_HASH_TYPE,	struct bch_sb, flags[1],  0,  4);
 LE64_BITMASK(BCH_SB_COMPRESSION_TYPE,	struct bch_sb, flags[1],  4,  8);
@@ -946,6 +961,7 @@ LE64_BITMASK(BCH_SB_INODE_32BIT,	struct bch_sb, flags[1],  8,  9);
 
 LE64_BITMASK(BCH_SB_128_BIT_MACS,	struct bch_sb, flags[1],  9, 10);
 LE64_BITMASK(BCH_SB_ENCRYPTION_TYPE,	struct bch_sb, flags[1], 10, 14);
+
 /* 14-20 unused, was JOURNAL_ENTRY_SIZE */
 
 LE64_BITMASK(BCH_SB_META_REPLICAS_REQ,	struct bch_sb, flags[1], 20, 24);
@@ -1002,77 +1018,6 @@ enum bch_compression_opts {
 	BCH_COMPRESSION_GZIP		= 2,
 	BCH_COMPRESSION_NR		= 3,
 };
-
-/* backing device specific stuff: */
-
-struct backingdev_sb {
-	__le64			csum;
-	__le64			offset;	/* sector where this sb was written */
-	__le64			version; /* of on disk format */
-
-	uuid_le			magic;	/* bcachefs superblock UUID */
-
-	uuid_le			disk_uuid;
-
-	/*
-	 * Internal cache set UUID - xored with various magic numbers and thus
-	 * must never change:
-	 */
-	union {
-		uuid_le		set_uuid;
-		__le64		set_magic;
-	};
-	__u8			label[BCH_SB_LABEL_SIZE];
-
-	__le64			flags;
-
-	/* Incremented each time superblock is written: */
-	__le64			seq;
-
-	/*
-	 * User visible UUID for identifying the cache set the user is allowed
-	 * to change:
-	 *
-	 * XXX hooked up?
-	 */
-	uuid_le			user_uuid;
-	__le64			pad1[6];
-
-	__le64			data_offset;
-	__le16			block_size;	/* sectors */
-	__le16			pad2[3];
-
-	__le32			last_mount;	/* time_t */
-	__le16			pad3;
-	/* size of variable length portion - always 0 for backingdev superblock */
-	__le16			u64s;
-	__u64			_data[0];
-};
-
-LE64_BITMASK(BDEV_CACHE_MODE,		struct backingdev_sb, flags, 0, 4);
-#define CACHE_MODE_WRITETHROUGH		0U
-#define CACHE_MODE_WRITEBACK		1U
-#define CACHE_MODE_WRITEAROUND		2U
-#define CACHE_MODE_NONE			3U
-
-LE64_BITMASK(BDEV_STATE,		struct backingdev_sb, flags, 61, 63);
-#define BDEV_STATE_NONE			0U
-#define BDEV_STATE_CLEAN		1U
-#define BDEV_STATE_DIRTY		2U
-#define BDEV_STATE_STALE		3U
-
-#define BDEV_DATA_START_DEFAULT		16	/* sectors */
-
-static inline _Bool __SB_IS_BDEV(__u64 version)
-{
-	return version == BCACHE_SB_VERSION_BDEV
-		|| version == BCACHE_SB_VERSION_BDEV_WITH_OFFSET;
-}
-
-static inline _Bool SB_IS_BDEV(const struct bch_sb *sb)
-{
-	return __SB_IS_BDEV(sb->version);
-}
 
 /*
  * Magic numbers

@@ -484,6 +484,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 
 	mutex_init(&c->state_lock);
 	mutex_init(&c->sb_lock);
+	mutex_init(&c->replicas_gc_lock);
 	mutex_init(&c->btree_cache_lock);
 	mutex_init(&c->bucket_lock);
 	mutex_init(&c->btree_root_lock);
@@ -603,7 +604,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 
 	mi = bch2_sb_get_members(c->disk_sb);
 	for (i = 0; i < c->sb.nr_devices; i++)
-		if (!bch2_is_zero(mi->members[i].uuid.b, sizeof(uuid_le)) &&
+		if (bch2_dev_exists(c->disk_sb, mi, i) &&
 		    bch2_dev_alloc(c, i))
 			goto err;
 
@@ -940,10 +941,7 @@ static const char *bch2_dev_in_fs(struct bch_sb *fs, struct bch_sb *sb)
 	if (uuid_le_cmp(fs->uuid, sb->uuid))
 		return "device not a member of filesystem";
 
-	if (sb->dev_idx >= newest->nr_devices)
-		return "device has invalid dev_idx";
-
-	if (bch2_is_zero(mi->members[sb->dev_idx].uuid.b, sizeof(uuid_le)))
+	if (!bch2_dev_exists(newest, mi, sb->dev_idx))
 		return "device has been removed";
 
 	if (fs->block_size != sb->block_size)
@@ -1241,44 +1239,25 @@ static int __bch2_dev_online(struct bch_fs *c, struct bcache_superblock *sb)
 
 /* Device management: */
 
-bool bch2_fs_may_start(struct bch_fs *c, int flags)
+static bool have_enough_devs(struct bch_fs *c,
+			     struct replicas_status s,
+			     unsigned flags)
 {
-	struct bch_sb_field_members *mi;
-	unsigned meta_missing = 0;
-	unsigned data_missing = 0;
-	bool degraded = false;
-	unsigned i;
-
-	mutex_lock(&c->sb_lock);
-	mi = bch2_sb_get_members(c->disk_sb);
-
-	for (i = 0; i < c->disk_sb->nr_devices; i++)
-		if (!c->devs[i] &&
-		    !bch2_is_zero(mi->members[i].uuid.b, sizeof(uuid_le))) {
-			degraded = true;
-			if (BCH_MEMBER_HAS_METADATA(&mi->members[i]))
-				meta_missing++;
-			if (BCH_MEMBER_HAS_DATA(&mi->members[i]))
-				data_missing++;
-		}
-	mutex_unlock(&c->sb_lock);
-
-	if (degraded &&
-	    !(flags & BCH_FORCE_IF_DEGRADED))
-		return false;
-
-	if (meta_missing &&
+	if ((s.replicas[BCH_DATA_JOURNAL].nr_offline ||
+	     s.replicas[BCH_DATA_BTREE].nr_offline) &&
 	    !(flags & BCH_FORCE_IF_METADATA_DEGRADED))
 		return false;
 
-	if (meta_missing >= BCH_SB_META_REPLICAS_HAVE(c->disk_sb) &&
+	if ((!s.replicas[BCH_DATA_JOURNAL].nr_online ||
+	     !s.replicas[BCH_DATA_BTREE].nr_online) &&
 	    !(flags & BCH_FORCE_IF_METADATA_LOST))
 		return false;
 
-	if (data_missing && !(flags & BCH_FORCE_IF_DATA_DEGRADED))
+	if (s.replicas[BCH_DATA_USER].nr_offline &&
+	    !(flags & BCH_FORCE_IF_DATA_DEGRADED))
 		return false;
 
-	if (data_missing >= BCH_SB_DATA_REPLICAS_HAVE(c->disk_sb) &&
+	if (!s.replicas[BCH_DATA_USER].nr_online &&
 	    !(flags & BCH_FORCE_IF_DATA_LOST))
 		return false;
 
@@ -1297,40 +1276,80 @@ bool bch2_fs_may_start(struct bch_fs *c, int flags)
 bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 			    enum bch_member_state new_state, int flags)
 {
+	struct replicas_status s;
+	struct bch_dev *ca2;
+	int i, nr_rw = 0, required;
+
 	lockdep_assert_held(&c->state_lock);
 
-	if (new_state == BCH_MEMBER_STATE_RW)
+	switch (new_state) {
+	case BCH_MEMBER_STATE_RW:
 		return true;
+	case BCH_MEMBER_STATE_RO:
+		if (ca->mi.state != BCH_MEMBER_STATE_RW)
+			return true;
 
-	if (ca->mi.state == BCH_MEMBER_STATE_FAILED)
-		return true;
+		/* do we have enough devices to write to?  */
+		for_each_member_device(ca2, c, i)
+			nr_rw += ca2->mi.state == BCH_MEMBER_STATE_RW;
 
-	/*
-	 * If the device is already offline - whatever is going on with it can't
-	 * possible make the FS need to go RO:
-	 */
-	if (!bch2_dev_is_online(ca))
-		return true;
+		required = max(!(flags & BCH_FORCE_IF_METADATA_DEGRADED)
+			       ? c->opts.metadata_replicas
+			       : c->opts.metadata_replicas_required,
+			       !(flags & BCH_FORCE_IF_DATA_DEGRADED)
+			       ? c->opts.data_replicas
+			       : c->opts.data_replicas_required);
 
-	if (ca->mi.has_data &&
-	    !(flags & BCH_FORCE_IF_DATA_DEGRADED))
-		return false;
+		return nr_rw - 1 <= required;
+	case BCH_MEMBER_STATE_FAILED:
+	case BCH_MEMBER_STATE_SPARE:
+		if (ca->mi.state != BCH_MEMBER_STATE_RW &&
+		    ca->mi.state != BCH_MEMBER_STATE_RO)
+			return true;
 
-	if (ca->mi.has_data &&
-	    c->sb.data_replicas_have <= 1 &&
-	    !(flags & BCH_FORCE_IF_DATA_LOST))
-		return false;
+		/* do we have enough devices to read from?  */
+		s = __bch2_replicas_status(c, ca);
 
-	if (ca->mi.has_metadata &&
-	    !(flags & BCH_FORCE_IF_METADATA_DEGRADED))
-		return false;
+		pr_info("replicas: j %u %u b %u %u d %u %u",
+			s.replicas[BCH_DATA_JOURNAL].nr_online,
+			s.replicas[BCH_DATA_JOURNAL].nr_offline,
 
-	if (ca->mi.has_metadata &&
-	    c->sb.meta_replicas_have <= 1 &&
-	    !(flags & BCH_FORCE_IF_METADATA_LOST))
-		return false;
+			s.replicas[BCH_DATA_BTREE].nr_online,
+			s.replicas[BCH_DATA_BTREE].nr_offline,
 
-	return true;
+			s.replicas[BCH_DATA_USER].nr_online,
+			s.replicas[BCH_DATA_USER].nr_offline);
+
+		return have_enough_devs(c, s, flags);
+	default:
+		BUG();
+	}
+}
+
+static bool bch2_fs_may_start(struct bch_fs *c, int flags)
+{
+	struct replicas_status s;
+	struct bch_sb_field_members *mi;
+	unsigned i;
+
+	if (!c->opts.degraded) {
+		mutex_lock(&c->sb_lock);
+		mi = bch2_sb_get_members(c->disk_sb);
+
+		for (i = 0; i < c->disk_sb->nr_devices; i++)
+			if (bch2_dev_exists(c->disk_sb, mi, i) &&
+			    !bch2_dev_is_online(c->devs[i]) &&
+			    (c->devs[i]->mi.state == BCH_MEMBER_STATE_RW ||
+			     c->devs[i]->mi.state == BCH_MEMBER_STATE_RO)) {
+				mutex_unlock(&c->sb_lock);
+				return false;
+			}
+		mutex_unlock(&c->sb_lock);
+	}
+
+	s = bch2_replicas_status(c);
+
+	return have_enough_devs(c, s, flags);
 }
 
 static void __bch2_dev_read_only(struct bch_fs *c, struct bch_dev *ca)
@@ -1411,7 +1430,7 @@ int bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags)
 {
 	struct bch_sb_field_members *mi;
-	unsigned dev_idx = ca->dev_idx;
+	unsigned dev_idx = ca->dev_idx, data;
 	int ret = -EINVAL;
 
 	mutex_lock(&c->state_lock);
@@ -1439,8 +1458,9 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags)
 		goto err;
 	}
 
-	if (ca->mi.has_data || ca->mi.has_metadata) {
-		bch_err(ca, "Remove failed, still has data");
+	data = bch2_dev_has_data(c, ca);
+	if (data) {
+		bch_err(ca, "Remove failed, still has data (%x)", data);
 		goto err;
 	}
 
@@ -1490,7 +1510,7 @@ int bch2_dev_add(struct bch_fs *c, const char *path)
 	if (err)
 		return -EINVAL;
 
-	err = bch2_validate_cache_super(&sb);
+	err = bch2_sb_validate(&sb);
 	if (err)
 		return -EINVAL;
 
@@ -1514,9 +1534,7 @@ int bch2_dev_add(struct bch_fs *c, const char *path)
 
 	mi = bch2_sb_get_members(c->disk_sb);
 	for (dev_idx = 0; dev_idx < BCH_SB_MEMBERS_MAX; dev_idx++)
-		if (dev_idx >= c->sb.nr_devices ||
-		    bch2_is_zero(mi->members[dev_idx].uuid.b,
-				 sizeof(uuid_le)))
+		if (!bch2_dev_exists(c->disk_sb, mi, dev_idx))
 			goto have_slot;
 no_slot:
 	err = "no slots available in superblock";
@@ -1656,6 +1674,7 @@ int bch2_dev_offline(struct bch_fs *c, struct bch_dev *ca, int flags)
 
 int bch2_dev_evacuate(struct bch_fs *c, struct bch_dev *ca)
 {
+	unsigned data;
 	int ret;
 
 	mutex_lock(&c->state_lock);
@@ -1680,8 +1699,9 @@ int bch2_dev_evacuate(struct bch_fs *c, struct bch_dev *ca)
 		return ret;
 	}
 
-	if (ca->mi.has_data || ca->mi.has_metadata) {
-		bch_err(ca, "Migrate error: data still present");
+	data = bch2_dev_has_data(c, ca);
+	if (data) {
+		bch_err(ca, "Migrate error: data still present (%x)", data);
 		return -EINVAL;
 	}
 
@@ -1714,11 +1734,7 @@ const char *bch2_fs_open(char * const *devices, unsigned nr_devices,
 		if (err)
 			goto err;
 
-		err = "attempting to register backing device";
-		if (__SB_IS_BDEV(le64_to_cpu(sb[i].sb->version)))
-			goto err;
-
-		err = bch2_validate_cache_super(&sb[i]);
+		err = bch2_sb_validate(&sb[i]);
 		if (err)
 			goto err;
 	}
@@ -1790,7 +1806,7 @@ static const char *__bch2_fs_open_incremental(struct bcache_superblock *sb,
 	struct bch_fs *c;
 	bool allocated_fs = false;
 
-	err = bch2_validate_cache_super(sb);
+	err = bch2_sb_validate(sb);
 	if (err)
 		return err;
 
@@ -1855,11 +1871,7 @@ const char *bch2_fs_open_incremental(const char *path)
 	if (err)
 		return err;
 
-	if (!__SB_IS_BDEV(le64_to_cpu(sb.sb->version)))
-		err = __bch2_fs_open_incremental(&sb, opts);
-	else
-		err = "not a bcachefs superblock";
-
+	err = __bch2_fs_open_incremental(&sb, opts);
 	bch2_free_super(&sb);
 
 	return err;

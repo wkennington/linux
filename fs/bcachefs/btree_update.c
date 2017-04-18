@@ -311,7 +311,7 @@ static struct btree *bch2_btree_node_alloc(struct bch_fs *c,
 
 	bch2_btree_build_aux_trees(b);
 
-	bch2_check_mark_super(c, &b->key, true);
+	bch2_check_mark_super(c, bkey_i_to_s_c_extent(&b->key), BCH_DATA_BTREE);
 
 	trace_btree_node_alloc(c, b);
 	return b;

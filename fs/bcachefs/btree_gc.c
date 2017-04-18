@@ -129,6 +129,8 @@ static u8 bch2_btree_mark_key(struct bch_fs *c, enum bkey_type type,
 int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 				struct bkey_s_c k)
 {
+	enum bch_data_types data_type = type == BKEY_TYPE_BTREE
+		? BCH_DATA_BTREE : BCH_DATA_USER;
 	int ret = 0;
 
 	switch (k.k->type) {
@@ -136,6 +138,15 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 	case BCH_EXTENT_CACHED: {
 		struct bkey_s_c_extent e = bkey_s_c_to_extent(k);
 		const struct bch_extent_ptr *ptr;
+
+		if (test_bit(BCH_FS_REBUILD_REPLICAS, &c->flags) ||
+		    (!c->opts.nofsck &&
+		     fsck_err_on(!bch2_sb_has_replicas(c, e, data_type), c,
+				 "superblock not marked as containing replicas"))) {
+			ret = bch2_check_mark_super(c, e, data_type);
+			if (ret)
+				return ret;
+		}
 
 		extent_for_each_ptr(e, ptr) {
 			struct bch_dev *ca = c->devs[ptr->dev];
@@ -167,6 +178,7 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 		break;
 	}
 	}
+
 
 	atomic64_set(&c->key_version,
 		     max_t(u64, k.k->version.lo,
@@ -997,6 +1009,14 @@ int bch2_initial_gc(struct bch_fs *c, struct list_head *journal)
 	unsigned iter = 0;
 	enum btree_id id;
 	int ret;
+
+	mutex_lock(&c->sb_lock);
+	if (!bch2_sb_get_replicas(c->disk_sb)) {
+		if (BCH_SB_INITIALIZED(c->disk_sb))
+			bch_info(c, "building replicas info");
+		set_bit(BCH_FS_REBUILD_REPLICAS, &c->flags);
+	}
+	mutex_unlock(&c->sb_lock);
 again:
 	bch2_gc_start(c);
 
@@ -1006,11 +1026,9 @@ again:
 			return ret;
 	}
 
-	if (journal) {
-		ret = bch2_journal_mark(c, journal);
-		if (ret)
-			return ret;
-	}
+	ret = bch2_journal_mark(c, journal);
+	if (ret)
+	return ret;
 
 	bch2_mark_metadata(c);
 
