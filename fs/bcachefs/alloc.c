@@ -60,7 +60,7 @@
  * in either lru or fifo order.
  */
 
-#include "bcache.h"
+#include "bcachefs.h"
 #include "btree.h"
 
 #include <linux/blkdev.h>

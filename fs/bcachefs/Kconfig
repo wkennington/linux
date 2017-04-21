@@ -1,5 +1,5 @@
 
-config BCACHE_FS
+config BCACHEFS_FS
 	tristate "bcachefs filesystem support"
 	depends on BLOCK
 	depends on (64BIT || LBDAF)
@@ -11,7 +11,7 @@ config BCACHE_FS
 
 config BCACHEFS_DEBUG
 	bool "bcachefs debugging"
-	depends on BCACHE_FS
+	depends on BCACHEFS_FS
 	---help---
 	Don't select this option unless you're a developer
 

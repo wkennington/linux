@@ -1,5 +1,5 @@
-#ifndef _BCACHE_H
-#define _BCACHE_H
+#ifndef _BCACHEFS_H
+#define _BCACHEFS_H
 
 /*
  * SOME HIGH LEVEL CODE DOCUMENTATION:
@@ -925,4 +925,4 @@ int bch_debug_init(struct kobject *);
 void bch_request_exit(void);
 int bch_request_init(void);
 
-#endif /* _BCACHE_H */
+#endif /* _BCACHEFS_H */

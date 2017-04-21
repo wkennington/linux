@@ -1,5 +1,5 @@
-#ifndef _LINUX_BCACHE_H
-#define _LINUX_BCACHE_H
+#ifndef _BCACHEFS_FORMAT_H
+#define _BCACHEFS_FORMAT_H
 
 /*
  * Bcache on disk data structures
@@ -371,4 +371,4 @@ struct uuid_entry_v0 {
 	__u32		pad;
 };
 
-#endif /* _LINUX_BCACHE_H */
+#endif /* _BCACHEFS_FORMAT_H */

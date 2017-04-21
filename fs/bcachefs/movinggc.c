@@ -4,7 +4,7 @@
  * Copyright 2012 Google, Inc.
  */
 
-#include "bcache.h"
+#include "bcachefs.h"
 #include "btree.h"
 #include "debug.h"
 #include "request.h"

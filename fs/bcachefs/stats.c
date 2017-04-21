@@ -4,7 +4,7 @@
  * Copyright 2012 Google, Inc.
  */
 
-#include "bcache.h"
+#include "bcachefs.h"
 #include "stats.h"
 #include "btree.h"
 #include "sysfs.h"
