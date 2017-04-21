@@ -377,7 +377,8 @@ static void bch2_fs_free(struct bch_fs *c)
 	bch2_io_clock_exit(&c->io_clock[WRITE]);
 	bch2_io_clock_exit(&c->io_clock[READ]);
 	bch2_fs_compress_exit(c);
-	bdi_destroy(&c->bdi);
+	if (c->bdi.bdi_list.next)
+		bdi_destroy(&c->bdi);
 	lg_lock_free(&c->usage_lock);
 	free_percpu(c->usage_percpu);
 	mempool_exit(&c->btree_bounce_pool);
