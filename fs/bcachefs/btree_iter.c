@@ -696,6 +696,26 @@ static inline int btree_iter_lock_root(struct btree_iter *iter,
 	}
 }
 
+noinline
+static void btree_iter_prefetch(struct btree_iter *iter)
+{
+	struct btree *b = iter->nodes[iter->level + 1];
+	struct btree_node_iter node_iter = iter->node_iters[iter->level + 1];
+	struct bkey_packed *k;
+	BKEY_PADDED(k) tmp;
+	unsigned nr = iter->level ? 1 : 8;
+
+	while (nr) {
+		bch2_btree_node_iter_advance(&node_iter, b);
+		k = bch2_btree_node_iter_peek(&node_iter, b);
+		if (!k)
+			break;
+
+		bch2_bkey_unpack(b, &tmp.k, k);
+		bch2_btree_node_prefetch(iter, &tmp.k, iter->level);
+	}
+}
+
 static inline int btree_iter_down(struct btree_iter *iter)
 {
 	struct btree *b;
@@ -713,6 +733,10 @@ static inline int btree_iter_down(struct btree_iter *iter)
 	iter->level = level;
 	mark_btree_node_locked(iter, level, lock_type);
 	btree_iter_node_set(iter, b);
+
+	if (iter->flags & BTREE_ITER_PREFETCH)
+		btree_iter_prefetch(iter);
+
 	return 0;
 }
 
