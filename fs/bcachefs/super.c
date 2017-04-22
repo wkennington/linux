@@ -573,7 +573,8 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 	    mempool_init_kmalloc_pool(&c->btree_interior_update_pool, 1,
 				      sizeof(struct btree_interior_update)) ||
 	    mempool_init_kmalloc_pool(&c->fill_iter, 1, iter_size) ||
-	    bioset_init(&c->btree_read_bio, 1, 0) ||
+	    bioset_init(&c->btree_read_bio, 1,
+			offsetof(struct btree_read_bio, bio)) ||
 	    bioset_init(&c->bio_read, 1, offsetof(struct bch_read_bio, bio)) ||
 	    bioset_init(&c->bio_read_split, 1, offsetof(struct bch_read_bio, bio)) ||
 	    bioset_init(&c->bio_write, 1, offsetof(struct bch_write_bio, bio)) ||
