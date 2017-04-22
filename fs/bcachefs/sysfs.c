@@ -512,7 +512,7 @@ STORE(bch2_fs_opts_dir)
 {
 	struct bch_fs *c = container_of(kobj, struct bch_fs, opts_dir);
 	const struct bch_option *opt;
-	enum bch_opt_id id;
+	int id;
 	u64 v;
 
 	id = bch2_parse_sysfs_opt(attr->name, buf, &v);
@@ -604,7 +604,7 @@ static unsigned bucket_priority_fn(struct bch_dev *ca, struct bucket *g,
 static unsigned bucket_sectors_used_fn(struct bch_dev *ca, struct bucket *g,
 				       void *private)
 {
-	return bucket_sectors_used(g);
+	return bucket_sectors_used(g->mark);
 }
 
 static unsigned bucket_oldest_gen_fn(struct bch_dev *ca, struct bucket *g,

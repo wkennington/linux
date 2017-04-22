@@ -93,15 +93,18 @@ static inline void kvpfree(void *p, size_t size)
 static inline void *kvpmalloc(size_t size, gfp_t gfp_mask)
 {
 	return size < PAGE_SIZE ? kmalloc(size, gfp_mask)
-		:  (void *) __get_free_pages(gfp_mask, get_order(size))
+		:  (void *) __get_free_pages(gfp_mask|__GFP_NOWARN,
+					     get_order(size))
 		?: __vmalloc(size, gfp_mask, PAGE_KERNEL);
 }
 
-#define DECLARE_HEAP(type, name)					\
-	struct {							\
-		size_t size, used;					\
-		type *data;						\
-	} name
+#define HEAP(type)							\
+struct {								\
+	size_t size, used;						\
+	type *data;							\
+}
+
+#define DECLARE_HEAP(type, name) HEAP(type) name
 
 #define init_heap(heap, _size, gfp)					\
 ({									\
@@ -119,45 +122,61 @@ do {									\
 
 #define heap_swap(h, i, j)	swap((h)->data[i], (h)->data[j])
 
-#define heap_sift(h, i, cmp)						\
-do {									\
-	size_t _r, _j = i;						\
-									\
-	for (; _j * 2 + 1 < (h)->used; _j = _r) {			\
-		_r = _j * 2 + 1;					\
-		if (_r + 1 < (h)->used &&				\
-		    cmp((h)->data[_r], (h)->data[_r + 1]))		\
-			_r++;						\
-									\
-		if (cmp((h)->data[_r], (h)->data[_j]))			\
-			break;						\
-		heap_swap(h, _r, _j);					\
-	}								\
-} while (0)
+#define heap_peek(h)							\
+({									\
+	EBUG_ON(!(h)->used);						\
+	(h)->data[0];							\
+})
+
+#define heap_full(h)	((h)->used == (h)->size)
 
 #define heap_sift_down(h, i, cmp)					\
 do {									\
+	size_t _c, _j = i;						\
+									\
+	for (; _j * 2 + 1 < (h)->used; _j = _c) {			\
+		_c = _j * 2 + 1;					\
+		if (_c + 1 < (h)->used &&				\
+		    cmp(h, (h)->data[_c], (h)->data[_c + 1]) >= 0)	\
+			_c++;						\
+									\
+		if (cmp(h, (h)->data[_c], (h)->data[_j]) >= 0)		\
+			break;						\
+		heap_swap(h, _c, _j);					\
+	}								\
+} while (0)
+
+#define heap_sift_up(h, i, cmp)						\
+do {									\
 	while (i) {							\
 		size_t p = (i - 1) / 2;					\
-		if (cmp((h)->data[i], (h)->data[p]))			\
+		if (cmp(h, (h)->data[i], (h)->data[p]) >= 0)		\
 			break;						\
 		heap_swap(h, i, p);					\
 		i = p;							\
 	}								\
 } while (0)
 
-#define heap_add(h, d, cmp)						\
+#define heap_add(h, new, cmp)						\
 ({									\
 	bool _r = !heap_full(h);					\
 	if (_r) {							\
 		size_t _i = (h)->used++;				\
-		(h)->data[_i] = d;					\
+		(h)->data[_i] = new;					\
 									\
-		heap_sift_down(h, _i, cmp);				\
-		heap_sift(h, _i, cmp);					\
+		heap_sift_up(h, _i, cmp);				\
 	}								\
 	_r;								\
 })
+
+#define heap_add_or_replace(h, new, cmp)				\
+do {									\
+	if (!heap_add(h, new, cmp) &&					\
+	    cmp(h, new, heap_peek(h)) >= 0) {				\
+		(h)->data[0] = new;					\
+		heap_sift_down(h, 0, cmp);				\
+	}								\
+} while (0)
 
 #define heap_del(h, i, cmp)						\
 do {									\
@@ -166,8 +185,8 @@ do {									\
 	BUG_ON(_i >= (h)->used);					\
 	(h)->used--;							\
 	heap_swap(h, _i, (h)->used);					\
+	heap_sift_up(h, _i, cmp);					\
 	heap_sift_down(h, _i, cmp);					\
-	heap_sift(h, _i, cmp);						\
 } while (0)
 
 #define heap_pop(h, d, cmp)						\
@@ -180,19 +199,11 @@ do {									\
 	_r;								\
 })
 
-#define heap_peek(h)							\
-({									\
-	EBUG_ON(!(h)->used);						\
-	(h)->data[0];							\
-})
-
-#define heap_full(h)	((h)->used == (h)->size)
-
 #define heap_resort(heap, cmp)						\
 do {									\
 	ssize_t _i;							\
 	for (_i = (ssize_t) (heap)->used / 2 -  1; _i >= 0; --_i)	\
-		heap_sift(heap, _i, cmp);				\
+		heap_sift_down(heap, _i, cmp);				\
 } while (0)
 
 /*
@@ -749,5 +760,7 @@ static inline struct bio_vec next_contig_bvec(struct bio *bio,
 
 #define bio_for_each_contig_segment(bv, bio, iter)			\
 	__bio_for_each_contig_segment(bv, bio, iter, (bio)->bi_iter)
+
+size_t bch_scnmemcpy(char *, size_t, const char *, size_t);
 
 #endif /* _BCACHE_UTIL_H */
