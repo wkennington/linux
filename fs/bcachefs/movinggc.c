@@ -95,7 +95,8 @@ static void read_moving(struct bch_dev *ca, size_t buckets_to_move,
 	bch2_ratelimit_reset(&ca->moving_gc_pd.rate);
 	bch2_move_ctxt_init(&ctxt, &ca->moving_gc_pd.rate,
 				SECTORS_IN_FLIGHT_PER_DEVICE);
-	bch2_btree_iter_init(&iter, c, BTREE_ID_EXTENTS, POS_MIN);
+	bch2_btree_iter_init(&iter, c, BTREE_ID_EXTENTS, POS_MIN,
+			     BTREE_ITER_PREFETCH);
 
 	while (1) {
 		if (kthread_should_stop())

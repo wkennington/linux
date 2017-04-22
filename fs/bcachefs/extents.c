@@ -1432,11 +1432,12 @@ stop:
 			   gc_pos_btree_node(b));
 
 	EBUG_ON(bkey_cmp(iter->pos, s->committed));
-	EBUG_ON((bkey_cmp(iter->pos, b->key.k.p) == 0) != iter->at_end_of_leaf);
+	EBUG_ON((bkey_cmp(iter->pos, b->key.k.p) == 0) !=
+		!!(iter->flags & BTREE_ITER_AT_END_OF_LEAF));
 
 	bch2_cut_front(iter->pos, insert);
 
-	if (insert->k.size && iter->at_end_of_leaf)
+	if (insert->k.size && (iter->flags & BTREE_ITER_AT_END_OF_LEAF))
 		ret = BTREE_INSERT_NEED_TRAVERSE;
 
 	EBUG_ON(insert->k.size && ret == BTREE_INSERT_OK);
@@ -1595,9 +1596,10 @@ stop:
 
 	EBUG_ON(bkey_cmp(iter->pos, bkey_start_pos(&insert->k->k)));
 	EBUG_ON(bkey_cmp(iter->pos, s.committed));
-	EBUG_ON((bkey_cmp(iter->pos, b->key.k.p) == 0) != iter->at_end_of_leaf);
+	EBUG_ON((bkey_cmp(iter->pos, b->key.k.p) == 0) !=
+		!!(iter->flags & BTREE_ITER_AT_END_OF_LEAF));
 
-	if (insert->k->k.size && iter->at_end_of_leaf)
+	if (insert->k->k.size && (iter->flags & BTREE_ITER_AT_END_OF_LEAF))
 		ret = BTREE_INSERT_NEED_TRAVERSE;
 
 	EBUG_ON(insert->k->k.size && ret == BTREE_INSERT_OK);
