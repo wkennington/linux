@@ -54,8 +54,9 @@ static int bch2_migrate_index_update(struct bch_write_op *op)
 	struct btree_iter iter;
 	int ret = 0;
 
-	bch2_btree_iter_init_intent(&iter, c, BTREE_ID_EXTENTS,
-		bkey_start_pos(&bch2_keylist_front(keys)->k));
+	bch2_btree_iter_init(&iter, c, BTREE_ID_EXTENTS,
+			     bkey_start_pos(&bch2_keylist_front(keys)->k),
+			     BTREE_ITER_INTENT);
 
 	while (1) {
 		struct bkey_s_extent insert =
