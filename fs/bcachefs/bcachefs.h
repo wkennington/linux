@@ -414,6 +414,7 @@ struct bch_dev {
 
 	atomic_long_t		saturated_count;
 	size_t			inc_gen_needs_gc;
+	size_t			inc_gen_really_needs_gc;
 
 	bucket_heap		alloc_heap;
 	bucket_heap		copygc_heap;
@@ -678,6 +679,7 @@ struct bch_fs {
 	/* GARBAGE COLLECTION */
 	struct task_struct	*gc_thread;
 	atomic_t		kick_gc;
+	unsigned long		gc_count;
 
 	/*
 	 * Tracks GC's progress - everything in the range [ZERO_KEY..gc_cur_pos]

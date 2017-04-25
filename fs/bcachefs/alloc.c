@@ -469,9 +469,9 @@ fsck_err:
  * If there aren't enough available buckets to fill up free_inc, wait until
  * there are.
  */
-static int wait_buckets_available(struct bch_dev *ca)
+static int wait_buckets_available(struct bch_fs *c, struct bch_dev *ca)
 {
-	struct bch_fs *c = ca->fs;
+	unsigned long gc_count = c->gc_count;
 	int ret = 0;
 
 	while (1) {
@@ -481,27 +481,18 @@ static int wait_buckets_available(struct bch_dev *ca)
 			break;
 		}
 
-		if (ca->inc_gen_needs_gc >= fifo_free(&ca->free_inc)) {
-			if (c->gc_thread) {
-				trace_gc_cannot_inc_gens(ca->fs);
-				atomic_inc(&c->kick_gc);
-				wake_up_process(ca->fs->gc_thread);
-			}
+		if (gc_count != c->gc_count)
+			ca->inc_gen_really_needs_gc = 0;
 
-			/*
-			 * We are going to wait for GC to wake us up, even if
-			 * bucket counters tell us enough buckets are available,
-			 * because we are actually waiting for GC to rewrite
-			 * nodes with stale pointers
-			 */
-		} else if (dev_buckets_available(ca) >=
-			   fifo_free(&ca->free_inc))
+		if ((ssize_t) (dev_buckets_available(ca) -
+			       ca->inc_gen_really_needs_gc) >=
+		    (ssize_t) fifo_free(&ca->free_inc))
 			break;
 
-		up_read(&ca->fs->gc_lock);
+		up_read(&c->gc_lock);
 		schedule();
 		try_to_freeze();
-		down_read(&ca->fs->gc_lock);
+		down_read(&c->gc_lock);
 	}
 
 	__set_current_state(TASK_RUNNING);
@@ -639,8 +630,11 @@ static bool bch2_can_invalidate_bucket(struct bch_dev *ca, struct bucket *g,
 	if (!is_available_bucket(mark))
 		return false;
 
-	if (bucket_gc_gen(ca, g) >= BUCKET_GC_GEN_MAX - 1)
+	if (bucket_gc_gen(ca, g) >= BUCKET_GC_GEN_MAX / 2)
 		ca->inc_gen_needs_gc++;
+
+	if (bucket_gc_gen(ca, g) >= BUCKET_GC_GEN_MAX)
+		ca->inc_gen_really_needs_gc++;
 
 	return can_inc_bucket_gen(ca, g);
 }
@@ -790,6 +784,7 @@ static void invalidate_buckets_random(struct bch_dev *ca)
 static void invalidate_buckets(struct bch_dev *ca)
 {
 	ca->inc_gen_needs_gc = 0;
+	ca->inc_gen_really_needs_gc = 0;
 
 	switch (ca->mi.replacement) {
 	case CACHE_REPLACEMENT_LRU:
@@ -923,27 +918,10 @@ static int bch2_allocator_thread(void *arg)
 			__set_current_state(TASK_RUNNING);
 		}
 
-		down_read(&c->gc_lock);
-
-		/*
-		 * See if we have buckets we can reuse without invalidating them
-		 * or forcing a journal commit:
-		 */
-		//bch2_find_empty_buckets(c, ca);
-
-		if (fifo_used(&ca->free_inc) * 2 > ca->free_inc.size) {
-			up_read(&c->gc_lock);
-			continue;
-		}
-
 		/* We've run out of free buckets! */
 
-		while (!fifo_full(&ca->free_inc)) {
-			if (wait_buckets_available(ca)) {
-				up_read(&c->gc_lock);
-				goto out;
-			}
-
+		down_read(&c->gc_lock);
+		while (1) {
 			/*
 			 * Find some buckets that we can invalidate, either
 			 * they're completely unused, or only contain clean data
@@ -952,10 +930,24 @@ static int bch2_allocator_thread(void *arg)
 			 */
 
 			invalidate_buckets(ca);
-			trace_alloc_batch(ca, fifo_used(&ca->free_inc),
-						 ca->free_inc.size);
-		}
 
+			trace_alloc_batch(ca, fifo_used(&ca->free_inc),
+					  ca->free_inc.size);
+
+			if (ca->inc_gen_needs_gc >= fifo_free(&ca->free_inc) &&
+			    c->gc_thread) {
+				atomic_inc(&c->kick_gc);
+				wake_up_process(c->gc_thread);
+			}
+
+			if (fifo_full(&ca->free_inc))
+				break;
+
+			if (wait_buckets_available(c, ca)) {
+				up_read(&c->gc_lock);
+				goto out;
+			}
+		}
 		up_read(&c->gc_lock);
 
 		/*
