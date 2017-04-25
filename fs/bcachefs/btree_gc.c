@@ -835,7 +835,6 @@ static int bch2_coalesce_btree(struct bch_fs *c, enum btree_id btree_id)
  */
 void bch2_coalesce(struct bch_fs *c)
 {
-	u64 start_time;
 	enum btree_id id;
 
 	if (test_bit(BCH_FS_GC_FAILURE, &c->flags))
@@ -843,7 +842,6 @@ void bch2_coalesce(struct bch_fs *c)
 
 	down_read(&c->gc_lock);
 	trace_gc_coalesce_start(c);
-	start_time = local_clock();
 
 	for (id = 0; id < BTREE_ID_NR; id++) {
 		int ret = c->btree_roots[id].b
@@ -858,7 +856,6 @@ void bch2_coalesce(struct bch_fs *c)
 		}
 	}
 
-	bch2_time_stats_update(&c->btree_coalesce_time, start_time);
 	trace_gc_coalesce_end(c);
 	up_read(&c->gc_lock);
 }
@@ -873,9 +870,7 @@ static int bch2_gc_thread(void *arg)
 	set_freezable();
 
 	while (1) {
-		unsigned long next = last + c->capacity / 16;
-
-		while (atomic_long_read(&clock->now) < next) {
+		while (1) {
 			set_current_state(TASK_INTERRUPTIBLE);
 
 			if (kthread_should_stop()) {
@@ -883,21 +878,28 @@ static int bch2_gc_thread(void *arg)
 				return 0;
 			}
 
-			if (atomic_read(&c->kick_gc) != last_kick) {
-				__set_current_state(TASK_RUNNING);
+			if (atomic_read(&c->kick_gc) != last_kick)
 				break;
+
+			if (c->btree_gc_periodic) {
+				unsigned long next = last + c->capacity / 16;
+
+				if (atomic_long_read(&clock->now) >= next)
+					break;
+
+				bch2_io_clock_schedule_timeout(clock, next);
+			} else {
+				schedule();
 			}
 
-			bch2_io_clock_schedule_timeout(clock, next);
 			try_to_freeze();
 		}
+		__set_current_state(TASK_RUNNING);
 
 		last = atomic_long_read(&clock->now);
 		last_kick = atomic_read(&c->kick_gc);
 
 		bch2_gc(c);
-		if (!btree_gc_coalesce_disabled(c))
-			bch2_coalesce(c);
 
 		debug_check_no_locks_held();
 	}
