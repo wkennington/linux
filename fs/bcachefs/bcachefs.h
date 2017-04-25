@@ -240,8 +240,6 @@ do {									\
 		"btree node it traverses")				\
 	BCH_DEBUG_PARAM(btree_gc_rewrite_disabled,			\
 		"Disables rewriting of btree nodes during mark and sweep")\
-	BCH_DEBUG_PARAM(btree_gc_coalesce_disabled,			\
-		"Disables coalescing of btree nodes")			\
 	BCH_DEBUG_PARAM(btree_shrinker_disabled,			\
 		"Disables the shrinker callback for the btree node cache")
 
@@ -273,7 +271,6 @@ do {									\
 #define BCH_TIME_STATS()						\
 	BCH_TIME_STAT(btree_node_mem_alloc,	sec, us)		\
 	BCH_TIME_STAT(btree_gc,			sec, ms)		\
-	BCH_TIME_STAT(btree_coalesce,		sec, ms)		\
 	BCH_TIME_STAT(btree_split,		sec, us)		\
 	BCH_TIME_STAT(btree_sort,		ms, us)			\
 	BCH_TIME_STAT(btree_read,		ms, us)			\
@@ -762,6 +759,7 @@ struct bch_fs {
 	/* The rest of this all shows up in sysfs */
 	atomic_long_t		read_realloc_races;
 
+	unsigned		btree_gc_periodic:1;
 	unsigned		foreground_write_ratelimit_enabled:1;
 	unsigned		copy_gc_enabled:1;
 	unsigned		tiering_enabled:1;
