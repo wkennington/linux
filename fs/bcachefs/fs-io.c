@@ -757,7 +757,7 @@ static void bchfs_read(struct bch_fs *c, struct btree_iter *iter,
 			flags |= BCH_READ_IS_LAST;
 
 		if (pick.ca) {
-			PTR_BUCKET(pick.ca, &pick.ptr)->read_prio =
+			PTR_BUCKET(pick.ca, &pick.ptr)->prio[READ] =
 				c->prio_clock[READ].hand;
 
 			bch2_read_extent(c, rbio, k, &pick, flags);
