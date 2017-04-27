@@ -1144,7 +1144,7 @@ static int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 		       movinggc_reserve, GFP_KERNEL) ||
 	    !init_fifo(&ca->free[RESERVE_NONE], reserve_none, GFP_KERNEL) ||
 	    !init_fifo(&ca->free_inc,	free_inc_reserve, GFP_KERNEL) ||
-	    !init_heap(&ca->alloc_heap,	heap_size, GFP_KERNEL) ||
+	    !init_heap(&ca->alloc_heap,	free_inc_reserve, GFP_KERNEL) ||
 	    !init_heap(&ca->copygc_heap,heap_size, GFP_KERNEL) ||
 	    !(ca->oldest_gens	= kvpmalloc(ca->mi.nbuckets *
 					    sizeof(u8),
