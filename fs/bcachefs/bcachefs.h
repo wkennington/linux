@@ -416,7 +416,7 @@ struct bch_dev {
 	size_t			inc_gen_needs_gc;
 	size_t			inc_gen_really_needs_gc;
 
-	bucket_heap		alloc_heap;
+	alloc_heap		alloc_heap;
 	bucket_heap		copygc_heap;
 
 	/* Moving GC: */
