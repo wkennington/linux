@@ -279,7 +279,7 @@ int bch2_prio_write(struct bch_dev *ca)
 		struct prio_set *p = ca->disk_buckets;
 		struct bucket_disk *d = p->data;
 		struct bucket_disk *end = d + prios_per_bucket(ca);
-		size_t r;
+		long r;
 
 		for (r = i * prios_per_bucket(ca);
 		     r < ca->mi.nbuckets && d < end;
@@ -295,8 +295,8 @@ int bch2_prio_write(struct bch_dev *ca)
 		get_random_bytes(&p->nonce, sizeof(p->nonce));
 
 		spin_lock(&ca->prio_buckets_lock);
-		r = bch2_bucket_alloc(ca, RESERVE_PRIO);
-		BUG_ON(!r);
+		r = bch2_bucket_alloc(c, ca, RESERVE_PRIO);
+		BUG_ON(r < 0);
 
 		/*
 		 * goes here before dropping prio_buckets_lock to guard against
@@ -652,15 +652,13 @@ static bool bch2_can_invalidate_bucket(struct bch_dev *ca, struct bucket *g,
 static void bch2_invalidate_one_bucket(struct bch_dev *ca, struct bucket *g)
 {
 	spin_lock(&ca->freelist_lock);
+	if (bch2_invalidate_bucket(ca, g)) {
+		g->prio[READ] = ca->fs->prio_clock[READ].hand;
+		g->prio[WRITE] = ca->fs->prio_clock[WRITE].hand;
 
-	bch2_invalidate_bucket(ca, g);
-
-	g->prio[READ] = ca->fs->prio_clock[READ].hand;
-	g->prio[WRITE] = ca->fs->prio_clock[WRITE].hand;
-
-	verify_not_on_freelist(ca, g - ca->buckets);
-	BUG_ON(!fifo_push(&ca->free_inc, g - ca->buckets));
-
+		verify_not_on_freelist(ca, g - ca->buckets);
+		BUG_ON(!fifo_push(&ca->free_inc, g - ca->buckets));
+	}
 	spin_unlock(&ca->freelist_lock);
 }
 
@@ -839,35 +837,6 @@ static bool bch2_allocator_push(struct bch_dev *ca, long bucket)
 	return ret;
 }
 
-static void bch2_find_empty_buckets(struct bch_fs *c, struct bch_dev *ca)
-{
-	u16 last_seq_ondisk = c->journal.last_seq_ondisk;
-	struct bucket *g;
-
-	for_each_bucket(g, ca) {
-		struct bucket_mark m = READ_ONCE(g->mark);
-
-		if (is_available_bucket(m) &&
-		    !m.cached_sectors &&
-		    !m.had_metadata &&
-		    !bucket_needs_journal_commit(m, last_seq_ondisk)) {
-			spin_lock(&ca->freelist_lock);
-
-			bch2_mark_alloc_bucket(ca, g, true);
-			g->prio[READ] = c->prio_clock[READ].hand;
-			g->prio[WRITE] = c->prio_clock[WRITE].hand;
-
-			verify_not_on_freelist(ca, g - ca->buckets);
-			BUG_ON(!fifo_push(&ca->free_inc, g - ca->buckets));
-
-			spin_unlock(&ca->freelist_lock);
-
-			if (fifo_full(&ca->free_inc))
-				break;
-		}
-	}
-}
-
 static int size_t_cmp(const void *_l, const void *_r)
 {
 	const size_t *l = _l, *r = _r;
@@ -891,8 +860,6 @@ static int bch2_allocator_thread(void *arg)
 	int ret;
 
 	set_freezable();
-
-	bch2_find_empty_buckets(c, ca);
 
 	while (1) {
 		/*
@@ -938,6 +905,11 @@ static int bch2_allocator_thread(void *arg)
 		ca->free_inc.front = ca->free_inc.back = 0;
 
 		down_read(&c->gc_lock);
+		if (test_bit(BCH_FS_GC_FAILURE, &c->flags)) {
+			up_read(&c->gc_lock);
+			goto out;
+		}
+
 		while (1) {
 			/*
 			 * Find some buckets that we can invalidate, either
@@ -1002,6 +974,8 @@ static int bch2_allocator_thread(void *arg)
 			spin_unlock(&ca->freelist_lock);
 			goto out;
 		}
+
+		ca->alloc_thread_started = true;
 	}
 out:
 	/*
@@ -1014,14 +988,37 @@ out:
 
 /* Allocation */
 
+static long bch2_bucket_alloc_startup(struct bch_fs *c, struct bch_dev *ca)
+{
+	struct bucket *g;
+	long r = -1;
+
+	if (!down_read_trylock(&c->gc_lock))
+		return r;
+
+	if (test_bit(BCH_FS_GC_FAILURE, &c->flags))
+		goto out;
+
+	for_each_bucket(g, ca)
+		if (!g->mark.touched_this_mount &&
+		    is_available_bucket(g->mark) &&
+		    bch2_mark_alloc_bucket_startup(ca, g)) {
+			r = g - ca->buckets;
+			break;
+		}
+out:
+	up_read(&c->gc_lock);
+	return r;
+}
+
 /**
  * bch_bucket_alloc - allocate a single bucket from a specific device
  *
  * Returns index of bucket on success, 0 on failure
  * */
-size_t bch2_bucket_alloc(struct bch_dev *ca, enum alloc_reserve reserve)
+long bch2_bucket_alloc(struct bch_fs *c, struct bch_dev *ca,
+		       enum alloc_reserve reserve)
 {
-	struct bucket *g;
 	long r;
 
 	spin_lock(&ca->freelist_lock);
@@ -1031,21 +1028,24 @@ size_t bch2_bucket_alloc(struct bch_dev *ca, enum alloc_reserve reserve)
 
 	spin_unlock(&ca->freelist_lock);
 
+	if (unlikely(!ca->alloc_thread_started) &&
+	    (r = bch2_bucket_alloc_startup(c, ca)) >= 0) {
+		verify_not_on_freelist(ca, r);
+		goto out2;
+	}
+
 	trace_bucket_alloc_fail(ca, reserve);
-	return 0;
+	return -1;
 out:
 	verify_not_on_freelist(ca, r);
 	spin_unlock(&ca->freelist_lock);
 
-	trace_bucket_alloc(ca, reserve);
-
 	bch2_wake_allocator(ca);
+out2:
+	ca->buckets[r].prio[READ]	= c->prio_clock[READ].hand;
+	ca->buckets[r].prio[WRITE]	= c->prio_clock[WRITE].hand;
 
-	g = ca->buckets + r;
-
-	g->prio[READ] = ca->fs->prio_clock[READ].hand;
-	g->prio[WRITE] = ca->fs->prio_clock[WRITE].hand;
-
+	trace_bucket_alloc(ca, reserve);
 	return r;
 }
 
@@ -1116,7 +1116,7 @@ static enum bucket_alloc_ret bch2_bucket_alloc_group(struct bch_fs *c,
 
 	while (ob->nr_ptrs < nr_replicas) {
 		struct bch_dev *ca;
-		u64 bucket;
+		long bucket;
 
 		if (!available) {
 			ret = NO_DEVICES;
@@ -1139,8 +1139,8 @@ static enum bucket_alloc_ret bch2_bucket_alloc_group(struct bch_fs *c,
 		    get_random_int() > devs->d[i].weight)
 			continue;
 
-		bucket = bch2_bucket_alloc(ca, reserve);
-		if (!bucket) {
+		bucket = bch2_bucket_alloc(c, ca, reserve);
+		if (bucket < 0) {
 			if (fail_idx == -1)
 				fail_idx = i;
 			continue;
@@ -1725,10 +1725,9 @@ set_capacity:
 	closure_wake_up(&c->freelist_wait);
 }
 
-static void bch2_stop_write_point(struct bch_dev *ca,
-				 struct write_point *wp)
+static void bch2_stop_write_point(struct bch_fs *c, struct bch_dev *ca,
+				  struct write_point *wp)
 {
-	struct bch_fs *c = ca->fs;
 	struct open_bucket *ob;
 	struct bch_extent_ptr *ptr;
 
@@ -1750,9 +1749,8 @@ found:
 	bch2_open_bucket_put(c, ob);
 }
 
-static bool bch2_dev_has_open_write_point(struct bch_dev *ca)
+static bool bch2_dev_has_open_write_point(struct bch_fs *c, struct bch_dev *ca)
 {
-	struct bch_fs *c = ca->fs;
 	struct bch_extent_ptr *ptr;
 	struct open_bucket *ob;
 
@@ -1796,13 +1794,13 @@ void bch2_dev_allocator_remove(struct bch_fs *c, struct bch_dev *ca)
 
 	/* Next, close write points that point to this device... */
 	for (i = 0; i < ARRAY_SIZE(c->write_points); i++)
-		bch2_stop_write_point(ca, &c->write_points[i]);
+		bch2_stop_write_point(c, ca, &c->write_points[i]);
 
-	bch2_stop_write_point(ca, &ca->copygc_write_point);
-	bch2_stop_write_point(ca, &c->promote_write_point);
-	bch2_stop_write_point(ca, &ca->tiering_write_point);
-	bch2_stop_write_point(ca, &c->migration_write_point);
-	bch2_stop_write_point(ca, &c->btree_write_point);
+	bch2_stop_write_point(c, ca, &ca->copygc_write_point);
+	bch2_stop_write_point(c, ca, &c->promote_write_point);
+	bch2_stop_write_point(c, ca, &ca->tiering_write_point);
+	bch2_stop_write_point(c, ca, &c->migration_write_point);
+	bch2_stop_write_point(c, ca, &c->btree_write_point);
 
 	mutex_lock(&c->btree_reserve_cache_lock);
 	while (c->btree_reserve_cache_nr) {
@@ -1830,7 +1828,7 @@ void bch2_dev_allocator_remove(struct bch_fs *c, struct bch_dev *ca)
 	while (1) {
 		closure_wait(&c->open_buckets_wait, &cl);
 
-		if (!bch2_dev_has_open_write_point(ca)) {
+		if (!bch2_dev_has_open_write_point(c, ca)) {
 			closure_wake_up(&c->open_buckets_wait);
 			break;
 		}

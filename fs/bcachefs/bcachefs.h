@@ -401,6 +401,7 @@ struct bch_dev {
 	DECLARE_FIFO(long, free)[RESERVE_NR];
 	DECLARE_FIFO(long, free_inc);
 	spinlock_t		freelist_lock;
+	bool			alloc_thread_started;
 
 	size_t			fifo_last_bucket;
 

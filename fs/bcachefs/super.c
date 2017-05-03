@@ -689,10 +689,10 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 	const char *err = "cannot allocate memory";
 	struct bch_sb_field_members *mi;
 	struct bch_dev *ca;
-	unsigned i, id;
 	time64_t now;
 	LIST_HEAD(journal);
 	struct jset *j;
+	unsigned i;
 	int ret = -EINVAL;
 
 	BUG_ON(c->state != BCH_FS_STARTING);
@@ -725,21 +725,21 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 			}
 		}
 
-		for (id = 0; id < BTREE_ID_NR; id++) {
+		for (i = 0; i < BTREE_ID_NR; i++) {
 			unsigned level;
 			struct bkey_i *k;
 
 			err = "bad btree root";
-			k = bch2_journal_find_btree_root(c, j, id, &level);
-			if (!k && id == BTREE_ID_EXTENTS)
+			k = bch2_journal_find_btree_root(c, j, i, &level);
+			if (!k && i == BTREE_ID_EXTENTS)
 				goto err;
 			if (!k) {
-				pr_debug("missing btree root: %d", id);
+				pr_debug("missing btree root: %d", i);
 				continue;
 			}
 
 			err = "error reading btree root";
-			if (bch2_btree_root_read(c, id, k, level))
+			if (bch2_btree_root_read(c, i, k, level))
 				goto err;
 		}
 
@@ -813,6 +813,11 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 				goto err;
 			}
 
+		err = "cannot allocate new btree root";
+		for (i = 0; i < BTREE_ID_NR; i++)
+			if (bch2_btree_root_alloc(c, i, &cl))
+				goto err;
+
 		/*
 		 * journal_res_get() will crash if called before this has
 		 * set up the journal.pin FIFO and journal.cur pointer:
@@ -824,13 +829,6 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 		for_each_rw_member(ca, c, i)
 			if (bch2_dev_allocator_start(ca)) {
 				percpu_ref_put(&ca->io_ref);
-				goto err;
-			}
-
-		err = "cannot allocate new btree root";
-		for (id = 0; id < BTREE_ID_NR; id++)
-			if (bch2_btree_root_alloc(c, id, &cl)) {
-				closure_sync(&cl);
 				goto err;
 			}
 
@@ -1016,7 +1014,7 @@ static void __bch2_dev_offline(struct bch_dev *ca)
 
 	lockdep_assert_held(&c->state_lock);
 
-	__bch2_dev_read_only(ca->fs, ca);
+	__bch2_dev_read_only(c, ca);
 
 	reinit_completion(&ca->offline_complete);
 	percpu_ref_kill(&ca->io_ref);
@@ -1066,7 +1064,7 @@ static int bch2_dev_sysfs_online(struct bch_dev *ca)
 		return 0;
 
 	if (!ca->kobj.state_in_sysfs) {
-		ret = kobject_add(&ca->kobj, &ca->fs->kobj,
+		ret = kobject_add(&ca->kobj, &c->kobj,
 				  "dev-%u", ca->dev_idx);
 		if (ret)
 			return ret;
@@ -1237,7 +1235,7 @@ static int __bch2_dev_online(struct bch_fs *c, struct bcache_superblock *sb)
 
 	lg_local_lock(&c->usage_lock);
 	if (!gc_will_visit(c, gc_phase(GC_PHASE_SB_METADATA)))
-		bch2_mark_dev_metadata(ca->fs, ca);
+		bch2_mark_dev_metadata(c, ca);
 	lg_local_unlock(&c->usage_lock);
 
 	percpu_ref_reinit(&ca->io_ref);
@@ -1505,6 +1503,7 @@ err:
 	return ret;
 }
 
+/* Add new device to running filesystem: */
 int bch2_dev_add(struct bch_fs *c, const char *path)
 {
 	struct bcache_superblock sb;
@@ -1614,6 +1613,7 @@ err:
 	return ret ?: -EINVAL;
 }
 
+/* Hot add existing device to running filesystem: */
 int bch2_dev_online(struct bch_fs *c, const char *path)
 {
 	struct bcache_superblock sb = { 0 };

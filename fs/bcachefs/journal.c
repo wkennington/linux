@@ -1614,8 +1614,8 @@ static int bch2_set_nr_journal_buckets(struct bch_fs *c, struct bch_dev *ca,
 
 	while (ja->nr < nr) {
 		/* must happen under journal lock, to avoid racing with gc: */
-		u64 b = bch2_bucket_alloc(ca, RESERVE_NONE);
-		if (!b) {
+		long b = bch2_bucket_alloc(c, ca, RESERVE_NONE);
+		if (b < 0) {
 			if (!closure_wait(&c->freelist_wait, &cl)) {
 				spin_unlock(&j->lock);
 				closure_sync(&cl);

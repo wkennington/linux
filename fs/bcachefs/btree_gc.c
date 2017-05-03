@@ -486,10 +486,6 @@ void bch2_gc(struct bch_fs *c)
 	 *    move around - if references move backwards in the ordering GC
 	 *    uses, GC could skip past them
 	 */
-
-	if (test_bit(BCH_FS_GC_FAILURE, &c->flags))
-		return;
-
 	trace_gc_start(c);
 
 	/*
@@ -499,6 +495,8 @@ void bch2_gc(struct bch_fs *c)
 	bch2_recalc_sectors_available(c);
 
 	down_write(&c->gc_lock);
+	if (test_bit(BCH_FS_GC_FAILURE, &c->flags))
+		goto out;
 
 	bch2_gc_start(c);
 
@@ -514,8 +512,7 @@ void bch2_gc(struct bch_fs *c)
 		if (ret) {
 			bch_err(c, "btree gc failed: %d", ret);
 			set_bit(BCH_FS_GC_FAILURE, &c->flags);
-			up_write(&c->gc_lock);
-			return;
+			goto out;
 		}
 
 		gc_pos_set(c, gc_phase(c->gc_pos.phase + 1));
@@ -530,7 +527,7 @@ void bch2_gc(struct bch_fs *c)
 	/* Indicates that gc is no longer in progress: */
 	gc_pos_set(c, gc_phase(GC_PHASE_DONE));
 	c->gc_count++;
-
+out:
 	up_write(&c->gc_lock);
 	trace_gc_end(c);
 	bch2_time_stats_update(&c->btree_gc_time, start_time);
@@ -541,6 +538,12 @@ void bch2_gc(struct bch_fs *c)
 	 */
 	for_each_member_device(ca, c, i)
 		bch2_wake_allocator(ca);
+
+	/*
+	 * At startup, allocations can happen directly instead of via the
+	 * allocator thread - issue wakeup in case they blocked on gc_lock:
+	 */
+	closure_wake_up(&c->freelist_wait);
 }
 
 /* Btree coalescing */
