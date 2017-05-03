@@ -306,12 +306,13 @@ static void bch2_dev_usage_update(struct bch_dev *ca,
 	_old;							\
 })
 
-bool bch2_invalidate_bucket(struct bch_dev *ca, struct bucket *g)
+bool bch2_invalidate_bucket(struct bch_dev *ca, struct bucket *g,
+			    struct bucket_mark *old)
 {
 	struct bch_fs_usage stats = { 0 };
-	struct bucket_mark old, new;
+	struct bucket_mark new;
 
-	old = bucket_data_cmpxchg(ca, g, new, ({
+	*old = bucket_data_cmpxchg(ca, g, new, ({
 		if (!is_available_bucket(new))
 			return false;
 
@@ -324,11 +325,11 @@ bool bch2_invalidate_bucket(struct bch_dev *ca, struct bucket *g)
 	}));
 
 	/* XXX: we're not actually updating fs usage's cached sectors... */
-	bch2_fs_usage_update(&stats, old, new);
+	bch2_fs_usage_update(&stats, *old, new);
 
-	if (!old.owned_by_allocator && old.cached_sectors)
+	if (!old->owned_by_allocator && old->cached_sectors)
 		trace_invalidate(ca, g - ca->buckets,
-					old.cached_sectors);
+					old->cached_sectors);
 	return true;
 }
 

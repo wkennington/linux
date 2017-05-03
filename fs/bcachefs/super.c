@@ -689,11 +689,15 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 	const char *err = "cannot allocate memory";
 	struct bch_sb_field_members *mi;
 	struct bch_dev *ca;
-	time64_t now;
 	LIST_HEAD(journal);
 	struct jset *j;
+	struct closure cl;
+	u64 journal_seq = 0;
+	time64_t now;
 	unsigned i;
 	int ret = -EINVAL;
+
+	closure_init_stack(&cl);
 
 	BUG_ON(c->state != BCH_FS_STARTING);
 
@@ -716,32 +720,27 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 		c->prio_clock[READ].hand = le16_to_cpu(j->read_clock);
 		c->prio_clock[WRITE].hand = le16_to_cpu(j->write_clock);
 
-		err = "error reading priorities";
-		for_each_readable_member(ca, c, i) {
-			ret = bch2_prio_read(ca);
-			if (ret) {
-				percpu_ref_put(&ca->io_ref);
-				goto err;
-			}
-		}
-
 		for (i = 0; i < BTREE_ID_NR; i++) {
 			unsigned level;
 			struct bkey_i *k;
 
-			err = "bad btree root";
+			err = "missing btree root";
 			k = bch2_journal_find_btree_root(c, j, i, &level);
-			if (!k && i == BTREE_ID_EXTENTS)
+			if (!k && i < BTREE_ID_ALLOC)
 				goto err;
-			if (!k) {
-				pr_debug("missing btree root: %d", i);
+
+			if (!k)
 				continue;
-			}
 
 			err = "error reading btree root";
 			if (bch2_btree_root_read(c, i, k, level))
 				goto err;
 		}
+
+		err = "error reading allocation information";
+		ret = bch2_alloc_read(c, &journal);
+		if (ret)
+			goto err;
 
 		bch_verbose(c, "starting mark and sweep:");
 		err = "error in recovery";
@@ -752,6 +751,14 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 
 		if (c->opts.noreplay)
 			goto recovery_done;
+
+		err = "cannot allocate new btree root";
+		for (i = 0; i < BTREE_ID_NR; i++)
+			if (!c->btree_roots[i].b &&
+			    bch2_btree_root_alloc(c, i, &cl))
+				goto err;
+
+		closure_sync(&cl);
 
 		/*
 		 * bch2_journal_start() can't happen sooner, or btree_gc_finish()
@@ -785,20 +792,18 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 		bch_verbose(c, "fsck done");
 
 		for_each_rw_member(ca, c, i)
-			if (ca->need_prio_write) {
-				ret = bch2_prio_write(ca);
+			if (ca->need_alloc_write) {
+				ret = bch2_alloc_write(c, ca, &journal_seq);
 				if (ret) {
 					percpu_ref_put(&ca->io_ref);
 					goto err;
 				}
 			}
 
+		bch2_journal_flush_seq(&c->journal, journal_seq);
 	} else {
 		struct bch_inode_unpacked inode;
 		struct bkey_inode_buf packed_inode;
-		struct closure cl;
-
-		closure_init_stack(&cl);
 
 		bch_notice(c, "initializing new filesystem");
 
@@ -883,6 +888,8 @@ out:
 	bch2_journal_entries_free(&journal);
 	return err;
 err:
+	closure_sync(&cl);
+
 	switch (ret) {
 	case BCH_FSCK_ERRORS_NOT_FIXED:
 		bch_err(c, "filesystem contains errors: please report this to the developers");
@@ -984,9 +991,6 @@ static void bch2_dev_free(struct bch_dev *ca)
 	free_percpu(ca->sectors_written);
 	bioset_exit(&ca->replica_set);
 	free_percpu(ca->usage_percpu);
-	kvpfree(ca->disk_buckets, bucket_bytes(ca));
-	kfree(ca->prio_buckets);
-	kfree(ca->bio_prio);
 	kvpfree(ca->buckets,	 ca->mi.nbuckets * sizeof(struct bucket));
 	kvpfree(ca->oldest_gens, ca->mi.nbuckets * sizeof(u8));
 	free_heap(&ca->copygc_heap);
@@ -1090,7 +1094,7 @@ static int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 	struct bch_member *member;
 	size_t reserve_none, movinggc_reserve, free_inc_reserve, total_reserve;
 	size_t heap_size;
-	unsigned i;
+	unsigned i, btree_node_reserve_buckets;
 	struct bch_dev *ca;
 
 	if (bch2_fs_init_fault("dev_alloc"))
@@ -1110,8 +1114,6 @@ static int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 	ca->dev_idx = dev_idx;
 
 	spin_lock_init(&ca->freelist_lock);
-	spin_lock_init(&ca->prio_buckets_lock);
-	mutex_init(&ca->prio_write_lock);
 	bch2_dev_moving_gc_init(ca);
 
 	INIT_WORK(&ca->io_error_work, bch2_nonfatal_io_error_work);
@@ -1137,12 +1139,16 @@ static int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 	free_inc_reserve = movinggc_reserve / 2;
 	heap_size = movinggc_reserve * 8;
 
+	btree_node_reserve_buckets =
+		DIV_ROUND_UP(BTREE_NODE_RESERVE,
+			     ca->mi.bucket_size / c->sb.btree_node_size);
+
 	if (percpu_ref_init(&ca->ref, bch2_dev_ref_release,
 			    0, GFP_KERNEL) ||
 	    percpu_ref_init(&ca->io_ref, bch2_dev_io_ref_release,
 			    PERCPU_REF_INIT_DEAD, GFP_KERNEL) ||
-	    !init_fifo(&ca->free[RESERVE_PRIO], prio_buckets(ca), GFP_KERNEL) ||
-	    !init_fifo(&ca->free[RESERVE_BTREE], BTREE_NODE_RESERVE, GFP_KERNEL) ||
+	    !init_fifo(&ca->free[RESERVE_BTREE], btree_node_reserve_buckets,
+		       GFP_KERNEL) ||
 	    !init_fifo(&ca->free[RESERVE_MOVINGGC],
 		       movinggc_reserve, GFP_KERNEL) ||
 	    !init_fifo(&ca->free[RESERVE_NONE], reserve_none, GFP_KERNEL) ||
@@ -1155,17 +1161,11 @@ static int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 	    !(ca->buckets	= kvpmalloc(ca->mi.nbuckets *
 					    sizeof(struct bucket),
 					    GFP_KERNEL|__GFP_ZERO)) ||
-	    !(ca->prio_buckets	= kzalloc(sizeof(u64) * prio_buckets(ca) *
-					  2, GFP_KERNEL)) ||
-	    !(ca->disk_buckets	= kvpmalloc(bucket_bytes(ca), GFP_KERNEL)) ||
 	    !(ca->usage_percpu = alloc_percpu(struct bch_dev_usage)) ||
-	    !(ca->bio_prio = bio_kmalloc(GFP_NOIO, bucket_pages(ca))) ||
 	    bioset_init(&ca->replica_set, 4,
 			offsetof(struct bch_write_bio, bio)) ||
 	    !(ca->sectors_written = alloc_percpu(*ca->sectors_written)))
 		goto err;
-
-	ca->prio_last_buckets = ca->prio_buckets + prio_buckets(ca);
 
 	total_reserve = ca->free_inc.size;
 	for (i = 0; i < RESERVE_NR; i++)
@@ -1237,6 +1237,20 @@ static int __bch2_dev_online(struct bch_fs *c, struct bcache_superblock *sb)
 	if (!gc_will_visit(c, gc_phase(GC_PHASE_SB_METADATA)))
 		bch2_mark_dev_metadata(c, ca);
 	lg_local_unlock(&c->usage_lock);
+
+	if (ca->mi.state == BCH_MEMBER_STATE_RW) {
+		struct bch_sb_field_journal *journal_buckets =
+			bch2_sb_get_journal(ca->disk_sb.sb);
+		bool has_journal =
+			bch2_nr_journal_buckets(journal_buckets) >=
+			BCH_JOURNAL_BUCKETS_MIN;
+
+		bch2_dev_group_add(&c->tiers[ca->mi.tier].devs, ca);
+		bch2_dev_group_add(&c->all_devs, ca);
+
+		if (has_journal)
+			bch2_dev_group_add(&c->journal.devs, ca);
+	}
 
 	percpu_ref_reinit(&ca->io_ref);
 	return 0;
@@ -1471,14 +1485,6 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags)
 		goto err;
 	}
 
-	/*
-	 * Ok, really doing the remove:
-	 * Drop device's prio pointer before removing it from superblock:
-	 */
-	spin_lock(&c->journal.lock);
-	c->journal.prio_buckets[dev_idx] = 0;
-	spin_unlock(&c->journal.lock);
-
 	bch2_journal_meta(&c->journal);
 
 	__bch2_dev_offline(ca);
@@ -1620,7 +1626,6 @@ int bch2_dev_online(struct bch_fs *c, const char *path)
 	struct bch_dev *ca;
 	unsigned dev_idx;
 	const char *err;
-	int ret;
 
 	mutex_lock(&c->state_lock);
 
@@ -1643,12 +1648,6 @@ int bch2_dev_online(struct bch_fs *c, const char *path)
 	mutex_unlock(&c->sb_lock);
 
 	ca = c->devs[dev_idx];
-	ret = bch2_prio_read(ca);
-	if (ret) {
-		err = "error reading priorities";
-		goto err;
-	}
-
 	if (ca->mi.state == BCH_MEMBER_STATE_RW) {
 		err = __bch2_dev_read_write(c, ca);
 		if (err)

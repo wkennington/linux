@@ -305,7 +305,7 @@ do {									\
 	(btree_reserve_required_nodes(BTREE_MAX_DEPTH) + GC_MERGE_NODES)
 
 /* Size of the freelist we allocate btree nodes from: */
-#define BTREE_NODE_RESERVE		(BTREE_RESERVE_MAX * 2)
+#define BTREE_NODE_RESERVE		(BTREE_RESERVE_MAX * 4)
 
 struct btree;
 struct crypto_blkcipher;
@@ -373,21 +373,7 @@ struct bch_dev {
 
 	struct task_struct	*alloc_thread;
 
-	struct prio_set		*disk_buckets;
-
-	/*
-	 * When allocating new buckets, prio_write() gets first dibs - since we
-	 * may not be allocate at all without writing priorities and gens.
-	 * prio_last_buckets[] contains the last buckets we wrote priorities to
-	 * (so gc can mark them as metadata).
-	 */
-	u64			*prio_buckets;
-	u64			*prio_last_buckets;
-	spinlock_t		prio_buckets_lock;
-	struct bio		*bio_prio;
-	bool			prio_read_done;
-	bool			need_prio_write;
-	struct mutex		prio_write_lock;
+	bool			need_alloc_write;
 
 	/*
 	 * free: Buckets that are ready to be used
@@ -426,6 +412,8 @@ struct bch_dev {
 	atomic_long_t		saturated_count;
 	size_t			inc_gen_needs_gc;
 	size_t			inc_gen_really_needs_gc;
+	u64			allocator_journal_seq_flush;
+	bool			allocator_invalidating_data;
 
 	alloc_heap		alloc_heap;
 	bucket_heap		copygc_heap;

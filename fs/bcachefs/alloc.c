@@ -75,7 +75,6 @@
 #include <linux/sort.h>
 #include <trace/events/bcachefs.h>
 
-static void __bch2_bucket_free(struct bch_dev *, struct bucket *);
 static void bch2_recalc_min_prio(struct bch_dev *, int);
 
 /* Allocation groups: */
@@ -206,268 +205,244 @@ static void pd_controllers_update(struct work_struct *work)
 			      c->pd_controllers_update_seconds * HZ);
 }
 
-/*
- * Bucket priorities/gens:
- *
- * For each bucket, we store on disk its
-   * 8 bit gen
-   * 16 bit priority
- *
- * See alloc.c for an explanation of the gen. The priority is used to implement
- * lru (and in the future other) cache replacement policies; for most purposes
- * it's just an opaque integer.
- *
- * The gens and the priorities don't have a whole lot to do with each other, and
- * it's actually the gens that must be written out at specific times - it's no
- * big deal if the priorities don't get written, if we lose them we just reuse
- * buckets in suboptimal order.
- *
- * On disk they're stored in a packed array, and in as many buckets are required
- * to fit them all. The buckets we use to store them form a list; the journal
- * header points to the first bucket, the first bucket points to the second
- * bucket, et cetera.
- *
- * This code is used by the allocation code; periodically (whenever it runs out
- * of buckets to allocate from) the allocation code will invalidate some
- * buckets, but it can't use those buckets until their new gens are safely on
- * disk.
- */
-
-static int prio_io(struct bch_dev *ca, uint64_t bucket, int op)
+static unsigned bch_alloc_val_u64s(const struct bch_alloc *a)
 {
-	bio_init(ca->bio_prio, ca->bio_prio->bi_inline_vecs, bucket_pages(ca));
-	ca->bio_prio->bi_opf		= op|REQ_SYNC|REQ_META;
-	ca->bio_prio->bi_iter.bi_sector	= bucket * ca->mi.bucket_size;
-	ca->bio_prio->bi_bdev		= ca->disk_sb.bdev;
-	ca->bio_prio->bi_iter.bi_size	= bucket_bytes(ca);
-	bch2_bio_map(ca->bio_prio, ca->disk_buckets);
+	unsigned bytes = offsetof(struct bch_alloc, data);
 
-	return submit_bio_wait(ca->bio_prio);
+	if (a->fields & (1 << BCH_ALLOC_FIELD_READ_TIME))
+		bytes += 2;
+	if (a->fields & (1 << BCH_ALLOC_FIELD_WRITE_TIME))
+		bytes += 2;
+
+	return DIV_ROUND_UP(bytes, sizeof(u64));
 }
 
-static struct nonce prio_nonce(struct prio_set *p)
+static const char *bch2_alloc_invalid(const struct bch_fs *c,
+				      struct bkey_s_c k)
 {
-	return (struct nonce) {{
-		[0] = 0,
-		[1] = p->nonce[0],
-		[2] = p->nonce[1],
-		[3] = p->nonce[2]^BCH_NONCE_PRIO,
-	}};
+	if (k.k->p.inode >= c->sb.nr_devices ||
+	    !c->devs[k.k->p.inode])
+		return "invalid device";
+
+	switch (k.k->type) {
+	case BCH_ALLOC: {
+		struct bkey_s_c_alloc a = bkey_s_c_to_alloc(k);
+
+		if (bch_alloc_val_u64s(a.v) != bkey_val_u64s(a.k))
+			return "incorrect value size";
+		break;
+	}
+	default:
+		return "invalid type";
+	}
+
+	return NULL;
 }
 
-int bch2_prio_write(struct bch_dev *ca)
+static void bch2_alloc_to_text(struct bch_fs *c, char *buf,
+			       size_t size, struct bkey_s_c k)
 {
-	struct bch_fs *c = ca->fs;
-	struct journal *j = &c->journal;
-	struct journal_res res = { 0 };
-	bool need_new_journal_entry;
-	int i, ret = 0;
+	buf[0] = '\0';
 
-	if (c->opts.nochanges)
+	switch (k.k->type) {
+	case BCH_ALLOC:
+		break;
+	}
+}
+
+const struct bkey_ops bch2_bkey_alloc_ops = {
+	.key_invalid	= bch2_alloc_invalid,
+	.val_to_text	= bch2_alloc_to_text,
+};
+
+static inline unsigned get_alloc_field(const u8 **p, unsigned bytes)
+{
+	unsigned v;
+
+	switch (bytes) {
+	case 1:
+		v = **p;
+		break;
+	case 2:
+		v = le16_to_cpup((void *) *p);
+		break;
+	case 4:
+		v = le32_to_cpup((void *) *p);
+		break;
+	default:
+		BUG();
+	}
+
+	*p += bytes;
+	return v;
+}
+
+static inline void put_alloc_field(u8 **p, unsigned bytes, unsigned v)
+{
+	switch (bytes) {
+	case 1:
+		**p = v;
+		break;
+	case 2:
+		*((__le16 *) *p) = cpu_to_le16(v);
+		break;
+	case 4:
+		*((__le32 *) *p) = cpu_to_le32(v);
+		break;
+	default:
+		BUG();
+	}
+
+	*p += bytes;
+}
+
+static void bch2_alloc_read_key(struct bch_fs *c, struct bkey_s_c k)
+{
+	struct bch_dev *ca;
+	struct bkey_s_c_alloc a;
+	struct bucket_mark new;
+	struct bucket *g;
+	const u8 *d;
+
+	if (k.k->type != BCH_ALLOC)
+		return;
+
+	a = bkey_s_c_to_alloc(k);
+	ca = c->devs[a.k->p.inode];
+
+	if (a.k->p.offset >= ca->mi.nbuckets)
+		return;
+
+	g = ca->buckets + a.k->p.offset;
+	bucket_cmpxchg(g, new, ({
+		new.gen = a.v->gen;
+		new.gen_valid = 1;
+	}));
+
+	d = a.v->data;
+	if (a.v->fields & (1 << BCH_ALLOC_FIELD_READ_TIME))
+		g->prio[READ] = get_alloc_field(&d, 2);
+	if (a.v->fields & (1 << BCH_ALLOC_FIELD_WRITE_TIME))
+		g->prio[WRITE] = get_alloc_field(&d, 2);
+}
+
+int bch2_alloc_read(struct bch_fs *c, struct list_head *journal_replay_list)
+{
+	struct journal_replay *r;
+	struct btree_iter iter;
+	struct bkey_s_c k;
+	int ret;
+
+	if (!c->btree_roots[BTREE_ID_ALLOC].b)
 		return 0;
 
-	mutex_lock(&ca->prio_write_lock);
-	trace_prio_write_start(ca);
-
-	ca->need_prio_write = false;
-
-	atomic64_add(ca->mi.bucket_size * prio_buckets(ca),
-		     &ca->meta_sectors_written);
-
-	for (i = prio_buckets(ca) - 1; i >= 0; --i) {
-		struct bucket *g;
-		struct prio_set *p = ca->disk_buckets;
-		struct bucket_disk *d = p->data;
-		struct bucket_disk *end = d + prios_per_bucket(ca);
-		long r;
-
-		for (r = i * prios_per_bucket(ca);
-		     r < ca->mi.nbuckets && d < end;
-		     r++, d++) {
-			g = ca->buckets + r;
-			d->prio[READ] = cpu_to_le16(g->prio[READ]);
-			d->prio[WRITE] = cpu_to_le16(g->prio[WRITE]);
-			d->gen = ca->buckets[r].mark.gen;
-		}
-
-		p->next_bucket	= cpu_to_le64(ca->prio_buckets[i + 1]);
-		p->magic	= cpu_to_le64(pset_magic(c));
-		get_random_bytes(&p->nonce, sizeof(p->nonce));
-
-		spin_lock(&ca->prio_buckets_lock);
-		r = bch2_bucket_alloc(c, ca, RESERVE_PRIO);
-		BUG_ON(r < 0);
-
-		/*
-		 * goes here before dropping prio_buckets_lock to guard against
-		 * it getting gc'd from under us
-		 */
-		ca->prio_buckets[i] = r;
-		bch2_mark_metadata_bucket(ca, ca->buckets + r,
-					 BUCKET_PRIOS, false);
-		spin_unlock(&ca->prio_buckets_lock);
-
-		SET_PSET_CSUM_TYPE(p, bch2_meta_checksum_type(c));
-
-		bch2_encrypt(c, PSET_CSUM_TYPE(p),
-			    prio_nonce(p),
-			    p->encrypted_start,
-			    bucket_bytes(ca) -
-			    offsetof(struct prio_set, encrypted_start));
-
-		p->csum	 = bch2_checksum(c, PSET_CSUM_TYPE(p),
-					prio_nonce(p),
-					(void *) p + sizeof(p->csum),
-					bucket_bytes(ca) - sizeof(p->csum));
-
-		ret = prio_io(ca, r, REQ_OP_WRITE);
-		if (bch2_dev_fatal_io_err_on(ret, ca,
-					  "prio write to bucket %zu", r) ||
-		    bch2_meta_write_fault("prio"))
-			goto err;
+	for_each_btree_key(&iter, c, BTREE_ID_ALLOC, POS_MIN, 0, k) {
+		bch2_alloc_read_key(c, k);
+		bch2_btree_iter_cond_resched(&iter);
 	}
 
-	spin_lock(&j->lock);
-	j->prio_buckets[ca->dev_idx] = cpu_to_le64(ca->prio_buckets[0]);
-	j->nr_prio_buckets = max_t(unsigned,
-				   ca->dev_idx + 1,
-				   j->nr_prio_buckets);
-	spin_unlock(&j->lock);
+	ret = bch2_btree_iter_unlock(&iter);
+	if (ret)
+		return ret;
+
+	list_for_each_entry(r, journal_replay_list, list) {
+		struct bkey_i *k, *n;
+		struct jset_entry *entry;
+
+		for_each_jset_key(k, n, entry, &r->j)
+			if (entry->btree_id == BTREE_ID_ALLOC)
+				bch2_alloc_read_key(c, bkey_i_to_s_c(k));
+	}
+
+	return 0;
+}
+
+static int __bch2_alloc_write_key(struct bch_fs *c, struct bch_dev *ca,
+				  struct bucket *g, struct btree_iter *iter,
+				  u64 *journal_seq)
+{
+	struct bucket_mark m = READ_ONCE(g->mark);
+	__BKEY_PADDED(k, DIV_ROUND_UP(sizeof(struct bch_alloc), 8)) alloc_key;
+	struct bkey_i_alloc *a;
+	u8 *d;
+	int ret;
+
+	bch2_btree_iter_set_pos(iter, POS(ca->dev_idx, g - ca->buckets));
 
 	do {
-		unsigned u64s = jset_u64s(0);
-
-		if (!test_bit(JOURNAL_STARTED, &c->journal.flags))
+		ret = bch2_btree_iter_traverse(iter);
+		if (ret)
 			break;
 
-		ret = bch2_journal_res_get(j, &res, u64s, u64s);
-		if (ret)
-			goto err;
+		a = bkey_alloc_init(&alloc_key.k);
+		a->k.p		= iter->pos;
+		a->v.fields	= 0;
+		a->v.gen	= m.gen;
+		set_bkey_val_u64s(&a->k, bch_alloc_val_u64s(&a->v));
 
-		need_new_journal_entry = j->buf[res.idx].nr_prio_buckets <
-			ca->dev_idx + 1;
-		bch2_journal_res_put(j, &res);
+		d = a->v.data;
+		if (a->v.fields & (1 << BCH_ALLOC_FIELD_READ_TIME))
+			put_alloc_field(&d, 2, g->prio[READ]);
+		if (a->v.fields & (1 << BCH_ALLOC_FIELD_WRITE_TIME))
+			put_alloc_field(&d, 2, g->prio[WRITE]);
 
-		ret = bch2_journal_flush_seq(j, res.seq);
-		if (ret)
-			goto err;
-	} while (need_new_journal_entry);
+		bch2_btree_iter_set_pos(iter, a->k.p);
+		ret = bch2_btree_insert_at(c, NULL, NULL, journal_seq,
+					   BTREE_INSERT_ATOMIC|
+					   BTREE_INSERT_NOFAIL|
+					   BTREE_INSERT_USE_RESERVE|
+					   BTREE_INSERT_USE_ALLOC_RESERVE|
+					   BTREE_INSERT_NOWAIT,
+					   BTREE_INSERT_ENTRY(iter, &a->k_i));
+		bch2_btree_iter_cond_resched(iter);
+	} while (ret == -EINTR);
 
-	/*
-	 * Don't want the old priorities to get garbage collected until after we
-	 * finish writing the new ones, and they're journalled
-	 */
-
-	spin_lock(&ca->prio_buckets_lock);
-
-	for (i = 0; i < prio_buckets(ca); i++) {
-		if (ca->prio_last_buckets[i])
-			__bch2_bucket_free(ca,
-				&ca->buckets[ca->prio_last_buckets[i]]);
-
-		ca->prio_last_buckets[i] = ca->prio_buckets[i];
-	}
-
-	spin_unlock(&ca->prio_buckets_lock);
-
-	trace_prio_write_end(ca);
-err:
-	mutex_unlock(&ca->prio_write_lock);
 	return ret;
 }
 
-int bch2_prio_read(struct bch_dev *ca)
+int bch2_alloc_replay_key(struct bch_fs *c, struct bpos pos)
 {
-	struct bch_fs *c = ca->fs;
-	struct prio_set *p = ca->disk_buckets;
-	struct bucket_disk *d = p->data + prios_per_bucket(ca), *end = d;
-	struct bucket_mark new;
-	struct bch_csum csum;
-	unsigned bucket_nr = 0;
-	u64 bucket, expect, got;
-	size_t b;
+	struct bch_dev *ca;
+	struct bucket *g;
+	struct btree_iter iter;
+	int ret;
+
+	lockdep_assert_held(&c->state_lock);
+
+	if (pos.inode >= c->sb.nr_devices || !c->devs[pos.inode])
+		return 0;
+
+	ca = c->devs[pos.inode];
+
+	if (pos.offset >= ca->mi.nbuckets)
+		return 0;
+
+	g = ca->buckets + pos.offset;
+
+	bch2_btree_iter_init(&iter, c, BTREE_ID_ALLOC, POS_MIN,
+			     BTREE_ITER_INTENT);
+
+	ret = __bch2_alloc_write_key(c, ca, g, &iter, NULL);
+	bch2_btree_iter_unlock(&iter);
+	return ret;
+}
+
+int bch2_alloc_write(struct bch_fs *c, struct bch_dev *ca, u64 *journal_seq)
+{
+	struct btree_iter iter;
+	struct bucket *g;
 	int ret = 0;
 
-	if (ca->prio_read_done)
-		return 0;
+	bch2_btree_iter_init(&iter, c, BTREE_ID_ALLOC, POS_MIN,
+			     BTREE_ITER_INTENT);
 
-	ca->prio_read_done = true;
-
-	spin_lock(&c->journal.lock);
-	bucket = le64_to_cpu(c->journal.prio_buckets[ca->dev_idx]);
-	spin_unlock(&c->journal.lock);
-
-	/*
-	 * If the device hasn't been used yet, there won't be a prio bucket ptr
-	 */
-	if (!bucket)
-		return 0;
-
-	if (mustfix_fsck_err_on(bucket < ca->mi.first_bucket ||
-				bucket >= ca->mi.nbuckets, c,
-				"bad prio bucket %llu", bucket))
-		return 0;
-
-	for (b = 0; b < ca->mi.nbuckets; b++, d++) {
-		if (d == end) {
-			ca->prio_last_buckets[bucket_nr] = bucket;
-			bucket_nr++;
-
-			ret = prio_io(ca, bucket, REQ_OP_READ) ||
-				bch2_meta_read_fault("prio");
-
-			if (mustfix_fsck_err_on(ret, c,
-					"IO error reading bucket gens (%i)",
-					ret))
-				return 0;
-
-			got = le64_to_cpu(p->magic);
-			expect = pset_magic(c);
-			if (mustfix_fsck_err_on(got != expect, c,
-					"bad magic (got %llu expect %llu) while reading prios from bucket %llu",
-					got, expect, bucket))
-				return 0;
-
-			if (mustfix_fsck_err_on(PSET_CSUM_TYPE(p) >= BCH_CSUM_NR, c,
-					"prio bucket with unknown csum type %llu bucket %lluu",
-					PSET_CSUM_TYPE(p), bucket))
-				return 0;
-
-			csum = bch2_checksum(c, PSET_CSUM_TYPE(p),
-					    prio_nonce(p),
-					    (void *) p + sizeof(p->csum),
-					    bucket_bytes(ca) - sizeof(p->csum));
-			if (fsck_err_on(bch2_crc_cmp(csum, p->csum), c,
-					"bad checksum reading prios from bucket %llu",
-					bucket))
-				return 0;
-
-			bch2_encrypt(c, PSET_CSUM_TYPE(p),
-				    prio_nonce(p),
-				    p->encrypted_start,
-				    bucket_bytes(ca) -
-				    offsetof(struct prio_set, encrypted_start));
-
-			bucket = le64_to_cpu(p->next_bucket);
-			d = p->data;
-		}
-
-		ca->buckets[b].prio[READ] = le16_to_cpu(d->prio[READ]);
-		ca->buckets[b].prio[WRITE] = le16_to_cpu(d->prio[WRITE]);
-
-		bucket_cmpxchg(&ca->buckets[b], new, ({
-			new.gen = d->gen;
-			new.gen_valid = 1;
-		}));
+	for_each_bucket(g, ca) {
+		ret = __bch2_alloc_write_key(c, ca, g, &iter, journal_seq);
+		if (ret)
+			break;
 	}
 
-	mutex_lock(&c->bucket_lock);
-	bch2_recalc_min_prio(ca, READ);
-	bch2_recalc_min_prio(ca, WRITE);
-	mutex_unlock(&c->bucket_lock);
-
-	ret = 0;
-fsck_err:
+	bch2_btree_iter_unlock(&iter);
 	return ret;
 }
 
@@ -515,9 +490,6 @@ static void verify_not_on_freelist(struct bch_dev *ca, size_t bucket)
 		size_t iter;
 		long i;
 		unsigned j;
-
-		for (iter = 0; iter < prio_buckets(ca) * 2; iter++)
-			BUG_ON(ca->prio_buckets[iter] == bucket);
 
 		for (j = 0; j < RESERVE_NR; j++)
 			fifo_for_each_entry(i, &ca->free[j], iter)
@@ -651,15 +623,37 @@ static bool bch2_can_invalidate_bucket(struct bch_dev *ca, struct bucket *g,
 
 static void bch2_invalidate_one_bucket(struct bch_dev *ca, struct bucket *g)
 {
-	spin_lock(&ca->freelist_lock);
-	if (bch2_invalidate_bucket(ca, g)) {
-		g->prio[READ] = ca->fs->prio_clock[READ].hand;
-		g->prio[WRITE] = ca->fs->prio_clock[WRITE].hand;
+	struct bch_fs *c = ca->fs;
+	struct bucket_mark m;
 
-		verify_not_on_freelist(ca, g - ca->buckets);
-		BUG_ON(!fifo_push(&ca->free_inc, g - ca->buckets));
+	spin_lock(&ca->freelist_lock);
+	if (!bch2_invalidate_bucket(ca, g, &m)) {
+		spin_unlock(&ca->freelist_lock);
+		return;
 	}
+
+	verify_not_on_freelist(ca, g - ca->buckets);
+	BUG_ON(!fifo_push(&ca->free_inc, g - ca->buckets));
 	spin_unlock(&ca->freelist_lock);
+
+	g->prio[READ] = c->prio_clock[READ].hand;
+	g->prio[WRITE] = c->prio_clock[WRITE].hand;
+
+	if (m.cached_sectors) {
+		ca->allocator_invalidating_data = true;
+	} else if (m.journal_seq_valid) {
+		u64 journal_seq = atomic64_read(&c->journal.seq);
+		u64 bucket_seq	= journal_seq;
+
+		bucket_seq &= ~((u64) U16_MAX);
+		bucket_seq |= m.journal_seq;
+
+		if (bucket_seq > journal_seq)
+			bucket_seq -= 1 << 16;
+
+		ca->allocator_journal_seq_flush =
+			max(ca->allocator_journal_seq_flush, bucket_seq);
+	}
 }
 
 /*
@@ -684,11 +678,23 @@ static unsigned long bucket_sort_key(struct bch_dev *ca,
 				     struct bucket *g,
 				     struct bucket_mark m)
 {
+	/*
+	 * Time since last read, scaled to [0, 8) where larger value indicates
+	 * more recently read data:
+	 */
 	unsigned long hotness =
 		(g->prio[READ]			- ca->min_prio[READ]) * 7 /
 		(ca->fs->prio_clock[READ].hand	- ca->min_prio[READ]);
 
-	return (((hotness + 1) * bucket_sectors_used(m)) << 8) |
+	/* How much we want to keep the data in this bucket: */
+	unsigned long data_wantness =
+		(hotness + 1) * bucket_sectors_used(m);
+
+	unsigned long needs_journal_commit =
+		    bucket_needs_journal_commit(m, ca->fs->journal.last_seq_ondisk);
+
+	return  (data_wantness << 9) |
+		(needs_journal_commit << 8) |
 		bucket_gc_gen(ca, g);
 }
 
@@ -788,8 +794,8 @@ static void invalidate_buckets_random(struct bch_dev *ca)
 
 static void invalidate_buckets(struct bch_dev *ca)
 {
-	ca->inc_gen_needs_gc = 0;
-	ca->inc_gen_really_needs_gc = 0;
+	ca->inc_gen_needs_gc			= 0;
+	ca->inc_gen_really_needs_gc		= 0;
 
 	switch (ca->mi.replacement) {
 	case CACHE_REPLACEMENT_LRU:
@@ -804,44 +810,82 @@ static void invalidate_buckets(struct bch_dev *ca)
 	}
 }
 
-static bool __bch2_allocator_push(struct bch_dev *ca, long bucket)
-{
-	if (fifo_push(&ca->free[RESERVE_PRIO], bucket))
-		goto success;
-
-	if (fifo_push(&ca->free[RESERVE_MOVINGGC], bucket))
-		goto success;
-
-	if (fifo_push(&ca->free[RESERVE_BTREE], bucket))
-		goto success;
-
-	if (fifo_push(&ca->free[RESERVE_NONE], bucket))
-		goto success;
-
-	return false;
-success:
-	closure_wake_up(&ca->fs->freelist_wait);
-	return true;
-}
-
-static bool bch2_allocator_push(struct bch_dev *ca, long bucket)
-{
-	bool ret;
-
-	spin_lock(&ca->freelist_lock);
-	ret = __bch2_allocator_push(ca, bucket);
-	if (ret)
-		fifo_pop(&ca->free_inc, bucket);
-	spin_unlock(&ca->freelist_lock);
-
-	return ret;
-}
-
 static int size_t_cmp(const void *_l, const void *_r)
 {
 	const size_t *l = _l, *r = _r;
 
 	return (*l > *r) - (*l < *r);
+}
+
+static int bch2_invalidate_free_inc(struct bch_fs *c, struct bch_dev *ca,
+				    u64 *journal_seq)
+{
+	struct btree_iter iter;
+	unsigned nr_invalidated = 0;
+	size_t b, i;
+	int ret = 0;
+
+	bch2_btree_iter_init(&iter, c, BTREE_ID_ALLOC, POS(ca->dev_idx, 0),
+			     BTREE_ITER_INTENT);
+
+	fifo_for_each_entry(b, &ca->free_inc, i) {
+		ret = __bch2_alloc_write_key(c, ca, ca->buckets + b,
+					     &iter, journal_seq);
+		if (ret)
+			break;
+
+		nr_invalidated++;
+	}
+
+	bch2_btree_iter_unlock(&iter);
+	return nr_invalidated ?: ret;
+}
+
+/*
+ * Given an invalidated, ready to use bucket: issue a discard to it if enabled,
+ * then add it to the freelist, waiting until there's room if necessary:
+ */
+static void discard_invalidated_bucket(struct bch_dev *ca, long bucket)
+{
+	if (ca->mi.discard &&
+	    blk_queue_discard(bdev_get_queue(ca->disk_sb.bdev)))
+		blkdev_issue_discard(ca->disk_sb.bdev,
+				     bucket_to_sector(ca, bucket),
+				     ca->mi.bucket_size, GFP_NOIO, 0);
+
+
+	while (1) {
+		bool pushed = false;
+		unsigned i;
+
+		set_current_state(TASK_INTERRUPTIBLE);
+
+		/*
+		 * Don't remove from free_inc until after it's added to
+		 * freelist, so gc can find it:
+		 */
+		spin_lock(&ca->freelist_lock);
+		for (i = 0; i < RESERVE_NR; i++)
+			if (fifo_push(&ca->free[i], bucket)) {
+				fifo_pop(&ca->free_inc, bucket);
+				closure_wake_up(&ca->fs->freelist_wait);
+				pushed = true;
+				break;
+			}
+		spin_unlock(&ca->freelist_lock);
+
+		if (pushed)
+			break;
+
+		if (kthread_should_stop()) {
+			__set_current_state(TASK_RUNNING);
+			break;
+		}
+		schedule();
+		try_to_freeze();
+	}
+
+	__set_current_state(TASK_RUNNING);
 }
 
 /**
@@ -856,53 +900,19 @@ static int bch2_allocator_thread(void *arg)
 {
 	struct bch_dev *ca = arg;
 	struct bch_fs *c = ca->fs;
-	long bucket;
+	size_t bucket;
 	int ret;
 
 	set_freezable();
 
-	while (1) {
-		/*
-		 * First, we pull buckets off of the free_inc list, possibly
-		 * issue discards to them, then we add the bucket to a
-		 * free list:
-		 */
+	while (!kthread_should_stop()) {
+		u64 journal_seq = 0;
 
-		while (!fifo_empty(&ca->free_inc)) {
-			bucket = fifo_peek(&ca->free_inc);
-
-			/*
-			 * Don't remove from free_inc until after it's added
-			 * to freelist, so gc doesn't miss it while we've
-			 * dropped bucket lock
-			 */
-
-			if (ca->mi.discard &&
-			    blk_queue_discard(bdev_get_queue(ca->disk_sb.bdev)))
-				blkdev_issue_discard(ca->disk_sb.bdev,
-					bucket_to_sector(ca, bucket),
-					ca->mi.bucket_size, GFP_NOIO, 0);
-
-			while (1) {
-				set_current_state(TASK_INTERRUPTIBLE);
-				if (bch2_allocator_push(ca, bucket))
-					break;
-
-				if (kthread_should_stop()) {
-					__set_current_state(TASK_RUNNING);
-					goto out;
-				}
-				schedule();
-				try_to_freeze();
-			}
-
-			__set_current_state(TASK_RUNNING);
-		}
-
-		/* We've run out of free buckets! */
-
+		/* Reset front/back so we can easily sort fifo entries later: */
 		BUG_ON(fifo_used(&ca->free_inc));
-		ca->free_inc.front = ca->free_inc.back = 0;
+		ca->free_inc.front = ca->free_inc.back	= 0;
+		ca->allocator_journal_seq_flush		= 0;
+		ca->allocator_invalidating_data		= false;
 
 		down_read(&c->gc_lock);
 		if (test_bit(BCH_FS_GC_FAILURE, &c->flags)) {
@@ -919,7 +929,6 @@ static int bch2_allocator_thread(void *arg)
 			 */
 
 			invalidate_buckets(ca);
-
 			trace_alloc_batch(ca, fifo_used(&ca->free_inc),
 					  ca->free_inc.size);
 
@@ -952,27 +961,29 @@ static int bch2_allocator_thread(void *arg)
 		spin_unlock(&ca->freelist_lock);
 
 		/*
-		 * free_inc is full of newly-invalidated buckets, must write out
-		 * prios and gens before they can be re-used
+		 * free_inc is now full of newly-invalidated buckets: next,
+		 * write out the new bucket gens:
 		 */
-		ret = bch2_prio_write(ca);
-		if (ret) {
-			/*
-			 * Emergency read only - allocator thread has to
-			 * shutdown.
-			 *
-			 * N.B. we better be going into RO mode, else
-			 * allocations would hang indefinitely - whatever
-			 * generated the error will have sent us into RO mode.
-			 *
-			 * Clear out the free_inc freelist so things are
-			 * consistent-ish:
-			 */
-			spin_lock(&ca->freelist_lock);
-			while (fifo_pop(&ca->free_inc, bucket))
-				bch2_mark_free_bucket(ca, ca->buckets + bucket);
-			spin_unlock(&ca->freelist_lock);
-			goto out;
+
+		while (!fifo_empty(&ca->free_inc) && !kthread_should_stop()) {
+			ret = bch2_invalidate_free_inc(c, ca, &journal_seq);
+			if (bch2_fs_fatal_err_on(ret < 0, c,
+					"error invalidating buckets: %i", ret))
+				goto err;
+
+			if (ca->allocator_invalidating_data)
+				bch2_journal_flush_seq(&c->journal, journal_seq);
+			else if (ca->allocator_journal_seq_flush)
+				bch2_journal_flush_seq(&c->journal,
+						       ca->allocator_journal_seq_flush);
+
+			while (ret && !kthread_should_stop()) {
+				BUG_ON(fifo_empty(&ca->free_inc));
+
+				bucket = fifo_peek(&ca->free_inc);
+				discard_invalidated_bucket(ca, bucket);
+				--ret;
+			}
 		}
 
 		ca->alloc_thread_started = true;
@@ -984,6 +995,21 @@ out:
 	 */
 	synchronize_rcu();
 	return 0;
+err:
+	/*
+	 * Emergency read only - allocator thread has to shutdown.
+	 *
+	 * N.B. we better be going into RO mode, else allocations would hang
+	 * indefinitely - whatever generated the error will have sent us into RO
+	 * mode.
+	 *
+	 * Clear out the free_inc freelist so things are consistent-ish:
+	 */
+	spin_lock(&ca->freelist_lock);
+	while (fifo_pop(&ca->free_inc, bucket))
+		bch2_mark_free_bucket(ca, ca->buckets + bucket);
+	spin_unlock(&ca->freelist_lock);
+	goto out;
 }
 
 /* Allocation */
@@ -1019,12 +1045,30 @@ out:
 long bch2_bucket_alloc(struct bch_fs *c, struct bch_dev *ca,
 		       enum alloc_reserve reserve)
 {
-	long r;
+	size_t r;
 
 	spin_lock(&ca->freelist_lock);
-	if (fifo_pop(&ca->free[RESERVE_NONE], r) ||
-	    fifo_pop(&ca->free[reserve], r))
+	if (likely(fifo_pop(&ca->free[RESERVE_NONE], r)))
 		goto out;
+
+	switch (reserve) {
+	case RESERVE_ALLOC:
+		if (fifo_pop(&ca->free[RESERVE_BTREE], r))
+			goto out;
+		break;
+	case RESERVE_BTREE:
+		if (fifo_used(&ca->free[RESERVE_BTREE]) * 2 >=
+		    ca->free[RESERVE_BTREE].size &&
+		    fifo_pop(&ca->free[RESERVE_BTREE], r))
+			goto out;
+		break;
+	case RESERVE_MOVINGGC:
+		if (fifo_pop(&ca->free[RESERVE_MOVINGGC], r))
+			goto out;
+		break;
+	default:
+		break;
+	}
 
 	spin_unlock(&ca->freelist_lock);
 
@@ -1047,11 +1091,6 @@ out2:
 
 	trace_bucket_alloc(ca, reserve);
 	return r;
-}
-
-static void __bch2_bucket_free(struct bch_dev *ca, struct bucket *g)
-{
-	bch2_mark_free_bucket(ca, g);
 }
 
 enum bucket_alloc_ret {
@@ -1456,7 +1495,6 @@ struct open_bucket *bch2_alloc_sectors_start(struct bch_fs *c,
 		? 0 : BTREE_NODE_RESERVE;
 	int ret;
 
-	BUG_ON(!reserve);
 	BUG_ON(!nr_replicas);
 retry:
 	ob = lock_writepoint(c, wp);
@@ -1705,7 +1743,9 @@ set_capacity:
 	capacity *= (100 - c->opts.gc_reserve_percent);
 	capacity = div64_u64(capacity, 100);
 
-	BUG_ON(capacity + reserved_sectors > total_capacity);
+	BUG_ON(reserved_sectors > total_capacity);
+
+	capacity = min(capacity, total_capacity - reserved_sectors);
 
 	c->capacity = capacity;
 

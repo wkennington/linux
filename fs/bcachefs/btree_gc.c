@@ -158,7 +158,7 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 					new.gen = ptr->gen;
 					new.gen_valid = 1;
 				}));
-				ca->need_prio_write = true;
+				ca->need_alloc_write = true;
 			}
 
 			if (fsck_err_on(gen_cmp(ptr->gen, g->mark.gen) > 0, c,
@@ -170,7 +170,7 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 					new.gen = ptr->gen;
 					new.gen_valid = 1;
 				}));
-				ca->need_prio_write = true;
+				ca->need_alloc_write = true;
 				set_bit(BCH_FS_FIXED_GENS, &c->flags);
 			}
 
@@ -360,17 +360,6 @@ void bch2_mark_dev_metadata(struct bch_fs *c, struct bch_dev *ca)
 	}
 
 	spin_unlock(&c->journal.lock);
-
-	spin_lock(&ca->prio_buckets_lock);
-
-	for (i = 0; i < prio_buckets(ca) * 2; i++) {
-		b = ca->prio_buckets[i];
-		if (b)
-			bch2_mark_metadata_bucket(ca, ca->buckets + b,
-						 BUCKET_PRIOS, true);
-	}
-
-	spin_unlock(&ca->prio_buckets_lock);
 }
 
 static void bch2_mark_metadata(struct bch_fs *c)

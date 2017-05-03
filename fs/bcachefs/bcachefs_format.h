@@ -714,6 +714,25 @@ struct bch_xattr {
 } __attribute__((packed, aligned(8)));
 BKEY_VAL_TYPE(xattr,		BCH_XATTR);
 
+/* Bucket/allocation information: */
+
+enum {
+	BCH_ALLOC		= 128,
+};
+
+enum {
+	BCH_ALLOC_FIELD_READ_TIME	= 0,
+	BCH_ALLOC_FIELD_WRITE_TIME	= 1,
+};
+
+struct bch_alloc {
+	struct bch_val		v;
+	__u8			fields;
+	__u8			gen;
+	__u8			data[];
+} __attribute__((packed, aligned(8)));
+BKEY_VAL_TYPE(alloc,	BCH_ALLOC);
+
 /* Superblock */
 
 /* Version 0: Cache device
@@ -1033,7 +1052,6 @@ enum bch_compression_opts {
 #define BCACHE_STATFS_MAGIC		0xca451a4e
 
 #define JSET_MAGIC		__cpu_to_le64(0x245235c1a3625032ULL)
-#define PSET_MAGIC		__cpu_to_le64(0x6750e15f87337f91ULL)
 #define BSET_MAGIC		__cpu_to_le64(0x90135c78b99e07f5ULL)
 
 static inline __le64 __bch2_sb_magic(struct bch_sb *sb)
@@ -1046,11 +1064,6 @@ static inline __le64 __bch2_sb_magic(struct bch_sb *sb)
 static inline __u64 __jset_magic(struct bch_sb *sb)
 {
 	return __le64_to_cpu(__bch2_sb_magic(sb) ^ JSET_MAGIC);
-}
-
-static inline __u64 __pset_magic(struct bch_sb *sb)
-{
-	return __le64_to_cpu(__bch2_sb_magic(sb) ^ PSET_MAGIC);
 }
 
 static inline __u64 __bset_magic(struct bch_sb *sb)
@@ -1081,9 +1094,9 @@ struct jset_entry {
 
 LE32_BITMASK(JOURNAL_ENTRY_TYPE,	struct jset_entry, flags, 0, 8);
 enum {
-	JOURNAL_ENTRY_BTREE_KEYS	= 0,
-	JOURNAL_ENTRY_BTREE_ROOT	= 1,
-	JOURNAL_ENTRY_PRIO_PTRS		= 2,
+	JOURNAL_ENTRY_BTREE_KEYS		= 0,
+	JOURNAL_ENTRY_BTREE_ROOT		= 1,
+	JOURNAL_ENTRY_PRIO_PTRS			= 2, /* Obsolete */
 
 	/*
 	 * Journal sequence numbers can be blacklisted: bsets record the max
@@ -1095,7 +1108,7 @@ enum {
 	 * and then record that we skipped it so that the next time we crash and
 	 * recover we don't think there was a missing journal entry.
 	 */
-	JOURNAL_ENTRY_JOURNAL_SEQ_BLACKLISTED = 3,
+	JOURNAL_ENTRY_JOURNAL_SEQ_BLACKLISTED	= 3,
 };
 
 /*
@@ -1138,35 +1151,14 @@ LE32_BITMASK(JSET_BIG_ENDIAN,	struct jset, flags, 4, 5);
 
 #define BCH_JOURNAL_BUCKETS_MIN		20
 
-/* Bucket prios/gens */
-
-struct prio_set {
-	struct bch_csum		csum;
-
-	__le64			magic;
-	__le32			nonce[3];
-	__le16			version;
-	__le16			flags;
-
-	__u8			encrypted_start[0];
-
-	__le64			next_bucket;
-
-	struct bucket_disk {
-		__le16		prio[2];
-		__u8		gen;
-	} __attribute__((packed)) data[];
-} __attribute__((packed, aligned(8)));
-
-LE32_BITMASK(PSET_CSUM_TYPE,	struct prio_set, flags, 0, 4);
-
 /* Btree: */
 
 #define DEFINE_BCH_BTREE_IDS()					\
-	DEF_BTREE_ID(EXTENTS, 0, "extents")			\
-	DEF_BTREE_ID(INODES,  1, "inodes")			\
-	DEF_BTREE_ID(DIRENTS, 2, "dirents")			\
-	DEF_BTREE_ID(XATTRS,  3, "xattrs")
+	DEF_BTREE_ID(EXTENTS,	0, "extents")			\
+	DEF_BTREE_ID(INODES,	1, "inodes")			\
+	DEF_BTREE_ID(DIRENTS,	2, "dirents")			\
+	DEF_BTREE_ID(XATTRS,	3, "xattrs")			\
+	DEF_BTREE_ID(ALLOC,	4, "alloc")
 
 #define DEF_BTREE_ID(kwd, val, name) BTREE_ID_##kwd = val,
 
@@ -1262,5 +1254,34 @@ struct btree_node_entry {
 	};
 	};
 } __attribute__((packed, aligned(8)));
+
+/* Obsolete: */
+
+struct prio_set {
+	struct bch_csum		csum;
+
+	__le64			magic;
+	__le32			nonce[3];
+	__le16			version;
+	__le16			flags;
+
+	__u8			encrypted_start[0];
+
+	__le64			next_bucket;
+
+	struct bucket_disk {
+		__le16		prio[2];
+		__u8		gen;
+	} __attribute__((packed)) data[];
+} __attribute__((packed, aligned(8)));
+
+LE32_BITMASK(PSET_CSUM_TYPE,	struct prio_set, flags, 0, 4);
+
+#define PSET_MAGIC		__cpu_to_le64(0x6750e15f87337f91ULL)
+
+static inline __u64 __pset_magic(struct bch_sb *sb)
+{
+	return __le64_to_cpu(__bch2_sb_magic(sb) ^ PSET_MAGIC);
+}
 
 #endif /* _BCACHEFS_FORMAT_H */

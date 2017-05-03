@@ -10,22 +10,12 @@ struct bch_dev;
 struct bch_fs;
 struct dev_group;
 
-static inline size_t prios_per_bucket(const struct bch_dev *ca)
-{
-	return (bucket_bytes(ca) - sizeof(struct prio_set)) /
-		sizeof(struct bucket_disk);
-}
-
-static inline size_t prio_buckets(const struct bch_dev *ca)
-{
-	return DIV_ROUND_UP((size_t) (ca)->mi.nbuckets, prios_per_bucket(ca));
-}
-
 void bch2_dev_group_remove(struct dev_group *, struct bch_dev *);
 void bch2_dev_group_add(struct dev_group *, struct bch_dev *);
 
-int bch2_prio_read(struct bch_dev *);
-int bch2_prio_write(struct bch_dev *);
+int bch2_alloc_read(struct bch_fs *, struct list_head *);
+int bch2_alloc_write(struct bch_fs *, struct bch_dev *, u64 *);
+int bch2_alloc_replay_key(struct bch_fs *, struct bpos);
 
 long bch2_bucket_alloc(struct bch_fs *, struct bch_dev *, enum alloc_reserve);
 
@@ -88,5 +78,7 @@ void bch2_dev_allocator_stop(struct bch_dev *);
 int bch2_dev_allocator_start(struct bch_dev *);
 
 void bch2_fs_allocator_init(struct bch_fs *);
+
+extern const struct bkey_ops bch2_bkey_alloc_ops;
 
 #endif /* _BCACHE_ALLOC_H */

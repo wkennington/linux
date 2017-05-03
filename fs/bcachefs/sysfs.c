@@ -693,7 +693,6 @@ static ssize_t show_dev_alloc_debug(struct bch_dev *ca, char *buf)
 
 	return scnprintf(buf, PAGE_SIZE,
 		"free_inc:               %zu/%zu\n"
-		"free[RESERVE_PRIO]:     %zu/%zu\n"
 		"free[RESERVE_BTREE]:    %zu/%zu\n"
 		"free[RESERVE_MOVINGGC]: %zu/%zu\n"
 		"free[RESERVE_NONE]:     %zu/%zu\n"
@@ -705,7 +704,6 @@ static ssize_t show_dev_alloc_debug(struct bch_dev *ca, char *buf)
 		"open buckets:           %u/%u (reserved %u)\n"
 		"open_buckets_wait:      %s\n",
 		fifo_used(&ca->free_inc),		ca->free_inc.size,
-		fifo_used(&ca->free[RESERVE_PRIO]),	ca->free[RESERVE_PRIO].size,
 		fifo_used(&ca->free[RESERVE_BTREE]),	ca->free[RESERVE_BTREE].size,
 		fifo_used(&ca->free[RESERVE_MOVINGGC]),	ca->free[RESERVE_MOVINGGC].size,
 		fifo_used(&ca->free[RESERVE_NONE]),	ca->free[RESERVE_NONE].size,
