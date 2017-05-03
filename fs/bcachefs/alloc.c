@@ -1773,47 +1773,28 @@ static bool bch2_dev_has_open_write_point(struct bch_dev *ca)
 }
 
 /* device goes ro: */
-void bch2_dev_allocator_stop(struct bch_dev *ca)
+void bch2_dev_allocator_remove(struct bch_fs *c, struct bch_dev *ca)
 {
-	struct bch_fs *c = ca->fs;
 	struct dev_group *tier = &c->tiers[ca->mi.tier].devs;
-	struct task_struct *p;
 	struct closure cl;
 	unsigned i;
+
+	BUG_ON(ca->alloc_thread);
 
 	closure_init_stack(&cl);
 
 	/* First, remove device from allocation groups: */
 
+	bch2_dev_group_remove(&c->journal.devs, ca);
 	bch2_dev_group_remove(tier, ca);
 	bch2_dev_group_remove(&c->all_devs, ca);
 
+	/*
+	 * Capacity is calculated based off of devices in allocation groups:
+	 */
 	bch2_recalc_capacity(c);
 
-	/*
-	 * Stopping the allocator thread comes after removing from allocation
-	 * groups, else pending allocations will hang:
-	 */
-
-	p = ca->alloc_thread;
-	ca->alloc_thread = NULL;
-	smp_wmb();
-
-	/*
-	 * We need an rcu barrier between setting ca->alloc_thread = NULL and
-	 * the thread shutting down to avoid a race with bch2_usage_update() -
-	 * the allocator thread itself does a synchronize_rcu() on exit.
-	 *
-	 * XXX: it would be better to have the rcu barrier be asynchronous
-	 * instead of blocking us here
-	 */
-	if (p) {
-		kthread_stop(p);
-		put_task_struct(p);
-	}
-
 	/* Next, close write points that point to this device... */
-
 	for (i = 0; i < ARRAY_SIZE(c->write_points); i++)
 		bch2_stop_write_point(ca, &c->write_points[i]);
 
@@ -1832,9 +1813,16 @@ void bch2_dev_allocator_stop(struct bch_dev *ca)
 	}
 	mutex_unlock(&c->btree_reserve_cache_lock);
 
-	/* Avoid deadlocks.. */
-
+	/*
+	 * Wake up threads that were blocked on allocation, so they can notice
+	 * the device can no longer be removed and the capacity has changed:
+	 */
 	closure_wake_up(&c->freelist_wait);
+
+	/*
+	 * journal_res_get() can block waiting for free space in the journal -
+	 * it needs to notice there may not be devices to allocate from anymore:
+	 */
 	wake_up(&c->journal.wait);
 
 	/* Now wait for any in flight writes: */
@@ -1851,32 +1839,15 @@ void bch2_dev_allocator_stop(struct bch_dev *ca)
 	}
 }
 
-/*
- * Startup the allocator thread for transition to RW mode:
- */
-int bch2_dev_allocator_start(struct bch_dev *ca)
+/* device goes rw: */
+void bch2_dev_allocator_add(struct bch_fs *c, struct bch_dev *ca)
 {
-	struct bch_fs *c = ca->fs;
 	struct dev_group *tier = &c->tiers[ca->mi.tier].devs;
 	struct bch_sb_field_journal *journal_buckets;
 	bool has_journal;
-	struct task_struct *k;
 
-	/*
-	 * allocator thread already started?
-	 */
-	if (ca->alloc_thread)
-		return 0;
-
-	k = kthread_create(bch2_allocator_thread, ca, "bcache_allocator");
-	if (IS_ERR(k))
-		return 0;
-
-	get_task_struct(k);
-	ca->alloc_thread = k;
-
-	bch2_dev_group_add(tier, ca);
 	bch2_dev_group_add(&c->all_devs, ca);
+	bch2_dev_group_add(tier, ca);
 
 	mutex_lock(&c->sb_lock);
 	journal_buckets = bch2_sb_get_journal(ca->disk_sb.sb);
@@ -1886,15 +1857,44 @@ int bch2_dev_allocator_start(struct bch_dev *ca)
 
 	if (has_journal)
 		bch2_dev_group_add(&c->journal.devs, ca);
+}
 
-	bch2_recalc_capacity(c);
+/* stop allocator thread: */
+void bch2_dev_allocator_stop(struct bch_dev *ca)
+{
+	struct task_struct *p = ca->alloc_thread;
+
+	ca->alloc_thread = NULL;
+	smp_wmb();
 
 	/*
-	 * Don't wake up allocator thread until after adding device to
-	 * allocator groups - otherwise, alloc thread could get a spurious
-	 * -EROFS due to prio_write() -> journal_meta() not finding any devices:
+	 * We need an rcu barrier between setting ca->alloc_thread = NULL and
+	 * the thread shutting down to avoid a race with bch2_usage_update() -
+	 * the allocator thread itself does a synchronize_rcu() on exit.
+	 *
+	 * XXX: it would be better to have the rcu barrier be asynchronous
+	 * instead of blocking us here
 	 */
-	wake_up_process(k);
+	if (p)
+		kthread_stop(p);
+}
+
+/* start allocator thread: */
+int bch2_dev_allocator_start(struct bch_dev *ca)
+{
+	struct task_struct *p;
+
+	/*
+	 * allocator thread already started?
+	 */
+	if (ca->alloc_thread)
+		return 0;
+
+	p = kthread_run(bch2_allocator_thread, ca, "bcache_allocator");
+	if (IS_ERR(p))
+		return PTR_ERR(p);
+
+	ca->alloc_thread = p;
 	return 0;
 }
 

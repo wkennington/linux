@@ -1724,6 +1724,8 @@ int bch2_dev_journal_alloc(struct bch_dev *ca)
 
 	ja->nr = nr;
 
+	bch2_dev_allocator_add(ca->fs, ca);
+
 	return 0;
 }
 

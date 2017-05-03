@@ -224,6 +224,9 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 		bch2_dev_allocator_stop(ca);
 
 	bch2_fs_journal_stop(&c->journal);
+
+	for_each_member_device(ca, c, i)
+		bch2_dev_allocator_remove(c, ca);
 }
 
 static void bch2_writes_disabled(struct percpu_ref *writes)
@@ -329,6 +332,10 @@ const char *bch2_fs_read_write(struct bch_fs *c)
 	if (c->state != BCH_FS_STARTING &&
 	    c->state != BCH_FS_RO)
 		goto out;
+
+	for_each_rw_member(ca, c, i)
+		bch2_dev_allocator_add(c, ca);
+	bch2_recalc_capacity(c);
 
 	err = "error starting allocator thread";
 	for_each_rw_member(ca, c, i)
@@ -695,6 +702,10 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 		bch2_sb_from_fs(c, ca);
 	mutex_unlock(&c->sb_lock);
 
+	for_each_rw_member(ca, c, i)
+		bch2_dev_allocator_add(c, ca);
+	bch2_recalc_capacity(c);
+
 	if (BCH_SB_INITIALIZED(c->disk_sb)) {
 		ret = bch2_journal_read(c, &journal);
 		if (ret)
@@ -733,16 +744,14 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 		}
 
 		bch_verbose(c, "starting mark and sweep:");
-
 		err = "error in recovery";
 		ret = bch2_initial_gc(c, &journal);
 		if (ret)
 			goto err;
+		bch_verbose(c, "mark and sweep done");
 
 		if (c->opts.noreplay)
 			goto recovery_done;
-
-		bch_verbose(c, "mark and sweep done");
 
 		/*
 		 * bch2_journal_start() can't happen sooner, or btree_gc_finish()
@@ -759,12 +768,10 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 			}
 
 		bch_verbose(c, "starting journal replay:");
-
 		err = "journal replay failed";
 		ret = bch2_journal_replay(c, &journal);
 		if (ret)
 			goto err;
-
 		bch_verbose(c, "journal replay done");
 
 		if (c->opts.norecovery)
@@ -775,6 +782,7 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 		ret = bch2_fsck(c, !c->opts.nofsck);
 		if (ret)
 			goto err;
+		bch_verbose(c, "fsck done");
 
 		for_each_rw_member(ca, c, i)
 			if (ca->need_prio_write) {
@@ -785,7 +793,6 @@ static const char *__bch2_fs_start(struct bch_fs *c)
 				}
 			}
 
-		bch_verbose(c, "fsck done");
 	} else {
 		struct bch_inode_unpacked inode;
 		struct bkey_inode_buf packed_inode;
@@ -1362,8 +1369,7 @@ static void __bch2_dev_read_only(struct bch_fs *c, struct bch_dev *ca)
 	 * complete.
 	 */
 	bch2_dev_allocator_stop(ca);
-
-	bch2_dev_group_remove(&c->journal.devs, ca);
+	bch2_dev_allocator_remove(c, ca);
 }
 
 static const char *__bch2_dev_read_write(struct bch_fs *c, struct bch_dev *ca)
@@ -1371,6 +1377,9 @@ static const char *__bch2_dev_read_write(struct bch_fs *c, struct bch_dev *ca)
 	lockdep_assert_held(&c->state_lock);
 
 	BUG_ON(ca->mi.state != BCH_MEMBER_STATE_RW);
+
+	bch2_dev_allocator_add(c, ca);
+	bch2_recalc_capacity(c);
 
 	if (bch2_dev_allocator_start(ca))
 		return "error starting allocator thread";

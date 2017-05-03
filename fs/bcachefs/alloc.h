@@ -80,8 +80,13 @@ static inline struct bch_dev *dev_group_next(struct dev_group *devs,
 	     (_ptr)++)
 
 void bch2_recalc_capacity(struct bch_fs *);
+
+void bch2_dev_allocator_remove(struct bch_fs *, struct bch_dev *);
+void bch2_dev_allocator_add(struct bch_fs *, struct bch_dev *);
+
 void bch2_dev_allocator_stop(struct bch_dev *);
 int bch2_dev_allocator_start(struct bch_dev *);
+
 void bch2_fs_allocator_init(struct bch_fs *);
 
 #endif /* _BCACHE_ALLOC_H */
