@@ -143,7 +143,6 @@ static inline void clear_btree_node_ ## flag(struct btree *b)		\
 enum btree_flags {
 	BTREE_NODE_read_in_flight,
 	BTREE_NODE_read_error,
-	BTREE_NODE_write_error,
 	BTREE_NODE_dirty,
 	BTREE_NODE_need_write,
 	BTREE_NODE_noevict,
@@ -155,7 +154,6 @@ enum btree_flags {
 
 BTREE_FLAG(read_in_flight);
 BTREE_FLAG(read_error);
-BTREE_FLAG(write_error);
 BTREE_FLAG(dirty);
 BTREE_FLAG(need_write);
 BTREE_FLAG(noevict);

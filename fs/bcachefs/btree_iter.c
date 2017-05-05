@@ -1131,12 +1131,15 @@ void __bch2_btree_iter_init(struct btree_iter *iter, struct bch_fs *c,
 			    unsigned locks_want, unsigned depth,
 			    unsigned flags)
 {
+	EBUG_ON(depth >= BTREE_MAX_DEPTH);
+	EBUG_ON(locks_want > BTREE_MAX_DEPTH);
+
 	iter->c				= c;
 	iter->pos			= pos;
 	iter->flags			= flags;
 	iter->btree_id			= btree_id;
 	iter->level			= depth;
-	iter->locks_want		= min(locks_want, BTREE_MAX_DEPTH);
+	iter->locks_want		= locks_want;
 	iter->nodes_locked		= 0;
 	iter->nodes_intent_locked	= 0;
 	memset(iter->nodes, 0, sizeof(iter->nodes));

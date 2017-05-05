@@ -1325,6 +1325,11 @@ void bch2_btree_interior_update_will_free_node(struct bch_fs *c,
 				      &as->journal, interior_update_flush);
 	bch2_journal_pin_drop(&c->journal, &w->journal);
 
+	w = btree_prev_write(b);
+	bch2_journal_pin_add_if_older(&c->journal, &w->journal,
+				      &as->journal, interior_update_flush);
+	bch2_journal_pin_drop(&c->journal, &w->journal);
+
 	if (b->will_make_reachable)
 		__btree_interior_update_drop_new_node(b);
 
@@ -1371,7 +1376,7 @@ err:
 #endif
 }
 
-static enum btree_insert_ret
+static int
 bch2_btree_insert_keys_interior(struct btree *b,
 			       struct btree_iter *iter,
 			       struct keylist *insert_keys,
@@ -1394,7 +1399,7 @@ bch2_btree_insert_keys_interior(struct btree *b,
 	if (bch_keylist_u64s(insert_keys) >
 	    bch_btree_keys_u64s_remaining(c, b)) {
 		bch2_btree_node_unlock_write(b, iter);
-		return BTREE_INSERT_BTREE_NODE_FULL;
+		return -1;
 	}
 
 	/* Don't screw up @iter's position: */
@@ -1432,7 +1437,7 @@ bch2_btree_insert_keys_interior(struct btree *b,
 	bch2_btree_node_unlock_write(b, iter);
 
 	btree_node_interior_verify(b);
-	return BTREE_INSERT_OK;
+	return 0;
 }
 
 /*
@@ -1709,16 +1714,10 @@ void bch2_btree_insert_node(struct btree *b,
 	BUG_ON(!b->level);
 	BUG_ON(!reserve || !as);
 
-	switch (bch2_btree_insert_keys_interior(b, iter, insert_keys,
-					       as, reserve)) {
-	case BTREE_INSERT_OK:
-		break;
-	case BTREE_INSERT_BTREE_NODE_FULL:
+	if ((as->flags & BTREE_INTERIOR_UPDATE_MUST_REWRITE) ||
+	    bch2_btree_insert_keys_interior(b, iter, insert_keys,
+					    as, reserve))
 		btree_split(b, iter, insert_keys, reserve, as);
-		break;
-	default:
-		BUG();
-	}
 }
 
 static int bch2_btree_split_leaf(struct btree_iter *iter, unsigned flags)
@@ -2528,5 +2527,142 @@ int bch2_btree_node_rewrite(struct bch_fs *c, struct btree_iter *iter,
 		up_read(&c->gc_lock);
 
 	closure_sync(&cl);
+	return ret;
+}
+
+int bch2_btree_node_update_key(struct bch_fs *c, struct btree *b,
+			       struct bkey_i_extent *new_key)
+{
+	struct btree_interior_update *as;
+	struct btree_reserve *reserve = NULL;
+	struct btree *parent, *new_hash = NULL;
+	struct btree_iter iter;
+	struct closure cl;
+	bool must_rewrite_parent = false;
+	int ret;
+
+	__bch2_btree_iter_init(&iter, c, b->btree_id, b->key.k.p,
+			       BTREE_MAX_DEPTH,
+			       b->level, 0);
+	closure_init_stack(&cl);
+
+	if (PTR_HASH(&new_key->k_i) != PTR_HASH(&b->key)) {
+		/* bch2_btree_reserve_get will unlock */
+		do {
+			ret = bch2_btree_node_cannibalize_lock(c, &cl);
+			closure_sync(&cl);
+		} while (ret == -EAGAIN);
+
+		BUG_ON(ret);
+
+		new_hash = bch2_btree_node_mem_alloc(c);
+	}
+retry:
+	reserve = bch2_btree_reserve_get(c, b, 0,
+				BTREE_INSERT_NOFAIL|
+				BTREE_INSERT_USE_RESERVE|
+				BTREE_INSERT_USE_ALLOC_RESERVE,
+				&cl);
+	closure_sync(&cl);
+	if (IS_ERR(reserve)) {
+		ret = PTR_ERR(reserve);
+		if (ret == -EAGAIN || ret == -EINTR)
+			goto retry;
+		goto err;
+	}
+
+	down_read(&c->gc_lock);
+
+	ret = bch2_btree_iter_traverse(&iter);
+	if (ret)
+		goto err;
+
+	mutex_lock(&c->btree_interior_update_lock);
+
+	/*
+	 * Two corner cases that need to be thought about here:
+	 *
+	 * @b may not be reachable yet - there might be another interior update
+	 * operation waiting on @b to be written, and we're gonna deliver the
+	 * write completion to that interior update operation _before_
+	 * persisting the new_key update
+	 *
+	 * That ends up working without us having to do anything special here:
+	 * the reason is, we do kick off (and do the in memory updates) for the
+	 * update for @new_key before we return, creating a new interior_update
+	 * operation here.
+	 *
+	 * The new interior update operation here will in effect override the
+	 * previous one. The previous one was going to terminate - make @b
+	 * reachable - in one of two ways:
+	 * - updating the btree root pointer
+	 *   In that case,
+	 *   no, this doesn't work. argh.
+	 */
+
+	if (b->will_make_reachable)
+		must_rewrite_parent = true;
+
+	/* other case: btree node being freed */
+	if (iter.nodes[b->level] != b) {
+		/* node has been freed: */
+		BUG_ON(btree_node_hashed(b));
+		mutex_unlock(&c->btree_interior_update_lock);
+		goto err;
+	}
+
+	mutex_unlock(&c->btree_interior_update_lock);
+
+	ret = bch2_check_mark_super(c, extent_i_to_s_c(new_key), BCH_DATA_BTREE);
+	if (ret)
+		goto err;
+
+	as = bch2_btree_interior_update_alloc(c);
+
+	if (must_rewrite_parent)
+		as->flags |= BTREE_INTERIOR_UPDATE_MUST_REWRITE;
+
+	bch2_btree_interior_update_add_node_reference(c, as, b);
+
+	if (new_hash) {
+		bkey_copy(&new_hash->key, &new_key->k_i);
+		BUG_ON(bch2_btree_node_hash_insert(c, new_hash,
+					b->level, b->btree_id));
+	}
+
+	parent = iter.nodes[b->level + 1];
+	if (parent) {
+		bch2_btree_insert_node(parent, &iter,
+				       &keylist_single(&b->key),
+				       reserve, as);
+	} else {
+		bch2_btree_set_root(&iter, b, as, reserve);
+	}
+
+	if (new_hash) {
+		mutex_lock(&c->btree_cache_lock);
+		bch2_btree_node_hash_remove(c, b);
+
+		bkey_copy(&b->key, &new_key->k_i);
+		__bch2_btree_node_hash_insert(c, b);
+
+		bch2_btree_node_hash_remove(c, new_hash);
+		mutex_unlock(&c->btree_cache_lock);
+	} else {
+		bkey_copy(&b->key, &new_key->k_i);
+	}
+err:
+	if (!IS_ERR_OR_NULL(reserve))
+		bch2_btree_reserve_put(c, reserve);
+	if (new_hash) {
+		mutex_lock(&c->btree_cache_lock);
+		list_move(&b->list, &c->btree_cache_freeable);
+		mutex_unlock(&c->btree_cache_lock);
+
+		six_unlock_write(&new_hash->lock);
+		six_unlock_intent(&new_hash->lock);
+	}
+	bch2_btree_iter_unlock(&iter);
+	up_read(&c->gc_lock);
 	return ret;
 }

@@ -517,10 +517,15 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 	mutex_init(&c->btree_interior_update_lock);
 
 	mutex_init(&c->bio_bounce_pages_lock);
+	mutex_init(&c->zlib_workspace_lock);
+
 	bio_list_init(&c->read_retry_list);
 	spin_lock_init(&c->read_retry_lock);
 	INIT_WORK(&c->read_retry_work, bch2_read_retry_work);
-	mutex_init(&c->zlib_workspace_lock);
+
+	bio_list_init(&c->btree_write_error_list);
+	spin_lock_init(&c->btree_write_error_lock);
+	INIT_WORK(&c->btree_write_error_work, bch2_btree_write_error_work);
 
 	INIT_LIST_HEAD(&c->fsck_errors);
 	mutex_init(&c->fsck_error_lock);

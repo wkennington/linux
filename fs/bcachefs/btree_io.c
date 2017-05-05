@@ -1344,16 +1344,56 @@ static void btree_node_write_done(struct bch_fs *c, struct btree *b)
 {
 	struct btree_write *w = btree_prev_write(b);
 
-	/*
-	 * Before calling bch2_btree_complete_write() - if the write errored, we
-	 * have to halt new journal writes before they see this btree node
-	 * write as completed:
-	 */
-	if (btree_node_write_error(b))
-		bch2_journal_halt(&c->journal);
-
 	bch2_btree_complete_write(c, b, w);
 	btree_node_io_unlock(b);
+}
+
+static void bch2_btree_node_write_error(struct bch_fs *c,
+					struct bch_write_bio *wbio)
+{
+	struct btree *b		= wbio->bio.bi_private;
+	struct closure *cl	= wbio->cl;
+	__BKEY_PADDED(k, BKEY_BTREE_PTR_VAL_U64s_MAX) tmp;
+	struct bkey_i_extent *new_key;
+
+	bkey_copy(&tmp.k, &b->key);
+	new_key = bkey_i_to_extent(&tmp.k);
+
+	while (wbio->replicas_failed) {
+		unsigned idx = __fls(wbio->replicas_failed);
+
+		bch2_extent_drop_ptr_idx(extent_i_to_s(new_key), idx);
+		wbio->replicas_failed ^= 1 << idx;
+	}
+
+	if (!bch2_extent_nr_ptrs(extent_i_to_s_c(new_key)) ||
+	    bch2_btree_node_update_key(c, b, new_key)) {
+		set_btree_node_noevict(b);
+		bch2_fatal_error(c);
+	}
+
+	bio_put(&wbio->bio);
+	btree_node_write_done(c, b);
+	if (cl)
+		closure_put(cl);
+}
+
+void bch2_btree_write_error_work(struct work_struct *work)
+{
+	struct bch_fs *c = container_of(work, struct bch_fs,
+					btree_write_error_work);
+	struct bio *bio;
+
+	while (1) {
+		spin_lock_irq(&c->read_retry_lock);
+		bio = bio_list_pop(&c->read_retry_list);
+		spin_unlock_irq(&c->read_retry_lock);
+
+		if (!bio)
+			break;
+
+		bch2_btree_node_write_error(c, to_wbio(bio));
+	}
 }
 
 static void btree_node_write_endio(struct bio *bio)
@@ -1361,13 +1401,14 @@ static void btree_node_write_endio(struct bio *bio)
 	struct btree *b			= bio->bi_private;
 	struct bch_write_bio *wbio	= to_wbio(bio);
 	struct bch_write_bio *parent	= wbio->split ? wbio->parent : NULL;
+	struct bch_write_bio *orig	= parent ?: wbio;
 	struct closure *cl		= !wbio->split ? wbio->cl : NULL;
 	struct bch_fs *c		= wbio->c;
 	struct bch_dev *ca		= wbio->ca;
 
-	if (bch2_dev_fatal_io_err_on(bio->bi_error, ca, "btree write") ||
+	if (bch2_dev_nonfatal_io_err_on(bio->bi_error, ca, "btree write") ||
 	    bch2_meta_write_fault("btree"))
-		set_btree_node_write_error(b);
+		set_bit(wbio->ptr_idx, (unsigned long *) &orig->replicas_failed);
 
 	if (wbio->have_io_ref)
 		percpu_ref_put(&ca->io_ref);
@@ -1382,6 +1423,16 @@ static void btree_node_write_endio(struct bio *bio)
 		wbio->order,
 		wbio->used_mempool,
 		wbio->data);
+
+	if (wbio->replicas_failed) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&c->btree_write_error_lock, flags);
+		bio_list_add(&c->read_retry_list, &wbio->bio);
+		spin_unlock_irqrestore(&c->btree_write_error_lock, flags);
+		queue_work(c->wq, &c->btree_write_error_work);
+		return;
+	}
 
 	bio_put(bio);
 	btree_node_write_done(c, b);

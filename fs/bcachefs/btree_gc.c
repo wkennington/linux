@@ -793,7 +793,8 @@ static int bch2_coalesce_btree(struct bch_fs *c, enum btree_id btree_id)
 	memset(merge, 0, sizeof(merge));
 
 	__for_each_btree_node(&iter, c, btree_id, POS_MIN,
-			      U8_MAX, 0, BTREE_ITER_PREFETCH, b) {
+			      BTREE_MAX_DEPTH, 0,
+			      BTREE_ITER_PREFETCH, b) {
 		memmove(merge + 1, merge,
 			sizeof(merge) - sizeof(merge[0]));
 		memmove(lock_seq + 1, lock_seq,

@@ -70,7 +70,10 @@ struct bch_write_bio {
 	struct closure		*cl;
 	};
 
+	u8			ptr_idx;
+	u8			replicas_failed;
 	u8			order;
+
 	unsigned		split:1,
 				bounce:1,
 				put_bio:1,

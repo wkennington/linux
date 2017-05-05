@@ -76,6 +76,9 @@ struct btree_interior_update {
 		BTREE_INTERIOR_UPDATING_AS,
 	} mode;
 
+	unsigned			flags;
+	struct btree_reserve		*reserve;
+
 	/*
 	 * BTREE_INTERIOR_UPDATING_NODE:
 	 * The update that made the new nodes visible was a regular update to an
@@ -129,6 +132,8 @@ struct btree_interior_update {
 	 */
 	u64				inline_keys[BKEY_BTREE_PTR_U64s_MAX * 3];
 };
+
+#define BTREE_INTERIOR_UPDATE_MUST_REWRITE	(1 << 0)
 
 #define for_each_pending_btree_node_free(c, as, p)			\
 	list_for_each_entry(as, &c->btree_interior_update_list, list)	\
@@ -430,6 +435,8 @@ int bch2_btree_delete_range(struct bch_fs *, enum btree_id,
 
 int bch2_btree_node_rewrite(struct bch_fs *c, struct btree_iter *,
 			    __le64, unsigned);
+int bch2_btree_node_update_key(struct bch_fs *, struct btree *,
+			       struct bkey_i_extent *);
 
 #endif /* _BCACHE_BTREE_INSERT_H */
 
