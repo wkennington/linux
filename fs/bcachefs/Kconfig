@@ -7,8 +7,6 @@ config BCACHEFS_FS
 	select CLOSURES
 	select LIBCRC32C
 	select FS_POSIX_ACL
-	select LZ4_COMPRESS
-	select LZ4_DECOMPRESS
 	select ZLIB_DEFLATE
 	select ZLIB_INFLATE
 	select CRYPTO_SHA256
