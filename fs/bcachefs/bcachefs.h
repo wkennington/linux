@@ -715,7 +715,7 @@ struct bch_fs {
 	mempool_t		compression_bounce[2];
 
 	struct crypto_shash	*sha256;
-	struct crypto_blkcipher	*chacha20;
+	struct crypto_skcipher	*chacha20;
 	struct crypto_shash	*poly1305;
 
 	atomic64_t		key_version;
