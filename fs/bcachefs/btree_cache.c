@@ -554,6 +554,12 @@ static noinline struct btree *bch2_btree_node_fill(struct btree_iter *iter,
 	struct bch_fs *c = iter->c;
 	struct btree *b;
 
+	/*
+	 * Parent node must be locked, else we could read in a btree node that's
+	 * been freed:
+	 */
+	BUG_ON(!btree_node_locked(iter, level + 1));
+
 	b = bch2_btree_node_mem_alloc(c);
 	if (IS_ERR(b))
 		return b;
