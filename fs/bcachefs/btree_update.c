@@ -819,8 +819,11 @@ void bch2_btree_journal_key(struct btree_insert *trans,
 		/* ick */
 		insert->k.needs_whiteout = false;
 		bch2_journal_add_keys(j, &trans->journal_res,
-				     b->btree_id, insert);
+				      b->btree_id, insert);
 		insert->k.needs_whiteout = needs_whiteout;
+
+		bch2_journal_set_has_inode(j, &trans->journal_res,
+					   insert->k.p.inode);
 
 		if (trans->journal_seq)
 			*trans->journal_seq = seq;
