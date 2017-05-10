@@ -2234,8 +2234,9 @@ static void journal_write(struct closure *cl)
 		closure_return_with_destructor(cl, journal_write_done);
 	}
 
-	bch2_check_mark_super(c, bkey_i_to_s_c_extent(&j->key),
-			      BCH_DATA_JOURNAL);
+	if (bch2_check_mark_super(c, bkey_i_to_s_c_extent(&j->key),
+				  BCH_DATA_JOURNAL))
+		goto err;
 
 	/*
 	 * XXX: we really should just disable the entire journal in nochanges

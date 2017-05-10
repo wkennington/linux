@@ -385,7 +385,7 @@ static int bch2_write_extent(struct bch_write_op *op, struct open_bucket *ob)
 	struct bkey_i *key_to_write;
 	unsigned csum_type = op->csum_type;
 	unsigned compression_type = op->compression_type;
-	int ret;
+	int ret, more;
 
 	/* don't refetch csum type/compression type */
 	barrier();
@@ -417,7 +417,7 @@ static int bch2_write_extent(struct bch_write_op *op, struct open_bucket *ob)
 
 		bio			= orig;
 		wbio			= wbio_init(bio);
-		ret			= 0;
+		more			= 0;
 	} else if (csum_type != BCH_CSUM_NONE ||
 		   compression_type != BCH_COMPRESSION_NONE) {
 		/* all units here in bytes */
@@ -495,7 +495,7 @@ static int bch2_write_extent(struct bch_write_op *op, struct open_bucket *ob)
 			mempool_free(bio->bi_io_vec[--bio->bi_vcnt].bv_page,
 				     &c->bio_bounce_pages);
 
-		ret = orig->bi_iter.bi_size != 0;
+		more = orig->bi_iter.bi_size != 0;
 	} else {
 		bio = bio_next_split(orig, ob->sectors_free, GFP_NOIO,
 				     &c->bio_write);
@@ -506,8 +506,17 @@ static int bch2_write_extent(struct bch_write_op *op, struct open_bucket *ob)
 				   compression_type, 0,
 				   (struct bch_csum) { 0 }, csum_type, ob);
 
-		ret = bio != orig;
+		more = bio != orig;
 	}
+
+	/* might have done a realloc... */
+
+	key_to_write = (void *) (op->insert_keys.keys_p + key_to_write_offset);
+
+	ret = bch2_check_mark_super(c, bkey_i_to_s_c_extent(key_to_write),
+				    BCH_DATA_USER);
+	if (ret)
+		return ret;
 
 	bio->bi_end_io	= bch2_write_endio;
 	bio->bi_private	= &op->cl;
@@ -515,15 +524,8 @@ static int bch2_write_extent(struct bch_write_op *op, struct open_bucket *ob)
 
 	closure_get(bio->bi_private);
 
-	/* might have done a realloc... */
-
-	key_to_write = (void *) (op->insert_keys.keys_p + key_to_write_offset);
-
-	bch2_check_mark_super(c, bkey_i_to_s_c_extent(key_to_write),
-			      BCH_DATA_USER);
-
 	bch2_submit_wbio_replicas(to_wbio(bio), c, key_to_write);
-	return ret;
+	return more;
 }
 
 static void __bch2_write(struct closure *cl)
