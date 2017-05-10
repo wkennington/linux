@@ -1358,12 +1358,12 @@ static void btree_node_write_done(struct bch_fs *c, struct btree *b)
 
 static void btree_node_write_endio(struct bio *bio)
 {
-	struct btree *b = bio->bi_private;
-	struct bch_write_bio *wbio = to_wbio(bio);
-	struct bch_fs *c	= wbio->c;
-	struct bio *orig	= wbio->split ? wbio->orig : NULL;
-	struct closure *cl	= !wbio->split ? wbio->cl : NULL;
-	struct bch_dev *ca	= wbio->ca;
+	struct btree *b			= bio->bi_private;
+	struct bch_write_bio *wbio	= to_wbio(bio);
+	struct bch_write_bio *parent	= wbio->split ? wbio->parent : NULL;
+	struct closure *cl		= !wbio->split ? wbio->cl : NULL;
+	struct bch_fs *c		= wbio->c;
+	struct bch_dev *ca		= wbio->ca;
 
 	if (bch2_dev_fatal_io_err_on(bio->bi_error, ca, "btree write") ||
 	    bch2_meta_write_fault("btree"))
@@ -1372,22 +1372,21 @@ static void btree_node_write_endio(struct bio *bio)
 	if (wbio->have_io_ref)
 		percpu_ref_put(&ca->io_ref);
 
-	if (wbio->bounce)
-		btree_bounce_free(c,
-			wbio->order,
-			wbio->used_mempool,
-			page_address(bio->bi_io_vec[0].bv_page));
-
-	if (wbio->put_bio)
+	if (parent) {
 		bio_put(bio);
-
-	if (orig) {
-		bio_endio(orig);
-	} else {
-		btree_node_write_done(c, b);
-		if (cl)
-			closure_put(cl);
+		bio_endio(&parent->bio);
+		return;
 	}
+
+	btree_bounce_free(c,
+		wbio->order,
+		wbio->used_mempool,
+		page_address(bio->bi_io_vec[0].bv_page));
+
+	bio_put(bio);
+	btree_node_write_done(c, b);
+	if (cl)
+		closure_put(cl);
 }
 
 static int validate_bset_for_write(struct bch_fs *c, struct btree *b,
@@ -1411,7 +1410,6 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b,
 			    struct closure *parent,
 			    enum six_lock_type lock_type_held)
 {
-	struct bio *bio;
 	struct bch_write_bio *wbio;
 	struct bset_tree *t;
 	struct bset *i;
@@ -1601,23 +1599,19 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b,
 
 	trace_btree_write(b, bytes_to_write, sectors_to_write);
 
-	bio = bio_alloc_bioset(GFP_NOIO, 1 << order, &c->bio_write);
-
-	wbio			= to_wbio(bio);
+	wbio = wbio_init(bio_alloc_bioset(GFP_NOIO, 1 << order, &c->bio_write));
 	wbio->cl		= parent;
-	wbio->bounce		= true;
-	wbio->put_bio		= true;
 	wbio->order		= order;
 	wbio->used_mempool	= used_mempool;
-	bio->bi_opf		= REQ_OP_WRITE|REQ_META|REQ_FUA;
-	bio->bi_iter.bi_size	= sectors_to_write << 9;
-	bio->bi_end_io		= btree_node_write_endio;
-	bio->bi_private		= b;
+	wbio->bio.bi_opf	= REQ_OP_WRITE|REQ_META|REQ_FUA;
+	wbio->bio.bi_iter.bi_size = sectors_to_write << 9;
+	wbio->bio.bi_end_io	= btree_node_write_endio;
+	wbio->bio.bi_private	= b;
 
 	if (parent)
 		closure_get(parent);
 
-	bch2_bio_map(bio, data);
+	bch2_bio_map(&wbio->bio, data);
 
 	/*
 	 * If we're appending to a leaf node, we don't technically need FUA -
