@@ -2011,6 +2011,8 @@ btree_insert_key(struct btree_insert *trans,
 	int old_live_u64s = b->nr.live_u64s;
 	int live_u64s_added, u64s_added;
 
+	iter->flags &= ~BTREE_ITER_UPTODATE;
+
 	ret = !btree_node_is_extents(b)
 		? bch2_insert_fixup_key(trans, insert)
 		: bch2_insert_fixup_extent(trans, insert);
