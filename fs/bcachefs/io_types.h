@@ -78,6 +78,7 @@ struct bch_write_bio {
 				used_mempool:1;
 
 	unsigned		submit_time_us;
+	void			*data;
 
 	struct bio		bio;
 };

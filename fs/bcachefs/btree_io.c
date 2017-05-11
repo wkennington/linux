@@ -56,9 +56,9 @@ static void btree_bounce_free(struct bch_fs *c, unsigned order,
 			      bool used_mempool, void *p)
 {
 	if (used_mempool)
-		mempool_free(virt_to_page(p), &c->btree_bounce_pool);
+		mempool_free(p, &c->btree_bounce_pool);
 	else
-		free_pages((unsigned long) p, order);
+		vpfree(p, PAGE_SIZE << order);
 }
 
 static void *btree_bounce_alloc(struct bch_fs *c, unsigned order,
@@ -66,7 +66,7 @@ static void *btree_bounce_alloc(struct bch_fs *c, unsigned order,
 {
 	void *p;
 
-	BUG_ON(1 << order > btree_pages(c));
+	BUG_ON(order > btree_page_order(c));
 
 	*used_mempool = false;
 	p = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOWAIT, order);
@@ -74,7 +74,7 @@ static void *btree_bounce_alloc(struct bch_fs *c, unsigned order,
 		return p;
 
 	*used_mempool = true;
-	return page_address(mempool_alloc(&c->btree_bounce_pool, GFP_NOIO));
+	return mempool_alloc(&c->btree_bounce_pool, GFP_NOIO);
 }
 
 typedef int (*sort_cmp_fn)(struct btree *,
@@ -1183,7 +1183,7 @@ void bch2_btree_node_read_done(struct bch_fs *c, struct btree *b,
 		if (bne->keys.seq == b->data->keys.seq)
 			goto err;
 
-	sorted = btree_bounce_alloc(c, ilog2(btree_pages(c)), &used_mempool);
+	sorted = btree_bounce_alloc(c, btree_page_order(c), &used_mempool);
 	sorted->keys.u64s = 0;
 
 	b->nr = btree_node_is_extents(b)
@@ -1199,7 +1199,7 @@ void bch2_btree_node_read_done(struct bch_fs *c, struct btree *b,
 
 	BUG_ON(b->nr.live_u64s != u64s);
 
-	btree_bounce_free(c, ilog2(btree_pages(c)), used_mempool, sorted);
+	btree_bounce_free(c, btree_page_order(c), used_mempool, sorted);
 
 	bch2_bset_build_aux_tree(b, b->set, false);
 
@@ -1381,7 +1381,7 @@ static void btree_node_write_endio(struct bio *bio)
 	btree_bounce_free(c,
 		wbio->order,
 		wbio->used_mempool,
-		page_address(bio->bi_io_vec[0].bv_page));
+		wbio->data);
 
 	bio_put(bio);
 	btree_node_write_done(c, b);
@@ -1603,6 +1603,7 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b,
 	wbio->cl		= parent;
 	wbio->order		= order;
 	wbio->used_mempool	= used_mempool;
+	wbio->data		= data;
 	wbio->bio.bi_opf	= REQ_OP_WRITE|REQ_META|REQ_FUA;
 	wbio->bio.bi_iter.bi_size = sectors_to_write << 9;
 	wbio->bio.bi_end_io	= btree_node_write_endio;

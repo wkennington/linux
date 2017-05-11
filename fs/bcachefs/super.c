@@ -593,8 +593,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 				   PAGE_SECTORS, 0) ||
 	    !(c->usage_percpu = alloc_percpu(struct bch_fs_usage)) ||
 	    lg_lock_init(&c->usage_lock) ||
-	    mempool_init_page_pool(&c->btree_bounce_pool, 1,
-				   ilog2(btree_pages(c))) ||
+	    mempool_init_vp_pool(&c->btree_bounce_pool, 1, btree_bytes(c)) ||
 	    bdi_setup_and_register(&c->bdi, "bcachefs") ||
 	    bch2_io_clock_init(&c->io_clock[READ]) ||
 	    bch2_io_clock_init(&c->io_clock[WRITE]) ||

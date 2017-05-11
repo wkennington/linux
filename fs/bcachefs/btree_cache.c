@@ -41,7 +41,7 @@ static void __mca_data_free(struct bch_fs *c, struct btree *b)
 {
 	EBUG_ON(btree_node_write_in_flight(b));
 
-	free_pages((unsigned long) b->data, btree_page_order(c));
+	kvpfree(b->data, btree_bytes(c));
 	b->data = NULL;
 	bch2_btree_keys_free(b);
 }
@@ -63,20 +63,18 @@ static const struct rhashtable_params bch_btree_cache_params = {
 
 static void mca_data_alloc(struct bch_fs *c, struct btree *b, gfp_t gfp)
 {
-	unsigned order = ilog2(btree_pages(c));
-
-	b->data = (void *) __get_free_pages(gfp, order);
+	b->data = kvpmalloc(btree_bytes(c), gfp);
 	if (!b->data)
 		goto err;
 
-	if (bch2_btree_keys_alloc(b, order, gfp))
+	if (bch2_btree_keys_alloc(b, btree_page_order(c), gfp))
 		goto err;
 
 	c->btree_cache_used++;
 	list_move(&b->list, &c->btree_cache_freeable);
 	return;
 err:
-	free_pages((unsigned long) b->data, order);
+	kvpfree(b->data, btree_bytes(c));
 	b->data = NULL;
 	list_move(&b->list, &c->btree_cache_freed);
 }
@@ -328,7 +326,7 @@ void bch2_fs_btree_exit(struct bch_fs *c)
 	if (c->verify_data)
 		list_move(&c->verify_data->list, &c->btree_cache);
 
-	free_pages((unsigned long) c->verify_ondisk, ilog2(btree_pages(c)));
+	kvpfree(c->verify_ondisk, btree_bytes(c));
 #endif
 
 	for (i = 0; i < BTREE_ID_NR; i++)
@@ -384,8 +382,7 @@ int bch2_fs_btree_init(struct bch_fs *c)
 #ifdef CONFIG_BCACHEFS_DEBUG
 	mutex_init(&c->verify_lock);
 
-	c->verify_ondisk = (void *)
-		__get_free_pages(GFP_KERNEL, ilog2(btree_pages(c)));
+	c->verify_ondisk = kvpmalloc(btree_bytes(c), GFP_KERNEL);
 	if (!c->verify_ondisk)
 		return -ENOMEM;
 
