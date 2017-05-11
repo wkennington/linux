@@ -116,7 +116,7 @@ struct btree {
 	 * another write - because that write also won't yet be reachable and
 	 * marking it as completed before it's reachable would be incorrect:
 	 */
-	struct list_head	reachable;
+	struct btree_interior_update *will_make_reachable;
 
 	struct open_bucket	*ob;
 

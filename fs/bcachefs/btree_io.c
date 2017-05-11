@@ -1456,7 +1456,7 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b,
 	} while (cmpxchg_acquire(&b->flags, old, new) != old);
 
 	BUG_ON(!list_empty(&b->write_blocked));
-	BUG_ON(!list_empty_careful(&b->reachable) != !b->written);
+	BUG_ON((b->will_make_reachable != NULL) != !b->written);
 
 	BUG_ON(b->written >= c->sb.btree_node_size);
 	BUG_ON(bset_written(b, btree_bset_last(b)));

@@ -86,7 +86,6 @@ struct btree_interior_update {
 	 */
 	struct btree			*b;
 	struct list_head		write_blocked_list;
-	struct list_head		reachable_list;
 
 	/*
 	 * BTREE_INTERIOR_UPDATING_AS: btree node we updated was freed, so now
@@ -117,6 +116,10 @@ struct btree_interior_update {
 	struct pending_btree_node_free	pending[BTREE_MAX_DEPTH + GC_MERGE_NODES];
 	unsigned			nr_pending;
 
+	/* New nodes, that will be made reachable by this update: */
+	struct btree			*new_nodes[BTREE_MAX_DEPTH * 2 + GC_MERGE_NODES];
+	unsigned			nr_new_nodes;
+
 	/* Only here to reduce stack usage on recursive splits: */
 	struct keylist			parent_keys;
 	/*
@@ -138,6 +141,7 @@ void bch2_btree_open_bucket_put(struct bch_fs *c, struct btree *);
 struct btree *__bch2_btree_node_alloc_replacement(struct bch_fs *,
 					     struct btree *,
 					     struct bkey_format,
+					     struct btree_interior_update *,
 					     struct btree_reserve *);
 
 struct btree_interior_update *
