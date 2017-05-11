@@ -409,8 +409,6 @@ int bch2_alloc_replay_key(struct bch_fs *c, struct bpos pos)
 	struct btree_iter iter;
 	int ret;
 
-	lockdep_assert_held(&c->state_lock);
-
 	if (pos.inode >= c->sb.nr_devices || !c->devs[pos.inode])
 		return 0;
 
