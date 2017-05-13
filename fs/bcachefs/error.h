@@ -222,7 +222,7 @@ do {									\
 #endif
 
 /* Logs message and handles the error: */
-#define bch2_dev_nonfatal_io_error(ca, fmt, ...)				\
+#define bch2_dev_nonfatal_io_error(ca, fmt, ...)			\
 do {									\
 	printk_ratelimited(KERN_ERR bch2_fmt((ca)->fs,			\
 		"IO error on %s for " fmt),				\

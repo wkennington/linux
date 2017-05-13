@@ -4,6 +4,7 @@
 #include "extents.h"
 #include "eytzinger.h"
 #include "super_types.h"
+#include "super.h"
 
 #include <asm/byteorder.h>
 
@@ -126,6 +127,22 @@ bool bch2_sb_has_replicas(struct bch_fs *, struct bkey_s_c_extent,
 int bch2_check_mark_super(struct bch_fs *, struct bkey_s_c_extent,
 			  enum bch_data_types);
 
+struct bch_devs_mask {
+	long d[BITS_TO_LONGS(BCH_SB_MEMBERS_MAX)];
+};
+
+static inline struct bch_devs_mask bch2_online_devs(struct bch_fs *c)
+{
+	struct bch_devs_mask devs;
+	struct bch_dev *ca;
+	unsigned i;
+
+	memset(&devs, 0, sizeof(devs));
+	for_each_online_member(ca, c, i)
+		__set_bit(ca->dev_idx, devs.d);
+	return devs;
+}
+
 struct replicas_status {
 	struct {
 		unsigned	nr_online;
@@ -134,8 +151,9 @@ struct replicas_status {
 };
 
 struct replicas_status __bch2_replicas_status(struct bch_fs *,
-					      struct bch_dev *);
+					      struct bch_devs_mask);
 struct replicas_status bch2_replicas_status(struct bch_fs *);
+bool bch2_have_enough_devs(struct bch_fs *, struct replicas_status, unsigned);
 
 unsigned bch2_replicas_online(struct bch_fs *, bool);
 unsigned bch2_dev_has_data(struct bch_fs *, struct bch_dev *);

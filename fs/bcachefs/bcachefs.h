@@ -365,6 +365,7 @@ struct bch_dev {
 	char			name[BDEVNAME_SIZE];
 
 	struct bcache_superblock disk_sb;
+	int			sb_write_error;
 
 	struct dev_group	self;
 

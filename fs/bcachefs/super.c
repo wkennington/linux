@@ -1262,31 +1262,6 @@ static int __bch2_dev_online(struct bch_fs *c, struct bcache_superblock *sb)
 
 /* Device management: */
 
-static bool have_enough_devs(struct bch_fs *c,
-			     struct replicas_status s,
-			     unsigned flags)
-{
-	if ((s.replicas[BCH_DATA_JOURNAL].nr_offline ||
-	     s.replicas[BCH_DATA_BTREE].nr_offline) &&
-	    !(flags & BCH_FORCE_IF_METADATA_DEGRADED))
-		return false;
-
-	if ((!s.replicas[BCH_DATA_JOURNAL].nr_online ||
-	     !s.replicas[BCH_DATA_BTREE].nr_online) &&
-	    !(flags & BCH_FORCE_IF_METADATA_LOST))
-		return false;
-
-	if (s.replicas[BCH_DATA_USER].nr_offline &&
-	    !(flags & BCH_FORCE_IF_DATA_DEGRADED))
-		return false;
-
-	if (!s.replicas[BCH_DATA_USER].nr_online &&
-	    !(flags & BCH_FORCE_IF_DATA_LOST))
-		return false;
-
-	return true;
-}
-
 /*
  * Note: this function is also used by the error paths - when a particular
  * device sees an error, we call it to determine whether we can just set the
@@ -1299,6 +1274,7 @@ static bool have_enough_devs(struct bch_fs *c,
 bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 			    enum bch_member_state new_state, int flags)
 {
+	struct bch_devs_mask new_online_devs;
 	struct replicas_status s;
 	struct bch_dev *ca2;
 	int i, nr_rw = 0, required;
@@ -1331,19 +1307,12 @@ bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 			return true;
 
 		/* do we have enough devices to read from?  */
-		s = __bch2_replicas_status(c, ca);
+		new_online_devs = bch2_online_devs(c);
+		__clear_bit(ca->dev_idx, new_online_devs.d);
 
-		pr_info("replicas: j %u %u b %u %u d %u %u",
-			s.replicas[BCH_DATA_JOURNAL].nr_online,
-			s.replicas[BCH_DATA_JOURNAL].nr_offline,
+		s = __bch2_replicas_status(c, new_online_devs);
 
-			s.replicas[BCH_DATA_BTREE].nr_online,
-			s.replicas[BCH_DATA_BTREE].nr_offline,
-
-			s.replicas[BCH_DATA_USER].nr_online,
-			s.replicas[BCH_DATA_USER].nr_offline);
-
-		return have_enough_devs(c, s, flags);
+		return bch2_have_enough_devs(c, s, flags);
 	default:
 		BUG();
 	}
@@ -1374,7 +1343,7 @@ static bool bch2_fs_may_start(struct bch_fs *c)
 
 	s = bch2_replicas_status(c);
 
-	return have_enough_devs(c, s, flags);
+	return bch2_have_enough_devs(c, s, flags);
 }
 
 static void __bch2_dev_read_only(struct bch_fs *c, struct bch_dev *ca)
