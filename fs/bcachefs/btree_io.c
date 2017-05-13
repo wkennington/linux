@@ -1356,7 +1356,15 @@ static void bch2_btree_node_write_error(struct bch_fs *c,
 	__BKEY_PADDED(k, BKEY_BTREE_PTR_VAL_U64s_MAX) tmp;
 	struct bkey_i_extent *new_key;
 
+	six_lock_read(&b->lock);
 	bkey_copy(&tmp.k, &b->key);
+	six_unlock_read(&b->lock);
+
+	if (!bkey_extent_is_data(&tmp.k.k) || !PTR_HASH(&tmp.k)) {
+		/* Node has been freed: */
+		goto out;
+	}
+
 	new_key = bkey_i_to_extent(&tmp.k);
 
 	while (wbio->replicas_failed) {
@@ -1371,7 +1379,7 @@ static void bch2_btree_node_write_error(struct bch_fs *c,
 		set_btree_node_noevict(b);
 		bch2_fatal_error(c);
 	}
-
+out:
 	bio_put(&wbio->bio);
 	btree_node_write_done(c, b);
 	if (cl)
