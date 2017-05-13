@@ -452,9 +452,8 @@ static void bch2_mark_pointer(struct bch_fs *c,
 			     const union bch_extent_crc *crc,
 			     const struct bch_extent_ptr *ptr,
 			     s64 sectors, enum s_alloc type,
-			     bool may_make_unavailable,
 			     struct bch_fs_usage *stats,
-			     bool gc_will_visit, u64 journal_seq)
+			     u64 journal_seq, unsigned flags)
 {
 	struct bucket_mark old, new;
 	unsigned saturated;
@@ -464,6 +463,7 @@ static void bch2_mark_pointer(struct bch_fs *c,
 		? BUCKET_BTREE : BUCKET_DATA;
 	unsigned old_sectors, new_sectors;
 	int disk_sectors, compressed_sectors;
+	u64 v;
 
 	if (sectors > 0) {
 		old_sectors = 0;
@@ -478,7 +478,7 @@ static void bch2_mark_pointer(struct bch_fs *c,
 	compressed_sectors = -__compressed_sectors(crc, old_sectors)
 		+ __compressed_sectors(crc, new_sectors);
 
-	if (gc_will_visit) {
+	if (flags & BCH_BUCKET_MARK_GC_WILL_VISIT) {
 		if (journal_seq)
 			bucket_cmpxchg(g, new, ({
 				new.touched_this_mount	= 1;
@@ -489,7 +489,9 @@ static void bch2_mark_pointer(struct bch_fs *c,
 		goto out;
 	}
 
-	old = bucket_data_cmpxchg(ca, g, new, ({
+	v = READ_ONCE(g->_mark.counter);
+	do {
+		new.counter = old.counter = v;
 		saturated = 0;
 
 		/*
@@ -528,7 +530,16 @@ static void bch2_mark_pointer(struct bch_fs *c,
 		}
 
 		new.touched_this_mount	= 1;
-	}));
+
+		if (flags & BCH_BUCKET_MARK_NOATOMIC) {
+			g->_mark = new;
+			break;
+		}
+	} while ((v = cmpxchg(&g->_mark.counter,
+			      old.counter,
+			      new.counter)) != old.counter);
+
+	bch2_dev_usage_update(ca, old, new);
 
 	if (old.data_type != data_type &&
 	    (old.data_type ||
@@ -537,7 +548,7 @@ static void bch2_mark_pointer(struct bch_fs *c,
 		bch_err(ca->fs, "bucket %zu has multiple types of data (%u, %u)",
 			g - ca->buckets, old.data_type, new.data_type);
 
-	BUG_ON(!may_make_unavailable &&
+	BUG_ON(!(flags & BCH_BUCKET_MARK_MAY_MAKE_UNAVAILABLE) &&
 	       bucket_became_unavailable(c, old, new));
 
 	if (saturated &&
@@ -556,9 +567,8 @@ out:
 
 static void bch2_mark_extent(struct bch_fs *c, struct bkey_s_c_extent e,
 			    s64 sectors, bool metadata,
-			    bool may_make_unavailable,
 			    struct bch_fs_usage *stats,
-			    bool gc_will_visit, u64 journal_seq)
+			    u64 journal_seq, unsigned flags)
 {
 	const struct bch_extent_ptr *ptr;
 	const union bch_extent_crc *crc;
@@ -570,22 +580,19 @@ static void bch2_mark_extent(struct bch_fs *c, struct bkey_s_c_extent e,
 	extent_for_each_ptr_crc(e, ptr, crc)
 		bch2_mark_pointer(c, e, crc, ptr, sectors,
 				 ptr->cached ? S_CACHED : type,
-				 may_make_unavailable,
-				 stats, gc_will_visit, journal_seq);
+				 stats, journal_seq, flags);
 }
 
-static void __bch2_mark_key(struct bch_fs *c, struct bkey_s_c k,
-			   s64 sectors, bool metadata,
-			   bool may_make_unavailable,
-			   struct bch_fs_usage *stats,
-			   bool gc_will_visit, u64 journal_seq)
+void __bch2_mark_key(struct bch_fs *c, struct bkey_s_c k,
+		     s64 sectors, bool metadata,
+		     struct bch_fs_usage *stats,
+		     u64 journal_seq, unsigned flags)
 {
 	switch (k.k->type) {
 	case BCH_EXTENT:
 	case BCH_EXTENT_CACHED:
 		bch2_mark_extent(c, bkey_s_c_to_extent(k), sectors, metadata,
-				may_make_unavailable, stats,
-				gc_will_visit, journal_seq);
+				stats, journal_seq, flags);
 		break;
 	case BCH_RESERVATION: {
 		struct bkey_s_c_reservation r = bkey_s_c_to_reservation(k);
@@ -596,19 +603,13 @@ static void __bch2_mark_key(struct bch_fs *c, struct bkey_s_c k,
 	}
 }
 
-void __bch2_gc_mark_key(struct bch_fs *c, struct bkey_s_c k,
-		       s64 sectors, bool metadata,
-		       struct bch_fs_usage *stats)
-{
-	__bch2_mark_key(c, k, sectors, metadata, true, stats, false, 0);
-}
-
 void bch2_gc_mark_key(struct bch_fs *c, struct bkey_s_c k,
-		     s64 sectors, bool metadata)
+		     s64 sectors, bool metadata, unsigned flags)
 {
 	struct bch_fs_usage stats = { 0 };
 
-	__bch2_gc_mark_key(c, k, sectors, metadata, &stats);
+	__bch2_mark_key(c, k, sectors, metadata, &stats, 0,
+			flags|BCH_BUCKET_MARK_MAY_MAKE_UNAVAILABLE);
 
 	preempt_disable();
 	bch2_usage_add(this_cpu_ptr(c->usage_percpu), &stats);
@@ -619,6 +620,8 @@ void bch2_mark_key(struct bch_fs *c, struct bkey_s_c k,
 		  s64 sectors, bool metadata, struct gc_pos gc_pos,
 		  struct bch_fs_usage *stats, u64 journal_seq)
 {
+	unsigned flags = gc_will_visit(c, gc_pos)
+		? BCH_BUCKET_MARK_GC_WILL_VISIT : 0;
 	/*
 	 * synchronization w.r.t. GC:
 	 *
@@ -647,9 +650,7 @@ void bch2_mark_key(struct bch_fs *c, struct bkey_s_c k,
 	 *    (e.g. the btree node lock, or the relevant allocator lock).
 	 */
 	lg_local_lock(&c->usage_lock);
-	__bch2_mark_key(c, k, sectors, metadata, false, stats,
-		       gc_will_visit(c, gc_pos), journal_seq);
-
+	__bch2_mark_key(c, k, sectors, metadata, stats, journal_seq, flags);
 	bch2_fs_stats_verify(c);
 	lg_local_unlock(&c->usage_lock);
 }

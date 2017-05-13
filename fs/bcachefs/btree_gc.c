@@ -112,14 +112,14 @@ u8 bch2_btree_key_recalc_oldest_gen(struct bch_fs *c, struct bkey_s_c k)
  * For runtime mark and sweep:
  */
 static u8 bch2_btree_mark_key(struct bch_fs *c, enum bkey_type type,
-			     struct bkey_s_c k)
+			      struct bkey_s_c k, unsigned flags)
 {
 	switch (type) {
 	case BKEY_TYPE_BTREE:
-		bch2_gc_mark_key(c, k, c->sb.btree_node_size, true);
+		bch2_gc_mark_key(c, k, c->sb.btree_node_size, true, flags);
 		return 0;
 	case BKEY_TYPE_EXTENTS:
-		bch2_gc_mark_key(c, k, k.k->size, false);
+		bch2_gc_mark_key(c, k, k.k->size, false, flags);
 		return bch2_btree_key_recalc_oldest_gen(c, k);
 	default:
 		BUG();
@@ -151,13 +151,10 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 		extent_for_each_ptr(e, ptr) {
 			struct bch_dev *ca = c->devs[ptr->dev];
 			struct bucket *g = PTR_BUCKET(ca, ptr);
-			struct bucket_mark new;
 
 			if (!g->mark.gen_valid) {
-				bucket_cmpxchg(g, new, ({
-					new.gen = ptr->gen;
-					new.gen_valid = 1;
-				}));
+				g->_mark.gen = ptr->gen;
+				g->_mark.gen_valid = 1;
 				ca->need_alloc_write = true;
 			}
 
@@ -166,10 +163,8 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 					type == BKEY_TYPE_BTREE
 					? "btree" : "data",
 					ptr->gen, g->mark.gen)) {
-				bucket_cmpxchg(g, new, ({
-					new.gen = ptr->gen;
-					new.gen_valid = 1;
-				}));
+				g->_mark.gen = ptr->gen;
+				g->_mark.gen_valid = 1;
 				ca->need_alloc_write = true;
 				set_bit(BCH_FS_FIXED_GENS, &c->flags);
 			}
@@ -184,13 +179,14 @@ int bch2_btree_mark_key_initial(struct bch_fs *c, enum bkey_type type,
 		     max_t(u64, k.k->version.lo,
 			   atomic64_read(&c->key_version)));
 
-	bch2_btree_mark_key(c, type, k);
+	bch2_btree_mark_key(c, type, k, BCH_BUCKET_MARK_NOATOMIC);
 fsck_err:
 	return ret;
 }
 
 static unsigned btree_gc_mark_node(struct bch_fs *c, struct btree *b)
 {
+	enum bkey_type type = btree_node_type(b);
 	struct btree_node_iter iter;
 	struct bkey unpacked;
 	struct bkey_s_c k;
@@ -201,8 +197,7 @@ static unsigned btree_gc_mark_node(struct bch_fs *c, struct btree *b)
 					       btree_node_is_extents(b),
 					       &unpacked) {
 			bch2_bkey_debugcheck(c, b, k);
-			stale = max(stale, bch2_btree_mark_key(c,
-							btree_node_type(b), k));
+			stale = max(stale, bch2_btree_mark_key(c, type, k, 0));
 		}
 
 	return stale;
@@ -269,7 +264,7 @@ static int bch2_gc_btree(struct bch_fs *c, enum btree_id btree_id)
 	mutex_lock(&c->btree_root_lock);
 
 	b = c->btree_roots[btree_id].b;
-	bch2_btree_mark_key(c, BKEY_TYPE_BTREE, bkey_i_to_s_c(&b->key));
+	bch2_btree_mark_key(c, BKEY_TYPE_BTREE, bkey_i_to_s_c(&b->key), 0);
 	gc_pos_set(c, gc_pos_btree_root(b->btree_id));
 
 	mutex_unlock(&c->btree_root_lock);
@@ -387,9 +382,10 @@ static void bch2_mark_pending_btree_node_frees(struct bch_fs *c)
 
 	for_each_pending_btree_node_free(c, as, d)
 		if (d->index_update_done)
-			__bch2_gc_mark_key(c, bkey_i_to_s_c(&d->key),
-					  c->sb.btree_node_size, true,
-					  &stats);
+			__bch2_mark_key(c, bkey_i_to_s_c(&d->key),
+					c->sb.btree_node_size, true,
+					&stats, 0,
+					BCH_BUCKET_MARK_MAY_MAKE_UNAVAILABLE);
 	/*
 	 * Don't apply stats - pending deletes aren't tracked in
 	 * bch_alloc_stats:

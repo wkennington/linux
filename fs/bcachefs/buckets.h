@@ -199,9 +199,15 @@ void bch2_mark_alloc_bucket(struct bch_dev *, struct bucket *, bool);
 void bch2_mark_metadata_bucket(struct bch_dev *, struct bucket *,
 			       enum bucket_data_type, bool);
 
-void __bch2_gc_mark_key(struct bch_fs *, struct bkey_s_c, s64, bool,
-		       struct bch_fs_usage *);
-void bch2_gc_mark_key(struct bch_fs *, struct bkey_s_c, s64, bool);
+#define BCH_BUCKET_MARK_NOATOMIC		(1 << 0)
+#define BCH_BUCKET_MARK_GC_WILL_VISIT		(1 << 1)
+#define BCH_BUCKET_MARK_MAY_MAKE_UNAVAILABLE	(1 << 2)
+
+void __bch2_mark_key(struct bch_fs *, struct bkey_s_c, s64, bool,
+		     struct bch_fs_usage *, u64, unsigned);
+
+void bch2_gc_mark_key(struct bch_fs *, struct bkey_s_c,
+		      s64, bool, unsigned);
 void bch2_mark_key(struct bch_fs *, struct bkey_s_c, s64, bool,
 		  struct gc_pos, struct bch_fs_usage *, u64);
 
