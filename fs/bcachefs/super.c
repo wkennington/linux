@@ -1349,11 +1349,13 @@ bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 	}
 }
 
-static bool bch2_fs_may_start(struct bch_fs *c, int flags)
+static bool bch2_fs_may_start(struct bch_fs *c)
 {
 	struct replicas_status s;
 	struct bch_sb_field_members *mi;
-	unsigned i;
+	unsigned i, flags = c->opts.degraded
+		? BCH_FORCE_IF_DEGRADED
+		: 0;
 
 	if (!c->opts.degraded) {
 		mutex_lock(&c->sb_lock);
@@ -1777,7 +1779,7 @@ const char *bch2_fs_open(char * const *devices, unsigned nr_devices,
 	mutex_unlock(&c->sb_lock);
 
 	err = "insufficient devices";
-	if (!bch2_fs_may_start(c, 0))
+	if (!bch2_fs_may_start(c))
 		goto err;
 
 	if (!c->opts.nostart) {
@@ -1848,7 +1850,7 @@ static const char *__bch2_fs_open_incremental(struct bcache_superblock *sb,
 	}
 	mutex_unlock(&c->sb_lock);
 
-	if (!c->opts.nostart && bch2_fs_may_start(c, 0)) {
+	if (!c->opts.nostart && bch2_fs_may_start(c)) {
 		err = __bch2_fs_start(c);
 		if (err)
 			goto err;
