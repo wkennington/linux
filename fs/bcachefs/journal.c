@@ -1086,7 +1086,6 @@ static bool journal_entry_is_open(struct journal *j)
 
 void bch2_journal_buf_put_slowpath(struct journal *j, bool need_write_just_set)
 {
-	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	struct journal_buf *w = journal_prev_buf(j);
 
 	atomic_dec_bug(&journal_seq_pin(j, w->data->seq)->count);
@@ -1096,10 +1095,10 @@ void bch2_journal_buf_put_slowpath(struct journal *j, bool need_write_just_set)
 		__bch2_time_stats_update(j->delay_time,
 					j->need_write_time);
 #if 0
-	closure_call(&j->io, journal_write, NULL, &c->cl);
+	closure_call(&j->io, journal_write, NULL, NULL);
 #else
 	/* Shut sparse up: */
-	closure_init(&j->io, &c->cl);
+	closure_init(&j->io, NULL);
 	set_closure_fn(&j->io, journal_write, NULL);
 	journal_write(&j->io);
 #endif
@@ -2099,17 +2098,23 @@ static void journal_write_compact(struct jset *jset)
 	jset->u64s = cpu_to_le32((u64 *) prev - jset->_data);
 }
 
-static void journal_write_endio(struct bio *bio)
+static void journal_buf_realloc(struct journal *j, struct journal_buf *buf)
 {
-	struct bch_dev *ca = bio->bi_private;
-	struct journal *j = &ca->fs->journal;
+	/* we aren't holding j->lock: */
+	unsigned new_size = READ_ONCE(j->buf_size_want);
+	void *new_buf;
 
-	if (bch2_dev_fatal_io_err_on(bio->bi_error, ca, "journal write") ||
-	    bch2_meta_write_fault("journal"))
-		bch2_journal_halt(j);
+	if (buf->size >= new_size)
+		return;
 
-	closure_put(&j->io);
-	percpu_ref_put(&ca->io_ref);
+	new_buf = kvpmalloc(new_size, GFP_NOIO|__GFP_NOWARN);
+	if (!new_buf)
+		return;
+
+	memcpy(new_buf, buf->data, buf->size);
+	kvpfree(buf->data, buf->size);
+	buf->data	= new_buf;
+	buf->size	= new_size;
 }
 
 static void journal_write_done(struct closure *cl)
@@ -2129,6 +2134,9 @@ static void journal_write_done(struct closure *cl)
 	 * bch2_fs_journal_stop():
 	 */
 	mod_delayed_work(system_freezable_wq, &j->reclaim_work, 0);
+
+	/* also must come before signalling write completion: */
+	closure_debug_destroy(cl);
 
 	BUG_ON(!j->reservations.prev_buf_unwritten);
 	atomic64_sub(((union journal_res_state) { .prev_buf_unwritten = 1 }).v,
@@ -2153,23 +2161,52 @@ static void journal_write_done(struct closure *cl)
 	wake_up(&j->wait);
 }
 
-static void journal_buf_realloc(struct journal *j, struct journal_buf *buf)
+static void journal_write_error(struct closure *cl)
 {
-	/* we aren't holding j->lock: */
-	unsigned new_size = READ_ONCE(j->buf_size_want);
-	void *new_buf;
+	struct journal *j = container_of(cl, struct journal, io);
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	struct bkey_s_extent e = bkey_i_to_s_extent(&j->key);
 
-	if (buf->size >= new_size)
-		return;
+	while (j->replicas_failed) {
+		unsigned idx = __fls(j->replicas_failed);
 
-	new_buf = kvpmalloc(new_size, GFP_NOIO|__GFP_NOWARN);
-	if (!new_buf)
-		return;
+		bch2_extent_drop_ptr_idx(e, idx);
+		j->replicas_failed ^= 1 << idx;
+	}
 
-	memcpy(new_buf, buf->data, buf->size);
-	kvpfree(buf->data, buf->size);
-	buf->data	= new_buf;
-	buf->size	= new_size;
+	if (!bch2_extent_nr_ptrs(e.c)) {
+		bch_err(c, "unable to write journal to sufficient devices");
+		goto err;
+	}
+
+	if (bch2_check_mark_super(c, e.c, BCH_DATA_JOURNAL))
+		goto err;
+
+out:
+	journal_write_done(cl);
+	return;
+err:
+	bch2_fatal_error(c);
+	bch2_journal_halt(j);
+	goto out;
+}
+
+static void journal_write_endio(struct bio *bio)
+{
+	struct bch_dev *ca = bio->bi_private;
+	struct journal *j = &ca->fs->journal;
+
+	if (bch2_dev_nonfatal_io_err_on(bio->bi_error, ca, "journal write") ||
+	    bch2_meta_write_fault("journal")) {
+		/* Was this a flush or an actual journal write? */
+		if (ca->journal.ptr_idx != U8_MAX) {
+			set_bit(ca->journal.ptr_idx, &j->replicas_failed);
+			set_closure_fn(&j->io, journal_write_error, system_wq);
+		}
+	}
+
+	closure_put(&j->io);
+	percpu_ref_put(&ca->io_ref);
 }
 
 static void journal_write(struct closure *cl)
@@ -2181,7 +2218,7 @@ static void journal_write(struct closure *cl)
 	struct jset *jset;
 	struct bio *bio;
 	struct bch_extent_ptr *ptr;
-	unsigned i, sectors, bytes;
+	unsigned i, sectors, bytes, ptr_idx = 0;
 
 	journal_buf_realloc(j, w);
 	jset = w->data;
@@ -2231,7 +2268,7 @@ static void journal_write(struct closure *cl)
 		bch2_journal_halt(j);
 		bch_err(c, "Unable to allocate journal write");
 		bch2_fatal_error(c);
-		closure_return_with_destructor(cl, journal_write_done);
+		continue_at(cl, journal_write_done, NULL);
 	}
 
 	if (bch2_check_mark_super(c, bkey_i_to_s_c_extent(&j->key),
@@ -2255,6 +2292,7 @@ static void journal_write(struct closure *cl)
 
 		atomic64_add(sectors, &ca->meta_sectors_written);
 
+		ca->journal.ptr_idx	= ptr_idx++;
 		bio = ca->journal.bio;
 		bio_reset(bio);
 		bio->bi_iter.bi_sector	= ptr->offset;
@@ -2277,6 +2315,7 @@ static void journal_write(struct closure *cl)
 		    !bch2_extent_has_device(bkey_i_to_s_c_extent(&j->key), i)) {
 			percpu_ref_get(&ca->io_ref);
 
+			ca->journal.ptr_idx = U8_MAX;
 			bio = ca->journal.bio;
 			bio_reset(bio);
 			bio->bi_bdev		= ca->disk_sb.bdev;
@@ -2290,10 +2329,10 @@ no_io:
 	extent_for_each_ptr(bkey_i_to_s_extent(&j->key), ptr)
 		ptr->offset += sectors;
 
-	closure_return_with_destructor(cl, journal_write_done);
+	continue_at(cl, journal_write_done, NULL);
 err:
 	bch2_inconsistent_error(c);
-	closure_return_with_destructor(cl, journal_write_done);
+	continue_at(cl, journal_write_done, NULL);
 }
 
 static void journal_write_work(struct work_struct *work)
