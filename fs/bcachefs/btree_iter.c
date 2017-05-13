@@ -247,14 +247,12 @@ fail:
 	return false;
 }
 
-static int __bch2_btree_iter_unlock(struct btree_iter *iter)
+static void __bch2_btree_iter_unlock(struct btree_iter *iter)
 {
 	while (iter->nodes_locked)
 		btree_node_unlock(iter, __ffs(iter->nodes_locked));
 
 	iter->flags &= ~BTREE_ITER_UPTODATE;
-
-	return iter->flags & BTREE_ITER_ERROR ? -EIO : 0;
 }
 
 int bch2_btree_iter_unlock(struct btree_iter *iter)
@@ -263,7 +261,9 @@ int bch2_btree_iter_unlock(struct btree_iter *iter)
 
 	for_each_linked_btree_iter(iter, linked)
 		__bch2_btree_iter_unlock(linked);
-	return __bch2_btree_iter_unlock(iter);
+	__bch2_btree_iter_unlock(iter);
+
+	return iter->flags & BTREE_ITER_ERROR ? -EIO : 0;
 }
 
 /* Btree iterator: */
@@ -617,13 +617,9 @@ bool bch2_btree_iter_node_replace(struct btree_iter *iter, struct btree *b)
 void bch2_btree_iter_node_drop_linked(struct btree_iter *iter, struct btree *b)
 {
 	struct btree_iter *linked;
-	unsigned level = b->level;
 
 	for_each_linked_btree_iter(iter, linked)
-		if (linked->nodes[level] == b) {
-			btree_node_unlock(linked, level);
-			linked->nodes[level] = BTREE_ITER_NOT_END;
-		}
+		bch2_btree_iter_node_drop(linked, b);
 }
 
 void bch2_btree_iter_node_drop(struct btree_iter *iter, struct btree *b)
@@ -631,9 +627,9 @@ void bch2_btree_iter_node_drop(struct btree_iter *iter, struct btree *b)
 	unsigned level = b->level;
 
 	if (iter->nodes[level] == b) {
-		BUG_ON(b->lock.state.intent_lock != 1);
 		btree_node_unlock(iter, level);
 		iter->nodes[level] = BTREE_ITER_NOT_END;
+		iter->flags &= ~BTREE_ITER_UPTODATE;
 	}
 }
 
