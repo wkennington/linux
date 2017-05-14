@@ -714,7 +714,8 @@ static void btree_iter_prefetch(struct btree_iter *iter)
 			break;
 
 		bch2_bkey_unpack(b, &tmp.k, k);
-		bch2_btree_node_prefetch(iter, &tmp.k, iter->level);
+		bch2_btree_node_prefetch(iter->c, &tmp.k,
+					 iter->level, iter->btree_id);
 	}
 
 	if (!was_locked)
@@ -731,7 +732,7 @@ static inline int btree_iter_down(struct btree_iter *iter)
 
 	bkey_reassemble(&tmp.k, k);
 
-	b = bch2_btree_node_get(iter, &tmp.k, level, lock_type);
+	b = bch2_btree_node_get(iter->c, iter, &tmp.k, level, lock_type);
 	if (unlikely(IS_ERR(b)))
 		return PTR_ERR(b);
 

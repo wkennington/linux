@@ -9,6 +9,8 @@
 #include "bkey_methods.h"
 #include "btree_gc.h"
 #include "btree_update.h"
+#include "btree_update_interior.h"
+#include "buckets.h"
 #include "checksum.h"
 #include "debug.h"
 #include "dirent.h"
@@ -622,12 +624,10 @@ bch2_btree_pick_ptr(struct bch_fs *c, const struct btree *b)
 
 	extent_for_each_ptr_crc(e, ptr, crc) {
 		struct bch_dev *ca = c->devs[ptr->dev];
-		struct btree *root = btree_node_root(c, b);
 
 		if (bch2_fs_inconsistent_on(crc, c,
-				"btree node pointer with crc at btree %u level %u/%u bucket %zu",
-				b->btree_id, b->level, root ? root->level : -1,
-				PTR_BUCKET_NR(ca, ptr)))
+				"btree node pointer with crc at btree %u level %u bucket %zu",
+				b->btree_id, b->level, PTR_BUCKET_NR(ca, ptr)))
 			break;
 
 		if (ca->mi.state == BCH_MEMBER_STATE_FAILED)

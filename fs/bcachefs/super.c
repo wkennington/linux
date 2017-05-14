@@ -11,6 +11,7 @@
 #include "btree_cache.h"
 #include "btree_gc.h"
 #include "btree_update.h"
+#include "btree_update_interior.h"
 #include "btree_io.h"
 #include "chardev.h"
 #include "checksum.h"
@@ -584,7 +585,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 	    mempool_init_kmalloc_pool(&c->btree_reserve_pool, 1,
 				      sizeof(struct btree_reserve)) ||
 	    mempool_init_kmalloc_pool(&c->btree_interior_update_pool, 1,
-				      sizeof(struct btree_interior_update)) ||
+				      sizeof(struct btree_update)) ||
 	    mempool_init_kmalloc_pool(&c->fill_iter, 1, iter_size) ||
 	    bioset_init(&c->btree_read_bio, 1,
 			offsetof(struct btree_read_bio, bio)) ||

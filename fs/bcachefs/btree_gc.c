@@ -7,7 +7,7 @@
 #include "alloc.h"
 #include "bkey_methods.h"
 #include "btree_locking.h"
-#include "btree_update.h"
+#include "btree_update_interior.h"
 #include "btree_io.h"
 #include "btree_gc.h"
 #include "buckets.h"
@@ -374,7 +374,7 @@ static void bch2_mark_metadata(struct bch_fs *c)
 static void bch2_mark_pending_btree_node_frees(struct bch_fs *c)
 {
 	struct bch_fs_usage stats = { 0 };
-	struct btree_interior_update *as;
+	struct btree_update *as;
 	struct pending_btree_node_free *d;
 
 	mutex_lock(&c->btree_interior_update_lock);
@@ -547,16 +547,14 @@ static void recalc_packed_keys(struct btree *b)
 		btree_keys_account_key_add(&b->nr, 0, k);
 }
 
-static void bch2_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
-				struct btree_iter *iter)
+static void bch2_coalesce_nodes(struct bch_fs *c, struct btree_iter *iter,
+				struct btree *old_nodes[GC_MERGE_NODES])
 {
 	struct btree *parent = iter->nodes[old_nodes[0]->level + 1];
-	struct bch_fs *c = iter->c;
 	unsigned i, nr_old_nodes, nr_new_nodes, u64s = 0;
 	unsigned blocks = btree_blocks(c) * 2 / 3;
 	struct btree *new_nodes[GC_MERGE_NODES];
-	struct btree_interior_update *as;
-	struct btree_reserve *res;
+	struct btree_update *as;
 	struct keylist keylist;
 	struct bkey_format_state format_state;
 	struct bkey_format new_format;
@@ -576,23 +574,6 @@ static void bch2_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 			     DIV_ROUND_UP(u64s, nr_old_nodes - 1)) > blocks)
 		return;
 
-	res = bch2_btree_reserve_get(c, parent, nr_old_nodes,
-				    BTREE_INSERT_NOFAIL|
-				    BTREE_INSERT_USE_RESERVE,
-				    NULL);
-	if (IS_ERR(res)) {
-		trace_btree_gc_coalesce_fail(c,
-				BTREE_GC_COALESCE_FAIL_RESERVE_GET);
-		return;
-	}
-
-	if (bch2_keylist_realloc(&keylist, NULL, 0,
-			(BKEY_U64s + BKEY_EXTENT_U64s_MAX) * nr_old_nodes)) {
-		trace_btree_gc_coalesce_fail(c,
-				BTREE_GC_COALESCE_FAIL_KEYLIST_REALLOC);
-		goto out;
-	}
-
 	/* Find a format that all keys in @old_nodes can pack into */
 	bch2_bkey_format_init(&format_state);
 
@@ -606,21 +587,38 @@ static void bch2_coalesce_nodes(struct btree *old_nodes[GC_MERGE_NODES],
 		if (!bch2_btree_node_format_fits(c, old_nodes[i], &new_format)) {
 			trace_btree_gc_coalesce_fail(c,
 					BTREE_GC_COALESCE_FAIL_FORMAT_FITS);
-			goto out;
+			return;
 		}
+
+	if (bch2_keylist_realloc(&keylist, NULL, 0,
+			(BKEY_U64s + BKEY_EXTENT_U64s_MAX) * nr_old_nodes)) {
+		trace_btree_gc_coalesce_fail(c,
+				BTREE_GC_COALESCE_FAIL_KEYLIST_REALLOC);
+		return;
+	}
+
+	as = bch2_btree_update_start(c, iter->btree_id,
+			btree_update_reserve_required(c, parent) + nr_old_nodes,
+			BTREE_INSERT_NOFAIL|
+			BTREE_INSERT_USE_RESERVE,
+			NULL);
+	if (IS_ERR(as)) {
+		trace_btree_gc_coalesce_fail(c,
+				BTREE_GC_COALESCE_FAIL_RESERVE_GET);
+		bch2_keylist_free(&keylist, NULL);
+		return;
+	}
 
 	trace_btree_gc_coalesce(c, parent, nr_old_nodes);
 
-	as = bch2_btree_interior_update_alloc(c);
-
 	for (i = 0; i < nr_old_nodes; i++)
-		bch2_btree_interior_update_will_free_node(c, as, old_nodes[i]);
+		bch2_btree_interior_update_will_free_node(as, old_nodes[i]);
 
 	/* Repack everything with @new_format and sort down to one bset */
 	for (i = 0; i < nr_old_nodes; i++)
 		new_nodes[i] =
-			__bch2_btree_node_alloc_replacement(c, old_nodes[i],
-							    new_format, as, res);
+			__bch2_btree_node_alloc_replacement(as, old_nodes[i],
+							    new_format);
 
 	/*
 	 * Conceptually we concatenate the nodes together and slice them
@@ -734,7 +732,7 @@ next:
 		bch2_keylist_add_in_order(&keylist, &new_nodes[i]->key);
 
 	/* Insert the newly coalesced nodes */
-	bch2_btree_insert_node(parent, iter, &keylist, res, as);
+	bch2_btree_insert_node(as, parent, iter, &keylist);
 
 	BUG_ON(!bch2_keylist_empty(&keylist));
 
@@ -747,7 +745,7 @@ next:
 
 	/* Free the old nodes and update our sliding window */
 	for (i = 0; i < nr_old_nodes; i++) {
-		bch2_btree_node_free_inmem(iter, old_nodes[i]);
+		bch2_btree_node_free_inmem(c, old_nodes[i], iter);
 		six_unlock_intent(&old_nodes[i]->lock);
 
 		/*
@@ -764,9 +762,9 @@ next:
 				six_unlock_intent(&new_nodes[i]->lock);
 		}
 	}
-out:
+
+	bch2_btree_update_done(as);
 	bch2_keylist_free(&keylist, NULL);
-	bch2_btree_reserve_put(c, res);
 }
 
 static int bch2_coalesce_btree(struct bch_fs *c, enum btree_id btree_id)
@@ -810,7 +808,7 @@ static int bch2_coalesce_btree(struct bch_fs *c, enum btree_id btree_id)
 		}
 		memset(merge + i, 0, (GC_MERGE_NODES - i) * sizeof(merge[0]));
 
-		bch2_coalesce_nodes(merge, &iter);
+		bch2_coalesce_nodes(c, &iter, merge);
 
 		for (i = 1; i < GC_MERGE_NODES && merge[i]; i++) {
 			lock_seq[i] = merge[i]->lock.state.seq;

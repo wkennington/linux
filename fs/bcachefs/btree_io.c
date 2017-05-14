@@ -2,10 +2,11 @@
 #include "bcachefs.h"
 #include "bkey_methods.h"
 #include "btree_cache.h"
-#include "btree_update.h"
 #include "btree_io.h"
 #include "btree_iter.h"
 #include "btree_locking.h"
+#include "btree_update.h"
+#include "btree_update_interior.h"
 #include "buckets.h"
 #include "checksum.h"
 #include "debug.h"
@@ -1327,7 +1328,7 @@ int bch2_btree_root_read(struct bch_fs *c, enum btree_id id,
 		return -EIO;
 	}
 
-	bch2_btree_set_root_initial(c, b, NULL);
+	bch2_btree_set_root_for_read(c, b);
 	six_unlock_intent(&b->lock);
 
 	return 0;

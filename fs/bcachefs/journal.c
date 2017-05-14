@@ -10,6 +10,7 @@
 #include "buckets.h"
 #include "btree_gc.h"
 #include "btree_update.h"
+#include "btree_update_interior.h"
 #include "btree_io.h"
 #include "checksum.h"
 #include "debug.h"
@@ -150,7 +151,7 @@ static void journal_seq_blacklist_flush(struct journal *j,
 	}
 
 	for (i = 0;; i++) {
-		struct btree_interior_update *as;
+		struct btree_update *as;
 		struct pending_btree_node_free *d;
 
 		mutex_lock(&j->blacklist_lock);
