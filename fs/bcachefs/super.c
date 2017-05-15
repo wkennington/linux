@@ -1121,7 +1121,7 @@ static int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 	spin_lock_init(&ca->freelist_lock);
 	bch2_dev_moving_gc_init(ca);
 
-	INIT_WORK(&ca->io_error_work, bch2_nonfatal_io_error_work);
+	INIT_WORK(&ca->io_error_work, bch2_io_error_work);
 
 	if (bch2_fs_init_fault("dev_alloc"))
 		goto err;

@@ -674,9 +674,9 @@ reread:			sectors_read = min_t(unsigned,
 
 			ret = submit_bio_wait(bio);
 
-			if (bch2_dev_fatal_io_err_on(ret, ca,
-						  "journal read from sector %llu",
-						  offset) ||
+			if (bch2_dev_io_err_on(ret, ca,
+					       "journal read from sector %llu",
+					       offset) ||
 			    bch2_meta_read_fault("journal"))
 				return -EIO;
 
@@ -2195,7 +2195,7 @@ static void journal_write_endio(struct bio *bio)
 	struct bch_dev *ca = bio->bi_private;
 	struct journal *j = &ca->fs->journal;
 
-	if (bch2_dev_nonfatal_io_err_on(bio->bi_error, ca, "journal write") ||
+	if (bch2_dev_io_err_on(bio->bi_error, ca, "journal write") ||
 	    bch2_meta_write_fault("journal")) {
 		/* Was this a flush or an actual journal write? */
 		if (ca->journal.ptr_idx != U8_MAX) {

@@ -314,8 +314,7 @@ static void bch2_write_endio(struct bio *bio)
 	struct bch_fs *c		= wbio->c;
 	struct bch_dev *ca		= wbio->ca;
 
-	if (bch2_dev_nonfatal_io_err_on(bio->bi_error, ca,
-					"data write"))
+	if (bch2_dev_io_err_on(bio->bi_error, ca, "data write"))
 		set_closure_fn(cl, bch2_write_io_error, index_update_wq(op));
 
 	if (wbio->have_io_ref)
@@ -857,7 +856,7 @@ static int bio_checksum_uncompress(struct bch_fs *c,
 	}
 
 	csum = bch2_checksum_bio(c, rbio->crc.csum_type, nonce, src);
-	if (bch2_dev_nonfatal_io_err_on(bch2_crc_cmp(rbio->crc.csum, csum),
+	if (bch2_dev_io_err_on(bch2_crc_cmp(rbio->crc.csum, csum),
 					rbio->ca,
 			"data checksum error, inode %llu offset %llu: expected %0llx%0llx got %0llx%0llx (type %u)",
 			rbio->inode, (u64) rbio->parent_iter.bi_sector << 9,
@@ -1016,7 +1015,7 @@ static void bch2_read_endio(struct bio *bio)
 		container_of(bio, struct bch_read_bio, bio);
 	struct bch_fs *c = rbio->c;
 
-	if (bch2_dev_nonfatal_io_err_on(bio->bi_error, rbio->ca, "data read")) {
+	if (bch2_dev_io_err_on(bio->bi_error, rbio->ca, "data read")) {
 		/* XXX: retry IO errors when we have another replica */
 		bch2_rbio_error(rbio, bio->bi_error);
 		return;

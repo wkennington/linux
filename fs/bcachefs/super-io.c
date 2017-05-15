@@ -700,7 +700,7 @@ static void write_super_endio(struct bio *bio)
 
 	/* XXX: return errors directly */
 
-	if (bch2_dev_nonfatal_io_err_on(bio->bi_error, ca, "superblock write"))
+	if (bch2_dev_io_err_on(bio->bi_error, ca, "superblock write"))
 		ca->sb_write_error = 1;
 
 	closure_put(&ca->fs->sb_write);

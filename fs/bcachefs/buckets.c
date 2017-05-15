@@ -367,12 +367,15 @@ void bch2_mark_free_bucket(struct bch_dev *ca, struct bucket *g)
 void bch2_mark_alloc_bucket(struct bch_dev *ca, struct bucket *g,
 			   bool owned_by_allocator)
 {
-	struct bucket_mark new;
+	struct bucket_mark old, new;
 
-	bucket_data_cmpxchg(ca, g, new, ({
+	old = bucket_data_cmpxchg(ca, g, new, ({
 		new.touched_this_mount	= 1;
 		new.owned_by_allocator	= owned_by_allocator;
 	}));
+
+	BUG_ON(!owned_by_allocator && !old.owned_by_allocator &&
+	       ca->fs->gc_pos.phase == GC_PHASE_DONE);
 }
 
 #define saturated_add(ca, dst, src, max)			\
