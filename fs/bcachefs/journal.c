@@ -1734,13 +1734,11 @@ void bch2_journal_pin_drop(struct journal *j,
 			  struct journal_entry_pin *pin)
 {
 	unsigned long flags;
-	bool wakeup;
-
-	if (!journal_pin_active(pin))
-		return;
+	bool wakeup = false;
 
 	spin_lock_irqsave(&j->pin_lock, flags);
-	wakeup = __journal_pin_drop(j, pin);
+	if (journal_pin_active(pin))
+		wakeup = __journal_pin_drop(j, pin);
 	spin_unlock_irqrestore(&j->pin_lock, flags);
 
 	/*
