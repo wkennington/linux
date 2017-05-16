@@ -144,7 +144,6 @@ static bool btree_key_matches(struct bch_fs *c,
 	return false;
 }
 
-
 /*
  * We're doing the index update that makes @b unreachable, update stuff to
  * reflect that:
@@ -1868,31 +1867,49 @@ retry:
 
 	btree_interior_update_add_node_reference(as, b);
 
-	if (new_hash) {
-		bkey_copy(&new_hash->key, &new_key->k_i);
-		BUG_ON(bch2_btree_node_hash_insert(c, new_hash,
-					b->level, b->btree_id));
-	}
-
 	parent = iter.nodes[b->level + 1];
 	if (parent) {
+		if (new_hash) {
+			bkey_copy(&new_hash->key, &new_key->k_i);
+			BUG_ON(bch2_btree_node_hash_insert(c, new_hash,
+							b->level, b->btree_id));
+		}
+
 		bch2_btree_insert_node(as, parent, &iter,
-				       &keylist_single(&b->key));
+				       &keylist_single(&new_key->k_i));
+
+		if (new_hash) {
+			mutex_lock(&c->btree_cache_lock);
+			bch2_btree_node_hash_remove(c, b);
+
+			bkey_copy(&b->key, &new_key->k_i);
+			__bch2_btree_node_hash_insert(c, b);
+
+			bch2_btree_node_hash_remove(c, new_hash);
+			mutex_unlock(&c->btree_cache_lock);
+		} else {
+			bkey_copy(&b->key, &new_key->k_i);
+		}
 	} else {
-		bch2_btree_set_root(as, b, &iter);
-	}
+		struct bch_fs_usage stats = { 0 };
 
-	if (new_hash) {
-		mutex_lock(&c->btree_cache_lock);
-		bch2_btree_node_hash_remove(c, b);
+		BUG_ON(btree_node_root(c, b) != b);
 
+		bch2_btree_node_lock_write(b, &iter);
+
+		bch2_mark_key(c, bkey_i_to_s_c(&new_key->k_i),
+			      c->sb.btree_node_size, true,
+			      gc_pos_btree_root(b->btree_id),
+			      &stats, 0);
+		bch2_btree_node_free_index(as, NULL,
+					   bkey_i_to_s_c(&b->key),
+					   &stats);
+		bch2_fs_usage_apply(c, &stats, &as->reserve->disk_res,
+				    gc_pos_btree_root(b->btree_id));
 		bkey_copy(&b->key, &new_key->k_i);
-		__bch2_btree_node_hash_insert(c, b);
 
-		bch2_btree_node_hash_remove(c, new_hash);
-		mutex_unlock(&c->btree_cache_lock);
-	} else {
-		bkey_copy(&b->key, &new_key->k_i);
+		btree_update_updated_root(as);
+		bch2_btree_node_unlock_write(b, &iter);
 	}
 
 	bch2_btree_update_done(as);
