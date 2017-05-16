@@ -105,11 +105,4 @@ static inline struct bch_read_bio *rbio_init(struct bio *bio)
 	return rbio;
 }
 
-static inline void __bio_inc_remaining(struct bio *bio)
-{
-	bio_set_flag(bio, BIO_CHAIN);
-	smp_mb__before_atomic();
-	atomic_inc(&bio->__bi_remaining);
-}
-
 #endif /* _BCACHE_IO_H */

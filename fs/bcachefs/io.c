@@ -106,7 +106,7 @@ void bch2_submit_wbio_replicas(struct bch_write_bio *wbio, struct bch_fs *c,
 			n->bounce		= false;
 			n->put_bio		= true;
 			n->bio.bi_opf		= wbio->bio.bi_opf;
-			__bio_inc_remaining(&wbio->bio);
+			bio_inc_remaining(&wbio->bio);
 		} else {
 			n = wbio;
 			n->split		= false;
@@ -1256,7 +1256,7 @@ retry:
 
 		if (pick.ca) {
 			if (fragment.bi_size != bvec_iter.bi_size) {
-				__bio_inc_remaining(&rbio->bio);
+				bio_inc_remaining(&rbio->bio);
 				flags |= BCH_READ_MUST_CLONE;
 				trace_read_split(&rbio->bio);
 			}

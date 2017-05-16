@@ -756,7 +756,7 @@ static void bchfs_read(struct bch_fs *c, struct btree_iter *iter,
 
 		if (pick.ca) {
 			if (!is_last) {
-				__bio_inc_remaining(&rbio->bio);
+				bio_inc_remaining(&rbio->bio);
 				flags |= BCH_READ_MUST_CLONE;
 				trace_read_split(&rbio->bio);
 			}
