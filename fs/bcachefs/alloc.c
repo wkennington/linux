@@ -912,7 +912,7 @@ static int bch2_allocator_thread(void *arg)
 				bucket = fifo_peek(&ca->free_inc);
 				discard_invalidated_bucket(ca, bucket);
 				if (kthread_should_stop())
-					goto out;
+					return 0;
 				--ca->nr_invalidated;
 			}
 
@@ -922,7 +922,7 @@ static int bch2_allocator_thread(void *arg)
 			journal_seq = 0;
 			ret = bch2_invalidate_free_inc(c, ca, &journal_seq);
 			if (ret < 0)
-				goto out;
+				return 0;
 
 			ca->nr_invalidated = ret;
 
@@ -944,7 +944,7 @@ static int bch2_allocator_thread(void *arg)
 		down_read(&c->gc_lock);
 		if (test_bit(BCH_FS_GC_FAILURE, &c->flags)) {
 			up_read(&c->gc_lock);
-			goto out;
+			return 0;
 		}
 
 		while (1) {
@@ -973,7 +973,7 @@ static int bch2_allocator_thread(void *arg)
 
 			if (wait_buckets_available(c, ca)) {
 				up_read(&c->gc_lock);
-				goto out;
+				return 0;
 			}
 		}
 		up_read(&c->gc_lock);
@@ -992,13 +992,6 @@ static int bch2_allocator_thread(void *arg)
 		 * write out the new bucket gens:
 		 */
 	}
-out:
-	/*
-	 * Avoid a race with bch2_usage_update() trying to wake us up after
-	 * we've exited:
-	 */
-	synchronize_rcu();
-	return 0;
 }
 
 /* Allocation */
@@ -1892,16 +1885,16 @@ void bch2_dev_allocator_stop(struct bch_dev *ca)
 	struct task_struct *p = ca->alloc_thread;
 
 	ca->alloc_thread = NULL;
-	smp_wmb();
 
 	/*
 	 * We need an rcu barrier between setting ca->alloc_thread = NULL and
-	 * the thread shutting down to avoid a race with bch2_usage_update() -
-	 * the allocator thread itself does a synchronize_rcu() on exit.
+	 * the thread shutting down to avoid bch2_wake_allocator() racing:
 	 *
 	 * XXX: it would be better to have the rcu barrier be asynchronous
 	 * instead of blocking us here
 	 */
+	synchronize_rcu();
+
 	if (p)
 		kthread_stop(p);
 }
