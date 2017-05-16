@@ -503,8 +503,8 @@ void bch2_get_read_device(struct bch_fs *c,
 			  const struct bkey *k,
 			  const struct bch_extent_ptr *ptr,
 			  const union bch_extent_crc *crc,
-			  struct extent_pick_ptr *pick,
-			  struct bch_dev *avoid)
+			  struct bch_devs_mask *avoid,
+			  struct extent_pick_ptr *pick)
 {
 	struct bch_dev *ca = c->devs[ptr->dev];
 
@@ -514,9 +514,10 @@ void bch2_get_read_device(struct bch_fs *c,
 	if (ca->mi.state == BCH_MEMBER_STATE_FAILED)
 		return;
 
-	if (pick->ca &&
-	    (ca == avoid ||
-	     pick->ca->mi.tier < ca->mi.tier))
+	if (avoid && test_bit(ca->dev_idx, avoid->d))
+		return;
+
+	if (pick->ca && pick->ca->mi.tier < ca->mi.tier)
 		return;
 
 	if (!percpu_ref_tryget(&ca->io_ref))
@@ -536,14 +537,14 @@ void bch2_get_read_device(struct bch_fs *c,
 
 static void extent_pick_read_device(struct bch_fs *c,
 				    struct bkey_s_c_extent e,
-				    struct bch_dev *avoid,
+				    struct bch_devs_mask *avoid,
 				    struct extent_pick_ptr *pick)
 {
 	const union bch_extent_crc *crc;
 	const struct bch_extent_ptr *ptr;
 
 	extent_for_each_ptr_crc(e, ptr, crc)
-		bch2_get_read_device(c, e.k, ptr, crc, pick, avoid);
+		bch2_get_read_device(c, e.k, ptr, crc, avoid, pick);
 }
 
 /* Btree ptrs */
@@ -2052,9 +2053,9 @@ void bch2_extent_mark_replicas_cached(struct bch_fs *c,
  * as the pointers are sorted by tier, hence preferring pointers to tier 0
  * rather than pointers to tier 1.
  */
-void bch2_extent_pick_ptr_avoiding(struct bch_fs *c, struct bkey_s_c k,
-				   struct bch_dev *avoid,
-				   struct extent_pick_ptr *ret)
+void bch2_extent_pick_ptr(struct bch_fs *c, struct bkey_s_c k,
+			  struct bch_devs_mask *avoid,
+			  struct extent_pick_ptr *ret)
 {
 	struct bkey_s_c_extent e;
 

@@ -47,7 +47,7 @@ void bch2_io_error_work(struct work_struct *work)
 
 void bch2_io_error(struct bch_dev *ca)
 {
-	queue_work(system_long_wq, &ca->io_error_work);
+	//queue_work(system_long_wq, &ca->io_error_work);
 }
 
 #ifdef __KERNEL__

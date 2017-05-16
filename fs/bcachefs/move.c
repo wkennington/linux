@@ -260,9 +260,12 @@ static void __bch2_data_move(struct closure *cl)
 	struct moving_io *io = container_of(cl, struct moving_io, cl);
 	struct bch_fs *c = io->write.op.c;
 	struct extent_pick_ptr pick;
+	struct bch_devs_mask avoid;
 
-	bch2_extent_pick_ptr_avoiding(c, bkey_i_to_s_c(&io->write.key),
-				     io->ctxt->avoid, &pick);
+	if (io->ctxt->avoid)
+		__set_bit(io->ctxt->avoid->dev_idx, avoid.d);
+
+	bch2_extent_pick_ptr(c, bkey_i_to_s_c(&io->write.key), &avoid, &pick);
 	if (IS_ERR_OR_NULL(pick.ca))
 		closure_return_with_destructor(cl, moving_io_destructor);
 
@@ -278,7 +281,7 @@ static void __bch2_data_move(struct closure *cl)
 
 	bch2_read_extent(c, &io->rbio,
 			bkey_i_to_s_c(&io->write.key),
-			&pick, BCH_READ_IS_LAST);
+			&pick, 0);
 }
 
 int bch2_data_move(struct bch_fs *c,

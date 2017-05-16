@@ -3,6 +3,7 @@
 
 #include "bcachefs.h"
 #include "bkey.h"
+#include "io_types.h"
 
 struct bch_fs;
 struct journal_res;
@@ -10,6 +11,7 @@ struct btree_node_iter;
 struct btree_insert;
 struct btree_insert_entry;
 struct extent_insert_hook;
+struct bch_devs_mask;
 union bch_extent_crc;
 
 struct btree_nr_keys bch2_key_sort_fix_overlapping(struct bset *,
@@ -23,30 +25,18 @@ struct btree_nr_keys bch2_extent_sort_fix_overlapping(struct bch_fs *c,
 extern const struct bkey_ops bch2_bkey_btree_ops;
 extern const struct bkey_ops bch2_bkey_extent_ops;
 
-struct extent_pick_ptr {
-	struct bch_extent_crc128	crc;
-	struct bch_extent_ptr		ptr;
-	struct bch_dev			*ca;
-};
-
 void bch2_get_read_device(struct bch_fs *,
 			  const struct bkey *,
 			  const struct bch_extent_ptr *,
 			  const union bch_extent_crc *,
-			  struct extent_pick_ptr *,
-			  struct bch_dev *);
+			  struct bch_devs_mask *,
+			  struct extent_pick_ptr *);
 struct extent_pick_ptr
 bch2_btree_pick_ptr(struct bch_fs *, const struct btree *);
 
-void bch2_extent_pick_ptr_avoiding(struct bch_fs *, struct bkey_s_c,
-				  struct bch_dev *, struct extent_pick_ptr *);
-
-static inline void
-bch2_extent_pick_ptr(struct bch_fs *c, struct bkey_s_c k,
-		    struct extent_pick_ptr *ret)
-{
-	bch2_extent_pick_ptr_avoiding(c, k, NULL, ret);
-}
+void bch2_extent_pick_ptr(struct bch_fs *, struct bkey_s_c,
+			  struct bch_devs_mask *,
+			  struct extent_pick_ptr *);
 
 enum btree_insert_ret
 bch2_insert_fixup_extent(struct btree_insert *,

@@ -417,7 +417,6 @@ static void bch2_fs_exit(struct bch_fs *c)
 	del_timer_sync(&c->foreground_write_wakeup);
 	cancel_delayed_work_sync(&c->pd_controllers_update);
 	cancel_work_sync(&c->read_only_work);
-	cancel_work_sync(&c->read_retry_work);
 
 	for (i = 0; i < c->sb.nr_devices; i++)
 		if (c->devs[i])
@@ -519,10 +518,6 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 
 	mutex_init(&c->bio_bounce_pages_lock);
 	mutex_init(&c->zlib_workspace_lock);
-
-	bio_list_init(&c->read_retry_list);
-	spin_lock_init(&c->read_retry_lock);
-	INIT_WORK(&c->read_retry_work, bch2_read_retry_work);
 
 	bio_list_init(&c->btree_write_error_list);
 	spin_lock_init(&c->btree_write_error_lock);

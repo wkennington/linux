@@ -127,22 +127,6 @@ bool bch2_sb_has_replicas(struct bch_fs *, struct bkey_s_c_extent,
 int bch2_check_mark_super(struct bch_fs *, struct bkey_s_c_extent,
 			  enum bch_data_types);
 
-struct bch_devs_mask {
-	long d[BITS_TO_LONGS(BCH_SB_MEMBERS_MAX)];
-};
-
-static inline struct bch_devs_mask bch2_online_devs(struct bch_fs *c)
-{
-	struct bch_devs_mask devs;
-	struct bch_dev *ca;
-	unsigned i;
-
-	memset(&devs, 0, sizeof(devs));
-	for_each_online_member(ca, c, i)
-		__set_bit(ca->dev_idx, devs.d);
-	return devs;
-}
-
 struct replicas_status {
 	struct {
 		unsigned	nr_online;

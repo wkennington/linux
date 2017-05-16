@@ -282,7 +282,6 @@ do {									\
 #include "alloc_types.h"
 #include "buckets_types.h"
 #include "clock_types.h"
-#include "io_types.h"
 #include "journal_types.h"
 #include "keylist_types.h"
 #include "move_types.h"
@@ -721,10 +720,6 @@ struct bch_fs {
 	struct crypto_shash	*poly1305;
 
 	atomic64_t		key_version;
-
-	struct bio_list		read_retry_list;
-	struct work_struct	read_retry_work;
-	spinlock_t		read_retry_lock;
 
 	struct bio_list		btree_write_error_list;
 	struct work_struct	btree_write_error_work;

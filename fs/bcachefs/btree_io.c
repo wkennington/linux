@@ -1210,6 +1210,7 @@ static void btree_node_read_work(struct work_struct *work)
 	struct bio *bio		= &rb->bio;
 	struct bkey_s_c_extent e = bkey_i_to_s_c_extent(&b->key);
 	const struct bch_extent_ptr *ptr;
+	struct bch_devs_mask avoid;
 
 	bch2_dev_io_err_on(bio->bi_error, rb->pick.ca, "btree read");
 	percpu_ref_put(&rb->pick.ca->io_ref);
@@ -1226,9 +1227,12 @@ out:
 	wake_up_bit(&b->flags, BTREE_NODE_read_in_flight);
 	return;
 err:
+	memset(&avoid, 0, sizeof(avoid));
+	__set_bit(ca->dev_idx, avoid.d);
+
 	extent_for_each_ptr(e, ptr) {
 		memset(&rb->pick, 0, sizeof(rb->pick));
-		bch2_get_read_device(c, e.k, ptr, NULL, &rb->pick, ca);
+		bch2_get_read_device(c, e.k, ptr, NULL, &avoid, &rb->pick);
 
 		if (!rb->pick.ca)
 			continue;
@@ -1240,8 +1244,7 @@ err:
 		bio->bi_iter.bi_size	= btree_bytes(c);
 		submit_bio_wait(bio);
 
-		bch2_dev_io_err_on(bio->bi_error, rb->pick.ca,
-				   "btree read");
+		bch2_dev_io_err_on(bio->bi_error, rb->pick.ca, "btree read");
 		percpu_ref_put(&rb->pick.ca->io_ref);
 
 		if (!bio->bi_error &&
@@ -1398,9 +1401,9 @@ void bch2_btree_write_error_work(struct work_struct *work)
 	struct bio *bio;
 
 	while (1) {
-		spin_lock_irq(&c->read_retry_lock);
-		bio = bio_list_pop(&c->read_retry_list);
-		spin_unlock_irq(&c->read_retry_lock);
+		spin_lock_irq(&c->btree_write_error_lock);
+		bio = bio_list_pop(&c->btree_write_error_list);
+		spin_unlock_irq(&c->btree_write_error_lock);
 
 		if (!bio)
 			break;
@@ -1441,7 +1444,7 @@ static void btree_node_write_endio(struct bio *bio)
 		unsigned long flags;
 
 		spin_lock_irqsave(&c->btree_write_error_lock, flags);
-		bio_list_add(&c->read_retry_list, &wbio->bio);
+		bio_list_add(&c->btree_write_error_list, &wbio->bio);
 		spin_unlock_irqrestore(&c->btree_write_error_lock, flags);
 		queue_work(c->wq, &c->btree_write_error_work);
 		return;
