@@ -146,17 +146,17 @@ static void pd_controllers_update(struct work_struct *work)
 
 			u64 size = (ca->mi.nbuckets -
 				    ca->mi.first_bucket) << bucket_bits;
-			u64 dirty = stats.buckets_dirty << bucket_bits;
+			u64 dirty = stats.buckets[S_DIRTY] << bucket_bits;
 			u64 free = __dev_buckets_free(ca, stats) << bucket_bits;
 			/*
 			 * Bytes of internal fragmentation, which can be
 			 * reclaimed by copy GC
 			 */
-			s64 fragmented = ((stats.buckets_dirty +
+			s64 fragmented = ((stats.buckets[S_DIRTY] +
 					   stats.buckets_cached) <<
 					  bucket_bits) -
 				((stats.sectors[S_DIRTY] +
-				  stats.sectors[S_CACHED] ) << 9);
+				  stats.sectors_cached) << 9);
 
 			fragmented = max(0LL, fragmented);
 

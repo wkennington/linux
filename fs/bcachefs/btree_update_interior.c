@@ -157,6 +157,7 @@ static void bch2_btree_node_free_index(struct btree_update *as, struct btree *b,
 {
 	struct bch_fs *c = as->c;
 	struct pending_btree_node_free *d;
+	unsigned replicas;
 
 	/*
 	 * btree_update lock is only needed here to avoid racing with
@@ -178,8 +179,9 @@ found:
 	 * Btree nodes are accounted as freed in bch_alloc_stats when they're
 	 * freed from the index:
 	 */
-	stats->s[S_COMPRESSED][S_META]	 -= c->sb.btree_node_size;
-	stats->s[S_UNCOMPRESSED][S_META] -= c->sb.btree_node_size;
+	replicas = bch2_extent_nr_dirty_ptrs(k);
+	if (replicas)
+		stats->s[replicas - 1].data[S_META] -= c->sb.btree_node_size;
 
 	/*
 	 * We're dropping @k from the btree, but it's still live until the

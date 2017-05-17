@@ -124,9 +124,9 @@ static inline u64 __dev_buckets_available(struct bch_dev *ca,
 {
 	return max_t(s64, 0,
 		     ca->mi.nbuckets - ca->mi.first_bucket -
-		     stats.buckets_dirty -
-		     stats.buckets_alloc -
-		     stats.buckets_meta);
+		     stats.buckets[S_META] -
+		     stats.buckets[S_DIRTY] -
+		     stats.buckets_alloc);
 }
 
 /*
@@ -157,16 +157,31 @@ struct bch_fs_usage bch2_fs_usage_read(struct bch_fs *);
 void bch2_fs_usage_apply(struct bch_fs *, struct bch_fs_usage *,
 			struct disk_reservation *, struct gc_pos);
 
+struct fs_usage_sum {
+	u64	data;
+	u64	reserved;
+};
+
+static inline struct fs_usage_sum __fs_usage_sum(struct bch_fs_usage stats)
+{
+	struct fs_usage_sum sum = { 0 };
+	unsigned i;
+
+	for (i = 0; i < BCH_REPLICAS_MAX; i++) {
+		sum.data += (stats.s[i].data[S_META] +
+			     stats.s[i].data[S_DIRTY]) * (i + 1);
+		sum.reserved += stats.s[i].persistent_reserved * (i + 1);
+	}
+
+	sum.reserved += stats.online_reserved;
+	return sum;
+}
+
 static inline u64 __bch2_fs_sectors_used(struct bch_fs *c)
 {
-	struct bch_fs_usage stats = __bch2_fs_usage_read(c);
-	u64 reserved = stats.persistent_reserved +
-		stats.online_reserved;
+	struct fs_usage_sum sum = __fs_usage_sum(__bch2_fs_usage_read(c));
 
-	return stats.s[S_COMPRESSED][S_META] +
-		stats.s[S_COMPRESSED][S_DIRTY] +
-		reserved +
-		(reserved >> 7);
+	return sum.data + sum.reserved + (sum.reserved >> 7);
 }
 
 static inline u64 bch2_fs_sectors_used(struct bch_fs *c)

@@ -426,7 +426,6 @@ void bch2_gc_start(struct bch_fs *c)
 			per_cpu_ptr(c->usage_percpu, cpu);
 
 		memset(p->s, 0, sizeof(p->s));
-		p->persistent_reserved = 0;
 	}
 
 	lg_global_unlock(&c->usage_lock);
