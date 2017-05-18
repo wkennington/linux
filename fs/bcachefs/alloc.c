@@ -1895,8 +1895,10 @@ void bch2_dev_allocator_stop(struct bch_dev *ca)
 	 */
 	synchronize_rcu();
 
-	if (p)
+	if (p) {
 		kthread_stop(p);
+		put_task_struct(p);
+	}
 }
 
 /* start allocator thread: */
@@ -1910,11 +1912,13 @@ int bch2_dev_allocator_start(struct bch_dev *ca)
 	if (ca->alloc_thread)
 		return 0;
 
-	p = kthread_run(bch2_allocator_thread, ca, "bcache_allocator");
+	p = kthread_create(bch2_allocator_thread, ca, "bcache_allocator");
 	if (IS_ERR(p))
 		return PTR_ERR(p);
 
+	get_task_struct(p);
 	ca->alloc_thread = p;
+	wake_up_process(p);
 	return 0;
 }
 
