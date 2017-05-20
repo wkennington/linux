@@ -2123,6 +2123,7 @@ static void journal_write_done(struct closure *cl)
 
 	__bch2_time_stats_update(j->write_time, j->write_start_time);
 
+	spin_lock(&j->lock);
 	j->last_seq_ondisk = le64_to_cpu(w->data->last_seq);
 
 	/*
@@ -2141,23 +2142,12 @@ static void journal_write_done(struct closure *cl)
 	atomic64_sub(((union journal_res_state) { .prev_buf_unwritten = 1 }).v,
 		     &j->reservations.counter);
 
-	/*
-	 * XXX: this is racy, we could technically end up doing the wake up
-	 * after the journal_buf struct has been reused for the next write
-	 * (because we're clearing JOURNAL_IO_IN_FLIGHT) and wake up things that
-	 * are waiting on the _next_ write, not this one.
-	 *
-	 * The wake up can't come before, because journal_flush_seq_async() is
-	 * looking at JOURNAL_IO_IN_FLIGHT when it has to wait on a journal
-	 * write that was already in flight.
-	 *
-	 * The right fix is to use a lock here, but using j.lock here means it
-	 * has to be a spin_lock_irqsave() lock which then requires propagating
-	 * the irq()ness to other locks and it's all kinds of nastiness.
-	 */
-
 	closure_wake_up(&w->wait);
 	wake_up(&j->wait);
+
+	if (test_bit(JOURNAL_NEED_WRITE, &j->flags))
+		mod_delayed_work(system_freezable_wq, &j->write_work, 0);
+	spin_unlock(&j->lock);
 }
 
 static void journal_write_error(struct closure *cl)
@@ -2200,7 +2190,8 @@ static void journal_write_endio(struct bio *bio)
 		/* Was this a flush or an actual journal write? */
 		if (ca->journal.ptr_idx != U8_MAX) {
 			set_bit(ca->journal.ptr_idx, &j->replicas_failed);
-			set_closure_fn(&j->io, journal_write_error, system_wq);
+			set_closure_fn(&j->io, journal_write_error,
+				       system_highpri_wq);
 		}
 	}
 
@@ -2267,7 +2258,7 @@ static void journal_write(struct closure *cl)
 		bch2_journal_halt(j);
 		bch_err(c, "Unable to allocate journal write");
 		bch2_fatal_error(c);
-		continue_at(cl, journal_write_done, NULL);
+		continue_at(cl, journal_write_done, system_highpri_wq);
 	}
 
 	if (bch2_check_mark_super(c, bkey_i_to_s_c_extent(&j->key),
@@ -2328,10 +2319,10 @@ no_io:
 	extent_for_each_ptr(bkey_i_to_s_extent(&j->key), ptr)
 		ptr->offset += sectors;
 
-	continue_at(cl, journal_write_done, NULL);
+	continue_at(cl, journal_write_done, system_highpri_wq);
 err:
 	bch2_inconsistent_error(c);
-	continue_at(cl, journal_write_done, NULL);
+	continue_at(cl, journal_write_done, system_highpri_wq);
 }
 
 static void journal_write_work(struct work_struct *work)
@@ -2562,18 +2553,61 @@ void bch2_journal_flush_seq_async(struct journal *j, u64 seq, struct closure *pa
 	spin_unlock(&j->lock);
 }
 
+static int journal_seq_flushed(struct journal *j, u64 seq)
+{
+	struct journal_buf *buf;
+	int ret = 1;
+
+	spin_lock(&j->lock);
+	BUG_ON(seq > atomic64_read(&j->seq));
+
+	if (seq == atomic64_read(&j->seq)) {
+		bool set_need_write = false;
+
+		ret = 0;
+
+		buf = journal_cur_buf(j);
+
+		if (!test_and_set_bit(JOURNAL_NEED_WRITE, &j->flags)) {
+			j->need_write_time = local_clock();
+			set_need_write = true;
+		}
+
+		switch (journal_buf_switch(j, set_need_write)) {
+		case JOURNAL_ENTRY_ERROR:
+			ret = -EIO;
+			break;
+		case JOURNAL_ENTRY_CLOSED:
+			/*
+			 * Journal entry hasn't been opened yet, but caller
+			 * claims it has something (seq == j->seq):
+			 */
+			BUG();
+		case JOURNAL_ENTRY_INUSE:
+			break;
+		case JOURNAL_UNLOCKED:
+			return 0;
+		}
+	} else if (seq + 1 == atomic64_read(&j->seq) &&
+		   j->reservations.prev_buf_unwritten) {
+		ret = bch2_journal_error(j);
+	}
+
+	spin_unlock(&j->lock);
+
+	return ret;
+}
+
 int bch2_journal_flush_seq(struct journal *j, u64 seq)
 {
-	struct closure cl;
 	u64 start_time = local_clock();
+	int ret, ret2;
 
-	closure_init_stack(&cl);
-	bch2_journal_flush_seq_async(j, seq, &cl);
-	closure_sync(&cl);
+	ret = wait_event_killable(j->wait, (ret2 = journal_seq_flushed(j, seq)));
 
 	bch2_time_stats_update(j->flush_seq_time, start_time);
 
-	return bch2_journal_error(j);
+	return ret ?: ret2 < 0 ? ret2 : 0;
 }
 
 void bch2_journal_meta_async(struct journal *j, struct closure *parent)
