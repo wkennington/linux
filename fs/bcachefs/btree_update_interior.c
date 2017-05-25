@@ -1918,7 +1918,7 @@ retry:
 out:
 	if (new_hash) {
 		mutex_lock(&c->btree_cache_lock);
-		list_move(&b->list, &c->btree_cache_freeable);
+		list_move(&new_hash->list, &c->btree_cache_freeable);
 		mutex_unlock(&c->btree_cache_lock);
 
 		six_unlock_write(&new_hash->lock);
