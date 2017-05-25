@@ -904,6 +904,8 @@ int __must_check bch2_btree_iter_traverse(struct btree_iter *iter)
 {
 	int ret;
 
+	iter->flags &= ~BTREE_ITER_UPTODATE;
+
 	if (unlikely(!iter->nodes[iter->level]))
 		return 0;
 
