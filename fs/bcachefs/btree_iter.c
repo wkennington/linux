@@ -904,6 +904,8 @@ int __must_check bch2_btree_iter_traverse(struct btree_iter *iter)
 {
 	int ret;
 
+	iter->flags &= ~BTREE_ITER_UPTODATE;
+
 	if (unlikely(!iter->nodes[iter->level]))
 		return 0;
 
@@ -1061,11 +1063,14 @@ struct bkey_s_c bch2_btree_iter_peek(struct btree_iter *iter)
 		struct btree *b = iter->nodes[0];
 		struct bkey_packed *k =
 			__bch2_btree_node_iter_peek_all(&iter->node_iters[0], b);
-
-		return (struct bkey_s_c) {
+		struct bkey_s_c ret = {
 			.k = &iter->k,
 			.v = bkeyp_val(&b->format, k)
 		};
+
+		if (debug_check_bkeys(iter->c))
+			bch2_bkey_debugcheck(iter->c, b, ret);
+		return ret;
 	}
 
 	while (1) {

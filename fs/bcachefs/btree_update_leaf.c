@@ -5,6 +5,7 @@
 #include "btree_io.h"
 #include "btree_iter.h"
 #include "btree_locking.h"
+#include "debug.h"
 #include "extents.h"
 #include "journal.h"
 #include "keylist.h"
@@ -320,6 +321,9 @@ int __bch2_btree_insert_at(struct btree_insert *trans)
 	trans_for_each_entry(trans, i) {
 		BUG_ON(i->iter->level);
 		BUG_ON(bkey_cmp(bkey_start_pos(&i->k->k), i->iter->pos));
+		BUG_ON(debug_check_bkeys(c) &&
+		       bch2_bkey_invalid(c, i->iter->btree_id,
+					 bkey_i_to_s_c(i->k)));
 	}
 
 	sort(trans->entries, trans->nr, sizeof(trans->entries[0]),
