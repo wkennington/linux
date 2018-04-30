@@ -5,11 +5,11 @@
  * Copyright 2012 Google, Inc.
  */
 
+#include <linux/closure.h>
 #include <linux/debugfs.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/seq_file.h>
-
-#include "closure.h"
+#include <linux/sched/debug.h>
 
 static inline void closure_put_after_sub(struct closure *cl, int flags)
 {
@@ -17,10 +17,6 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
 
 	BUG_ON(flags & CLOSURE_GUARD_MASK);
 	BUG_ON(!r && (flags & ~CLOSURE_DESTRUCTOR));
-
-	/* Must deliver precisely one wakeup */
-	if (r == 1 && (flags & CLOSURE_SLEEPING))
-		wake_up_process(cl->task);
 
 	if (!r) {
 		if (cl->fn && !(flags & CLOSURE_DESTRUCTOR)) {
@@ -100,30 +96,37 @@ bool closure_wait(struct closure_waitlist *waitlist, struct closure *cl)
 }
 EXPORT_SYMBOL(closure_wait);
 
-/**
- * closure_sync - sleep until a closure has nothing left to wait on
- *
- * Sleeps until the refcount hits 1 - the thread that's running the closure owns
- * the last refcount.
- */
-void closure_sync(struct closure *cl)
+struct closure_syncer {
+	struct task_struct	*task;
+	int			done;
+};
+
+static void closure_sync_fn(struct closure *cl)
 {
+	cl->s->done = 1;
+	wake_up_process(cl->s->task);
+}
+
+void __sched __closure_sync(struct closure *cl)
+{
+	struct closure_syncer s = { .task = current };
+
+	cl->s = &s;
+	continue_at_noreturn(cl, closure_sync_fn, NULL);
+
 	while (1) {
-		__closure_start_sleep(cl);
-		closure_set_ret_ip(cl);
-
-		if ((atomic_read(&cl->remaining) &
-		     CLOSURE_REMAINING_MASK) == 1)
+		__set_current_state(TASK_UNINTERRUPTIBLE);
+		smp_mb();
+		if (s.done)
 			break;
-
 		schedule();
 	}
 
-	__closure_end_sleep(cl);
+	__set_current_state(TASK_RUNNING);
 }
-EXPORT_SYMBOL(closure_sync);
+EXPORT_SYMBOL(__closure_sync);
 
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+#ifdef CONFIG_DEBUG_CLOSURES
 
 static LIST_HEAD(closure_list);
 static DEFINE_SPINLOCK(closure_list_lock);
@@ -159,6 +162,7 @@ static struct dentry *debug;
 static int debug_seq_show(struct seq_file *f, void *data)
 {
 	struct closure *cl;
+
 	spin_lock_irq(&closure_list_lock);
 
 	list_for_each_entry(cl, &closure_list, all) {
@@ -168,18 +172,16 @@ static int debug_seq_show(struct seq_file *f, void *data)
 			   cl, (void *) cl->ip, cl->fn, cl->parent,
 			   r & CLOSURE_REMAINING_MASK);
 
-		seq_printf(f, "%s%s%s%s\n",
+		seq_printf(f, "%s%s\n",
 			   test_bit(WORK_STRUCT_PENDING_BIT,
 				    work_data_bits(&cl->work)) ? "Q" : "",
-			   r & CLOSURE_RUNNING	? "R" : "",
-			   r & CLOSURE_STACK	? "S" : "",
-			   r & CLOSURE_SLEEPING	? "Sl" : "");
+			   r & CLOSURE_RUNNING	? "R" : "");
 
 		if (r & CLOSURE_WAITING)
 			seq_printf(f, " W %pF\n",
 				   (void *) cl->waiting_on);
 
-		seq_printf(f, "\n");
+		seq_puts(f, "\n");
 	}
 
 	spin_unlock_irq(&closure_list_lock);
@@ -198,12 +200,11 @@ static const struct file_operations debug_ops = {
 	.release	= single_release
 };
 
-void __init closure_debug_init(void)
+static int __init closure_debug_init(void)
 {
 	debug = debugfs_create_file("closures", 0400, NULL, NULL, &debug_ops);
+	return 0;
 }
+late_initcall(closure_debug_init)
 
 #endif
-
-MODULE_AUTHOR("Kent Overstreet <koverstreet@google.com>");
-MODULE_LICENSE("GPL");

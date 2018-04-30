@@ -39,7 +39,7 @@ obj-y += bcd.o div64.o sort.o parser.o debug_locks.o random32.o \
 	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iov_iter.o clz_ctz.o \
 	 bsearch.o find_bit.o llist.o memweight.o kfifo.o \
 	 percpu-refcount.o percpu_ida.o rhashtable.o reciprocal_div.o \
-	 once.o refcount.o usercopy.o errseq.o
+	 once.o refcount.o usercopy.o errseq.o generic-radix-tree.o
 obj-$(CONFIG_STRING_SELFTEST) += test_string.o
 obj-y += string_helpers.o
 obj-$(CONFIG_TEST_STRING_HELPERS) += test-string_helpers.o
@@ -156,6 +156,8 @@ obj-$(CONFIG_HAVE_ARCH_TRACEHOOK) += syscall.o
 
 obj-$(CONFIG_DYNAMIC_DEBUG) += dynamic_debug.o
 
+obj-$(CONFIG_DYNAMIC_FAULT) += dynamic_fault.o
+
 obj-$(CONFIG_NLATTR) += nlattr.o
 
 obj-$(CONFIG_LRU_CACHE) += lru_cache.o
@@ -169,6 +171,8 @@ obj-$(CONFIG_GENERIC_ATOMIC64) += atomic64.o
 obj-$(CONFIG_ATOMIC64_SELFTEST) += atomic64_test.o
 
 obj-$(CONFIG_CPU_RMAP) += cpu_rmap.o
+
+obj-$(CONFIG_CLOSURES) += closure.o
 
 obj-$(CONFIG_CORDIC) += cordic.o
 

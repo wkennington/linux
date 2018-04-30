@@ -200,6 +200,10 @@ static void req_bio_endio(struct request *rq, struct bio *bio,
 	bio_advance(bio, nbytes);
 
 	/* don't actually finish bio if it's part of flush sequence */
+	/*
+	 * XXX this code looks suspicious - it's not consistent with advancing
+	 * req->bio in caller
+	 */
 	if (bio->bi_iter.bi_size == 0 && !(rq->rq_flags & RQF_FLUSH_SEQ))
 		bio_endio(bio);
 }
@@ -2950,8 +2954,10 @@ bool blk_update_request(struct request *req, blk_status_t error,
 		struct bio *bio = req->bio;
 		unsigned bio_bytes = min(bio->bi_iter.bi_size, nr_bytes);
 
-		if (bio_bytes == bio->bi_iter.bi_size)
+		if (bio_bytes == bio->bi_iter.bi_size) {
 			req->bio = bio->bi_next;
+			bio->bi_next = NULL;
+		}
 
 		/* Completion has already been traced */
 		bio_clear_flag(bio, BIO_TRACE_COMPLETION);
@@ -3375,7 +3381,7 @@ int blk_rq_prep_clone(struct request *rq, struct request *rq_src,
 	struct bio *bio, *bio_src;
 
 	if (!bs)
-		bs = fs_bio_set;
+		bs = &fs_bio_set;
 
 	__rq_for_each_bio(bio_src, rq_src) {
 		bio = bio_clone_fast(bio_src, gfp_mask, bs);
