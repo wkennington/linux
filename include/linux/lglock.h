@@ -84,7 +84,8 @@ void lg_global_unlock(struct lglock *lg);
 #define lglock spinlock
 #define DEFINE_LGLOCK(name) DEFINE_SPINLOCK(name)
 #define DEFINE_STATIC_LGLOCK(name) static DEFINE_SPINLOCK(name)
-#define lg_lock_init(lg, name) spin_lock_init(lg)
+#define lg_lock_init(lg)	({ spin_lock_init(lg); 0; })
+#define lg_lock_free(lg)	do {} while (0)
 #define lg_local_lock spin_lock
 #define lg_local_unlock spin_unlock
 #define lg_local_lock_cpu(lg, cpu) spin_lock(lg)
