@@ -206,14 +206,12 @@ void bch2_bkey_swab_key(const struct bkey_format *, struct bkey_packed *);
 
 static __always_inline int bversion_cmp(struct bversion l, struct bversion r)
 {
-	if (l.hi != r.hi)
-		return l.hi < r.hi ? -1 : 1;
-	if (l.lo != r.lo)
-		return l.lo < r.lo ? -1 : 1;
-	return 0;
+	return  (l.hi > r.hi) - (l.hi < r.hi) ?:
+		(l.lo > r.lo) - (l.lo < r.lo);
 }
 
 #define ZERO_VERSION	((struct bversion) { .hi = 0, .lo = 0 })
+#define MAX_VERSION	((struct bversion) { .hi = ~0, .lo = ~0ULL })
 
 static __always_inline int bversion_zero(struct bversion v)
 {
@@ -265,6 +263,16 @@ static inline struct bpos bkey_successor(struct bpos p)
 
 	if (!++ret.offset)
 		BUG_ON(!++ret.inode);
+
+	return ret;
+}
+
+static inline struct bpos bkey_predecessor(struct bpos p)
+{
+	struct bpos ret = p;
+
+	if (!ret.offset--)
+		BUG_ON(!ret.inode--);
 
 	return ret;
 }
