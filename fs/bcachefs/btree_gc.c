@@ -324,9 +324,16 @@ void bch2_mark_dev_superblock(struct bch_fs *c, struct bch_dev *ca,
 	unsigned i;
 	u64 b;
 
+	/*
+	 * This conditional is kind of gross, but we may be called from the
+	 * device add path, before the new device has actually been added to the
+	 * running filesystem:
+	 */
 	if (c) {
 		lockdep_assert_held(&c->sb_lock);
 		percpu_down_read_preempt_disable(&c->usage_lock);
+	} else {
+		preempt_disable();
 	}
 
 	for (i = 0; i < layout->nr_superblocks; i++) {
@@ -354,6 +361,8 @@ void bch2_mark_dev_superblock(struct bch_fs *c, struct bch_dev *ca,
 	if (c) {
 		percpu_up_read_preempt_enable(&c->usage_lock);
 		spin_unlock(&c->journal.lock);
+	} else {
+		preempt_enable();
 	}
 }
 
@@ -557,9 +566,6 @@ void bch2_gc(struct bch_fs *c)
 
 	bch2_mark_pending_btree_node_frees(c);
 	bch2_mark_allocator_buckets(c);
-
-	for_each_member_device(ca, c, i)
-		atomic_long_set(&ca->saturated_count, 0);
 
 	/* Indicates that gc is no longer in progress: */
 	gc_pos_set(c, gc_phase(GC_PHASE_DONE));

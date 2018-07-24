@@ -177,23 +177,40 @@ static int bch2_quota_reservation_add(struct bch_fs *c,
 
 /* i_size updates: */
 
+struct inode_new_size {
+	loff_t		new_size;
+	u64		now;
+	unsigned	fields;
+};
+
 static int inode_set_size(struct bch_inode_info *inode,
 			  struct bch_inode_unpacked *bi,
 			  void *p)
 {
-	loff_t *new_i_size = p;
+	struct inode_new_size *s = p;
 
-	lockdep_assert_held(&inode->ei_update_lock);
+	bi->bi_size = s->new_size;
+	if (s->fields & ATTR_ATIME)
+		bi->bi_atime = s->now;
+	if (s->fields & ATTR_MTIME)
+		bi->bi_mtime = s->now;
+	if (s->fields & ATTR_CTIME)
+		bi->bi_ctime = s->now;
 
-	bi->bi_size = *new_i_size;
 	return 0;
 }
 
 static int __must_check bch2_write_inode_size(struct bch_fs *c,
 					      struct bch_inode_info *inode,
-					      loff_t new_size)
+					      loff_t new_size, unsigned fields)
 {
-	return __bch2_write_inode(c, inode, inode_set_size, &new_size, 0);
+	struct inode_new_size s = {
+		.new_size	= new_size,
+		.now		= bch2_current_time(c),
+		.fields		= fields,
+	};
+
+	return bch2_write_inode(c, inode, inode_set_size, &s, fields);
 }
 
 static void i_sectors_acct(struct bch_fs *c, struct bch_inode_info *inode,
@@ -241,6 +258,7 @@ static int i_sectors_dirty_finish_fn(struct bch_inode_info *inode,
 				     struct bch_inode_unpacked *bi,
 				     void *p)
 {
+	struct bch_fs *c = inode->v.i_sb->s_fs_info;
 	struct i_sectors_hook *h = p;
 
 	if (h->new_i_size != U64_MAX &&
@@ -249,6 +267,7 @@ static int i_sectors_dirty_finish_fn(struct bch_inode_info *inode,
 		bi->bi_size = h->new_i_size;
 	bi->bi_sectors	+= h->sectors;
 	bi->bi_flags	&= ~h->flags;
+	bi->bi_mtime	= bi->bi_ctime = bch2_current_time(c);
 	return 0;
 }
 
@@ -259,7 +278,8 @@ static int i_sectors_dirty_finish(struct bch_fs *c, struct i_sectors_hook *h)
 	mutex_lock(&h->inode->ei_update_lock);
 	i_sectors_acct(c, h->inode, &h->quota_res, h->sectors);
 
-	ret = __bch2_write_inode(c, h->inode, i_sectors_dirty_finish_fn, h, 0);
+	ret = bch2_write_inode(c, h->inode, i_sectors_dirty_finish_fn,
+			       h, ATTR_MTIME|ATTR_CTIME);
 
 	if (!ret && h->new_i_size != U64_MAX)
 		i_size_write(&h->inode->v, h->new_i_size);
@@ -289,7 +309,7 @@ static int i_sectors_dirty_start(struct bch_fs *c, struct i_sectors_hook *h)
 	int ret;
 
 	mutex_lock(&h->inode->ei_update_lock);
-	ret = __bch2_write_inode(c, h->inode, i_sectors_dirty_start_fn, h, 0);
+	ret = bch2_write_inode(c, h->inode, i_sectors_dirty_start_fn, h, 0);
 	mutex_unlock(&h->inode->ei_update_lock);
 
 	return ret;
@@ -354,8 +374,6 @@ bchfs_extent_update_hook(struct extent_insert_hook *hook,
 
 		h->inode_u.bi_size = offset;
 		do_pack = true;
-
-		inode->ei_inode.bi_size = offset;
 
 		spin_lock(&inode->v.i_lock);
 		if (offset > inode->v.i_size) {
@@ -478,6 +496,7 @@ static int bchfs_write_index_update(struct bch_write_op *wop)
 					&hook.hook, op_journal_seq(wop),
 					BTREE_INSERT_NOFAIL|
 					BTREE_INSERT_ATOMIC|
+					BTREE_INSERT_NOUNLOCK|
 					BTREE_INSERT_USE_RESERVE,
 					BTREE_INSERT_ENTRY(extent_iter, k));
 		}
@@ -492,6 +511,9 @@ err:
 			continue;
 		if (ret)
 			break;
+
+		if (hook.need_inode_update)
+			op->inode->ei_inode = hook.inode_u;
 
 		BUG_ON(bkey_cmp(extent_iter->pos, k->k.p) < 0);
 		bch2_keylist_pop_front(keys);
@@ -2068,7 +2090,7 @@ int bch2_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct bch_inode_info *inode = file_bch_inode(file);
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-	int ret;
+	int ret, ret2;
 
 	ret = file_write_and_wait_range(file, start, end);
 	if (ret)
@@ -2084,7 +2106,10 @@ out:
 	if (c->opts.journal_flush_disabled)
 		return 0;
 
-	return bch2_journal_flush_seq(&c->journal, inode->ei_journal_seq);
+	ret = bch2_journal_flush_seq(&c->journal, inode->ei_journal_seq);
+	ret2 = file_check_and_advance_wb_err(file);
+
+	return ret ?: ret2;
 }
 
 /* truncate: */
@@ -2203,8 +2228,8 @@ static int bch2_extend(struct bch_inode_info *inode, struct iattr *iattr)
 	setattr_copy(&inode->v, iattr);
 
 	mutex_lock(&inode->ei_update_lock);
-	inode->v.i_mtime = inode->v.i_ctime = current_time(&inode->v);
-	ret = bch2_write_inode_size(c, inode, inode->v.i_size);
+	ret = bch2_write_inode_size(c, inode, inode->v.i_size,
+				    ATTR_MTIME|ATTR_CTIME);
 	mutex_unlock(&inode->ei_update_lock);
 
 	return ret;
@@ -2262,7 +2287,6 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 		goto err_put_sectors_dirty;
 
 	setattr_copy(&inode->v, iattr);
-	inode->v.i_mtime = inode->v.i_ctime = current_time(&inode->v);
 out:
 	ret = i_sectors_dirty_finish(c, &i_sectors_hook) ?: ret;
 err_put_pagecache:
@@ -2595,7 +2619,7 @@ btree_iter_err:
 		i_size_write(&inode->v, end);
 
 		mutex_lock(&inode->ei_update_lock);
-		ret = bch2_write_inode_size(c, inode, inode->v.i_size);
+		ret = bch2_write_inode_size(c, inode, inode->v.i_size, 0);
 		mutex_unlock(&inode->ei_update_lock);
 	}
 
@@ -2611,7 +2635,8 @@ btree_iter_err:
 
 		if (inode->ei_inode.bi_size != inode->v.i_size) {
 			mutex_lock(&inode->ei_update_lock);
-			ret = bch2_write_inode_size(c, inode, inode->v.i_size);
+			ret = bch2_write_inode_size(c, inode,
+						    inode->v.i_size, 0);
 			mutex_unlock(&inode->ei_update_lock);
 		}
 	}

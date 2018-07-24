@@ -578,6 +578,8 @@ static void bch2_btree_update_free(struct btree_update *as)
 {
 	struct bch_fs *c = as->c;
 
+	bch2_journal_pin_flush(&c->journal, &as->journal);
+
 	BUG_ON(as->nr_new_nodes);
 	BUG_ON(as->nr_pending);
 
@@ -1142,7 +1144,8 @@ static void bch2_btree_set_root(struct btree_update *as, struct btree *b,
 	struct btree *old;
 
 	trace_btree_set_root(c, b);
-	BUG_ON(!b->written);
+	BUG_ON(!b->written &&
+	       !test_bit(BCH_FS_HOLD_BTREE_WRITES, &c->flags));
 
 	old = btree_node_root(c, b);
 
@@ -2150,7 +2153,7 @@ ssize_t bch2_btree_updates_print(struct bch_fs *c, char *buf)
 				 as->mode,
 				 as->nodes_written,
 				 atomic_read(&as->cl.remaining) & CLOSURE_REMAINING_MASK,
-				 bch2_journal_pin_seq(&c->journal, &as->journal));
+				 as->journal.seq);
 	mutex_unlock(&c->btree_interior_update_lock);
 
 	return out - buf;

@@ -110,8 +110,7 @@ static void __btree_node_flush(struct journal *j, struct journal_entry_pin *pin,
 
 	btree_node_lock_type(c, b, SIX_LOCK_read);
 	bch2_btree_node_write_cond(c, b,
-			(btree_current_write(b) == w &&
-			 w->journal.pin_list == journal_seq_pin(j, seq)));
+		(btree_current_write(b) == w && w->journal.seq == seq));
 	six_unlock_read(&b->lock);
 }
 
@@ -490,7 +489,7 @@ out:
 			bch2_btree_iter_verify_locks(linked);
 			BUG_ON((trans->flags & BTREE_INSERT_NOUNLOCK) &&
 			       trans->did_work &&
-			       linked->uptodate >= BTREE_ITER_NEED_RELOCK);
+			       !btree_node_locked(linked, 0));
 		}
 
 		/* make sure we didn't lose an error: */
@@ -579,26 +578,6 @@ err:
 	}
 
 	goto out;
-}
-
-void bch2_trans_update(struct btree_trans *trans,
-		       struct btree_iter *iter,
-		       struct bkey_i *k,
-		       unsigned extra_journal_res)
-{
-	struct btree_insert_entry *i;
-
-	BUG_ON(trans->nr_updates >= ARRAY_SIZE(trans->updates));
-
-	i = &trans->updates[trans->nr_updates++];
-
-	*i = (struct btree_insert_entry) {
-		.iter	= iter,
-		.k		= k,
-		.extra_res	= extra_journal_res,
-	};
-
-	btree_insert_entry_checks(trans->c, i);
 }
 
 int bch2_trans_commit(struct btree_trans *trans,

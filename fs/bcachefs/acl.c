@@ -284,10 +284,9 @@ static int inode_update_for_set_acl_fn(struct bch_inode_info *inode,
 				       void *p)
 {
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-	struct timespec now = current_time(&inode->v);
 	umode_t mode = (unsigned long) p;
 
-	bi->bi_ctime	= timespec_to_bch2_time(c, now);
+	bi->bi_ctime	= bch2_current_time(c);
 	bi->bi_mode	= mode;
 	return 0;
 }
@@ -301,13 +300,14 @@ int bch2_set_acl(struct inode *vinode, struct posix_acl *acl, int type)
 	umode_t mode = inode->v.i_mode;
 	int ret;
 
+	mutex_lock(&inode->ei_update_lock);
+	bch2_trans_init(&trans, c);
+
 	if (type == ACL_TYPE_ACCESS && acl) {
 		ret = posix_acl_update_mode(&inode->v, &mode, &acl);
 		if (ret)
-			return ret;
+			goto err;
 	}
-
-	bch2_trans_init(&trans, c);
 retry:
 	bch2_trans_begin(&trans);
 
@@ -333,6 +333,7 @@ retry:
 	set_cached_acl(&inode->v, type, acl);
 err:
 	bch2_trans_exit(&trans);
+	mutex_unlock(&inode->ei_update_lock);
 
 	return ret;
 }
@@ -372,7 +373,7 @@ int bch2_acl_chmod(struct btree_trans *trans,
 		goto err;
 	}
 
-	bch2_trans_update(trans, iter, &new->k_i, 0);
+	bch2_trans_update(trans, BTREE_INSERT_ENTRY(iter, &new->k_i));
 	*new_acl = acl;
 	acl = NULL;
 err:

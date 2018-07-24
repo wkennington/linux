@@ -114,11 +114,6 @@ static inline u8 ptr_stale(struct bch_dev *ca,
 
 /* bucket gc marks */
 
-/* The dirty and cached sector counts saturate. If this occurs,
- * reference counting alone will not free the bucket, and a btree
- * GC must be performed. */
-#define GC_MAX_SECTORS_USED ((1U << 15) - 1)
-
 static inline unsigned bucket_sectors_used(struct bucket_mark mark)
 {
 	return mark.dirty_sectors + mark.cached_sectors;
@@ -209,7 +204,7 @@ static inline bool bucket_needs_journal_commit(struct bucket_mark m,
 
 void bch2_bucket_seq_cleanup(struct bch_fs *);
 
-bool bch2_invalidate_bucket(struct bch_fs *, struct bch_dev *,
+void bch2_invalidate_bucket(struct bch_fs *, struct bch_dev *,
 			    size_t, struct bucket_mark *);
 void bch2_mark_alloc_bucket(struct bch_fs *, struct bch_dev *,
 			    size_t, bool, struct gc_pos, unsigned);
