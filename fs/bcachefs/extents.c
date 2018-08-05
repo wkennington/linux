@@ -1396,7 +1396,7 @@ bch2_extent_can_insert(struct btree_insert *trans,
 	return BTREE_INSERT_OK;
 }
 
-static enum btree_insert_ret
+static void
 extent_squash(struct extent_insert_state *s, struct bkey_i *insert,
 	      struct bset_tree *t, struct bkey_packed *_k, struct bkey_s k,
 	      enum bch_extent_overlap overlap)
@@ -1490,8 +1490,6 @@ extent_squash(struct extent_insert_state *s, struct bkey_i *insert,
 		break;
 	}
 	}
-
-	return BTREE_INSERT_OK;
 }
 
 static enum btree_insert_ret
@@ -1536,7 +1534,7 @@ __bch2_insert_fixup_extent(struct extent_insert_state *s)
 				_k->needs_whiteout = false;
 			}
 
-			ret = extent_squash(s, insert, t, _k, k, overlap);
+			extent_squash(s, insert, t, _k, k, overlap);
 		} else {
 			if (bkey_whiteout(k.k))
 				goto next;
@@ -1569,21 +1567,18 @@ __bch2_insert_fixup_extent(struct extent_insert_state *s)
 
 				discard.k.needs_whiteout = true;
 
-				ret = extent_squash(s, insert, t, _k, k, overlap);
-				BUG_ON(ret != BTREE_INSERT_OK);
+				extent_squash(s, insert, t, _k, k, overlap);
 
 				extent_bset_insert(c, iter, &discard);
 			} else {
-				ret = extent_squash(s, insert, t, _k, k, overlap);
-				BUG_ON(ret != BTREE_INSERT_OK);
+				extent_squash(s, insert, t, _k, k, overlap);
 			}
 next:
 			bch2_cut_front(s->committed, insert);
 			bch2_btree_iter_set_pos_same_leaf(iter, s->committed);
 		}
 
-		if (ret != BTREE_INSERT_OK ||
-		    overlap == BCH_EXTENT_OVERLAP_FRONT ||
+		if (overlap == BCH_EXTENT_OVERLAP_FRONT ||
 		    overlap == BCH_EXTENT_OVERLAP_MIDDLE)
 			break;
 	}
