@@ -179,7 +179,7 @@ retry:
 	bch2_trans_begin(&trans);
 
 	ret = bch2_write_inode_trans(&trans, inode, &inode_u, set, p) ?:
-		bch2_trans_commit(&trans, NULL, NULL,
+		bch2_trans_commit(&trans, NULL,
 				  &inode->ei_journal_seq,
 				  BTREE_INSERT_ATOMIC|
 				  BTREE_INSERT_NOUNLOCK|
@@ -333,7 +333,7 @@ retry:
 					  inode_update_for_create_fn,
 					  &inode_u)
 		 : 0) ?:
-		bch2_trans_commit(&trans, NULL, NULL,
+		bch2_trans_commit(&trans, NULL,
 				  &journal_seq,
 				  BTREE_INSERT_ATOMIC|
 				  BTREE_INSERT_NOUNLOCK);
@@ -472,7 +472,7 @@ retry:
 		bch2_write_inode_trans(&trans, inode, &inode_u,
 				       inode_update_for_link_fn,
 				       NULL) ?:
-		bch2_trans_commit(&trans, NULL, NULL,
+		bch2_trans_commit(&trans, NULL,
 				  &inode->ei_journal_seq,
 				  BTREE_INSERT_ATOMIC|
 				  BTREE_INSERT_NOUNLOCK);
@@ -559,7 +559,7 @@ retry:
 		bch2_write_inode_trans(&trans, inode, &inode_u,
 				       inode_update_for_unlink_fn,
 				       NULL) ?:
-		bch2_trans_commit(&trans, NULL, NULL,
+		bch2_trans_commit(&trans, NULL,
 				  &dir->ei_journal_seq,
 				  BTREE_INSERT_ATOMIC|
 				  BTREE_INSERT_NOUNLOCK|
@@ -765,7 +765,7 @@ retry:
 		 ? bch2_write_inode_trans(&trans, i.dst_inode, &dst_inode_u,
 				       inode_update_for_rename_fn, &i)
 		 : 0 ) ?:
-		bch2_trans_commit(&trans, NULL, NULL,
+		bch2_trans_commit(&trans, NULL,
 				  &journal_seq,
 				  BTREE_INSERT_ATOMIC|
 				  BTREE_INSERT_NOUNLOCK);
@@ -883,7 +883,7 @@ retry:
 		(iattr->ia_valid & ATTR_MODE
 		 ? bch2_acl_chmod(&trans, inode, iattr->ia_mode, &acl)
 		 : 0) ?:
-		bch2_trans_commit(&trans, NULL, NULL,
+		bch2_trans_commit(&trans, NULL,
 				  &inode->ei_journal_seq,
 				  BTREE_INSERT_ATOMIC|
 				  BTREE_INSERT_NOUNLOCK|
