@@ -180,6 +180,60 @@ void pagecache_block_get(struct pagecache_lock *lock)
 }
 EXPORT_SYMBOL(pagecache_block_get);
 
+static int page_cache_tree_insert_vec(struct address_space *mapping,
+				      struct page *pages[],
+				      unsigned nr_pages,
+				      void *shadow[],
+				      pgoff_t index)
+{
+	XA_STATE(xas, &mapping->i_pages, index);
+	void *old;
+	int i = 0, error = 0;
+
+	if (!nr_pages)
+		return 0;
+
+	xas_lock_irq(&xas);
+
+	while (1) {
+		old = xas_load(&xas);
+		if (old && !xa_is_value(old)) {
+			error = -EEXIST;
+			break;
+		}
+
+		xas_store(&xas, pages[i]);
+		error = xas_error(&xas);
+		if (error)
+			break;
+
+		if (xa_is_value(old)) {
+			mapping->nrexceptional--;
+			if (shadow)
+				shadow[i] = old;
+		}
+		mapping->nrpages++;
+
+		if (++i == nr_pages)
+			break;
+
+		xas_next(&xas);
+	}
+	xas_unlock_irq(&xas);
+
+	return i ?: error;
+}
+
+static int page_cache_tree_insert(struct address_space *mapping,
+				  struct page *page, void **shadowp)
+{
+	int ret = page_cache_tree_insert_vec(mapping, &page, 1,
+					     shadowp, page->index);
+	if (ret < 0)
+		return ret;
+	return 0;
+}
+
 static void page_cache_delete(struct address_space *mapping,
 				   struct page *page, void *shadow)
 {
