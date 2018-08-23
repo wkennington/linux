@@ -190,6 +190,8 @@ static int page_cache_tree_insert_vec(struct address_space *mapping,
 	void *old;
 	int i = 0, error = 0;
 
+	mapping_set_update(&xas, mapping);
+
 	if (!nr_pages)
 		return 0;
 
@@ -914,79 +916,88 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 }
 EXPORT_SYMBOL_GPL(replace_page_cache_page);
 
-static int __add_to_page_cache(struct page *page,
-			       struct address_space *mapping,
-			       pgoff_t offset, gfp_t gfp_mask,
-			       void **shadowp)
+static int add_to_page_cache_vec(struct page **pages,
+				 unsigned nr_pages,
+				 struct address_space *mapping,
+				 pgoff_t offset, gfp_t gfp_mask,
+				 void *shadow[])
 {
-	XA_STATE(xas, &mapping->i_pages, offset);
-	int huge = PageHuge(page);
 	struct mem_cgroup *memcg;
-	int error;
-	void *old;
+	int i, nr_charged = 0, nr_added = 0, error;
 
-	VM_BUG_ON_PAGE(!PageLocked(page), page);
-	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
-	mapping_set_update(&xas, mapping);
+	for (i = 0; i < nr_pages; i++) {
+		struct page *page = pages[i];
+
+		VM_BUG_ON_PAGE(PageSwapBacked(page), page);
+	}
+
+	for (; nr_charged < nr_pages; nr_charged++) {
+		struct page *page = pages[nr_charged];
+
+		if (PageHuge(page))
+			continue;
+
+		error = mem_cgroup_try_charge(page, current->mm,
+					      gfp_mask, &memcg, false);
+		if (error)
+			break;
+	}
+
+	for (i = 0; i < nr_charged; i++) {
+		struct page *page = pages[i];
+
+		__SetPageLocked(page);
+		get_page(page);
+		page->mapping = mapping;
+		page->index = offset + i;
+	}
 
 	if (current->pagecache_lock != &mapping->add_lock)
 		pagecache_add_get(&mapping->add_lock);
 
-	if (!huge) {
-		error = mem_cgroup_try_charge(page, current->mm,
-					      gfp_mask, &memcg, false);
-		if (error)
-			goto out;
+	while (nr_added < nr_charged) {
+		error = page_cache_tree_insert_vec(mapping,
+					pages		+ nr_added,
+					nr_charged	- nr_added,
+					shadow		+ nr_added,
+					offset		+ nr_added);
+		if (error < 0)
+			break;
+
+		while (error--) {
+			struct page *page = pages[nr_added++];
+
+			/* hugetlb pages do not participate in page cache accounting. */
+			if (!PageHuge(page))
+				__inc_node_page_state(page, NR_FILE_PAGES);
+		}
 	}
 
-	__SetPageLocked(page);
-	get_page(page);
-	page->mapping = mapping;
-	page->index = offset;
-
-	do {
-		xas_lock_irq(&xas);
-		old = xas_load(&xas);
-		if (old && !xa_is_value(old))
-			xas_set_err(&xas, -EEXIST);
-		xas_store(&xas, page);
-		if (xas_error(&xas))
-			goto unlock;
-
-		if (xa_is_value(old)) {
-			mapping->nrexceptional--;
-			if (shadowp)
-				*shadowp = old;
-		}
-		mapping->nrpages++;
-
-		/* hugetlb pages do not participate in page cache accounting */
-		if (!huge)
-			__inc_node_page_state(page, NR_FILE_PAGES);
-unlock:
-		xas_unlock_irq(&xas);
-	} while (xas_nomem(&xas, gfp_mask & GFP_RECLAIM_MASK));
-
-	if (xas_error(&xas))
-		goto error;
-
-	if (!huge)
-		mem_cgroup_commit_charge(page, memcg, false, false);
-	trace_mm_filemap_add_to_page_cache(page);
-	error = 0;
-out:
 	if (current->pagecache_lock != &mapping->add_lock)
 		pagecache_add_put(&mapping->add_lock);
-	return error;
-error:
-	page->mapping = NULL;
-	/* Leave page->index set: truncation relies upon it */
-	if (!huge)
-		mem_cgroup_cancel_charge(page, memcg, false);
-	put_page(page);
-	__ClearPageLocked(page);
-	error = xas_error(&xas);
-	goto out;
+
+	for (i = 0; i < nr_added; i++) {
+		struct page *page = pages[i];
+
+		if (!PageHuge(page))
+			mem_cgroup_commit_charge(page, memcg, false, false);
+
+		trace_mm_filemap_add_to_page_cache(page);
+	}
+
+	for (i = nr_added; i < nr_charged; i++) {
+		struct page *page = pages[i];
+
+		if (!PageHuge(page))
+			mem_cgroup_cancel_charge(page, memcg, false);
+
+		/* Leave page->index set: truncation relies upon it */
+		page->mapping = NULL;
+		put_page(page);
+		__ClearPageLocked(page);
+	}
+
+	return nr_added ?: error;
 }
 
 /**
@@ -1003,7 +1014,11 @@ error:
 int add_to_page_cache(struct page *page, struct address_space *mapping,
 		      pgoff_t offset, gfp_t gfp_mask)
 {
-	return __add_to_page_cache(page, mapping, offset, gfp_mask, NULL);
+	int ret = add_to_page_cache_vec(&page, 1, mapping, offset,
+					gfp_mask, NULL);
+	if (ret < 0)
+		return ret;
+	return 0;
 }
 EXPORT_SYMBOL(add_to_page_cache);
 
@@ -1013,7 +1028,8 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 	void *shadow = NULL;
 	int ret;
 
-	ret = __add_to_page_cache(page, mapping, offset, gfp_mask, &shadow);
+	ret = add_to_page_cache_vec(&page, 1, mapping, offset,
+				    gfp_mask, &shadow);
 	if (unlikely(ret))
 		return ret;
 
