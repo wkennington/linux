@@ -349,7 +349,7 @@ void bch2_mark_dev_superblock(struct bch_fs *c, struct bch_dev *ca,
 	 */
 	if (c) {
 		lockdep_assert_held(&c->sb_lock);
-		percpu_down_read_preempt_disable(&c->usage_lock);
+		percpu_down_read_preempt_disable(&c->mark_lock);
 	} else {
 		preempt_disable();
 	}
@@ -374,7 +374,7 @@ void bch2_mark_dev_superblock(struct bch_fs *c, struct bch_dev *ca,
 	}
 
 	if (c) {
-		percpu_up_read_preempt_enable(&c->usage_lock);
+		percpu_up_read_preempt_enable(&c->mark_lock);
 	} else {
 		preempt_enable();
 	}
@@ -420,7 +420,7 @@ static void bch2_mark_allocator_buckets(struct bch_fs *c)
 	size_t i, j, iter;
 	unsigned ci;
 
-	percpu_down_read_preempt_disable(&c->usage_lock);
+	percpu_down_read_preempt_disable(&c->mark_lock);
 
 	spin_lock(&c->freelist_lock);
 	gc_pos_set(c, gc_pos_alloc(c, NULL));
@@ -456,7 +456,7 @@ static void bch2_mark_allocator_buckets(struct bch_fs *c)
 		spin_unlock(&ob->lock);
 	}
 
-	percpu_up_read_preempt_enable(&c->usage_lock);
+	percpu_up_read_preempt_enable(&c->mark_lock);
 }
 
 static void bch2_gc_free(struct bch_fs *c)
@@ -576,7 +576,7 @@ static void bch2_gc_done(struct bch_fs *c, bool initial)
 #define copy_fs_field(_f, _msg, ...)					\
 	copy_field(_f, "fs has wrong " _msg, ##__VA_ARGS__)
 
-	percpu_down_write(&c->usage_lock);
+	percpu_down_write(&c->mark_lock);
 
 	if (initial) {
 		bch2_gc_done_nocheck(c);
@@ -696,7 +696,7 @@ static void bch2_gc_done(struct bch_fs *c, bool initial)
 		preempt_enable();
 	}
 out:
-	percpu_up_write(&c->usage_lock);
+	percpu_up_write(&c->mark_lock);
 
 #undef copy_fs_field
 #undef copy_dev_field
@@ -741,7 +741,7 @@ static int bch2_gc_start(struct bch_fs *c)
 		}
 	}
 
-	percpu_down_write(&c->usage_lock);
+	percpu_down_write(&c->mark_lock);
 
 	for_each_member_device(ca, c, i) {
 		struct bucket_array *dst = __bucket_array(ca, 1);
@@ -755,7 +755,7 @@ static int bch2_gc_start(struct bch_fs *c)
 			dst->b[b]._mark.gen = src->b[b].mark.gen;
 	};
 
-	percpu_up_write(&c->usage_lock);
+	percpu_up_write(&c->mark_lock);
 
 	return bch2_ec_mem_alloc(c, true);
 }
