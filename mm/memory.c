@@ -435,9 +435,9 @@ int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
 	return 0;
 }
 
-int __pte_alloc_kernel(pmd_t *pmd)
+int __pte_alloc_kernel(pmd_t *pmd, gfp_t gfp)
 {
-	pte_t *new = pte_alloc_one_kernel(&init_mm);
+	pte_t *new = pte_alloc_one_kernel(&init_mm, gfp);
 	if (!new)
 		return -ENOMEM;
 
@@ -884,7 +884,7 @@ static inline int copy_pmd_range(struct mm_struct *dst_mm, struct mm_struct *src
 	pmd_t *src_pmd, *dst_pmd;
 	unsigned long next;
 
-	dst_pmd = pmd_alloc(dst_mm, dst_pud, addr);
+	dst_pmd = pmd_alloc(dst_mm, dst_pud, addr, GFP_KERNEL);
 	if (!dst_pmd)
 		return -ENOMEM;
 	src_pmd = pmd_offset(src_pud, addr);
@@ -918,7 +918,7 @@ static inline int copy_pud_range(struct mm_struct *dst_mm, struct mm_struct *src
 	pud_t *src_pud, *dst_pud;
 	unsigned long next;
 
-	dst_pud = pud_alloc(dst_mm, dst_p4d, addr);
+	dst_pud = pud_alloc(dst_mm, dst_p4d, addr, GFP_KERNEL);
 	if (!dst_pud)
 		return -ENOMEM;
 	src_pud = pud_offset(src_p4d, addr);
@@ -952,7 +952,7 @@ static inline int copy_p4d_range(struct mm_struct *dst_mm, struct mm_struct *src
 	p4d_t *src_p4d, *dst_p4d;
 	unsigned long next;
 
-	dst_p4d = p4d_alloc(dst_mm, dst_pgd, addr);
+	dst_p4d = p4d_alloc(dst_mm, dst_pgd, addr, GFP_KERNEL);
 	if (!dst_p4d)
 		return -ENOMEM;
 	src_p4d = p4d_offset(src_pgd, addr);
@@ -1422,13 +1422,13 @@ pte_t *__get_locked_pte(struct mm_struct *mm, unsigned long addr,
 	pmd_t *pmd;
 
 	pgd = pgd_offset(mm, addr);
-	p4d = p4d_alloc(mm, pgd, addr);
+	p4d = p4d_alloc(mm, pgd, addr, GFP_KERNEL);
 	if (!p4d)
 		return NULL;
-	pud = pud_alloc(mm, p4d, addr);
+	pud = pud_alloc(mm, p4d, addr, GFP_KERNEL);
 	if (!pud)
 		return NULL;
-	pmd = pmd_alloc(mm, pud, addr);
+	pmd = pmd_alloc(mm, pud, addr, GFP_KERNEL);
 	if (!pmd)
 		return NULL;
 
@@ -1768,7 +1768,7 @@ static inline int remap_pmd_range(struct mm_struct *mm, pud_t *pud,
 	int err;
 
 	pfn -= addr >> PAGE_SHIFT;
-	pmd = pmd_alloc(mm, pud, addr);
+	pmd = pmd_alloc(mm, pud, addr, GFP_KERNEL);
 	if (!pmd)
 		return -ENOMEM;
 	VM_BUG_ON(pmd_trans_huge(*pmd));
@@ -1791,7 +1791,7 @@ static inline int remap_pud_range(struct mm_struct *mm, p4d_t *p4d,
 	int err;
 
 	pfn -= addr >> PAGE_SHIFT;
-	pud = pud_alloc(mm, p4d, addr);
+	pud = pud_alloc(mm, p4d, addr, GFP_KERNEL);
 	if (!pud)
 		return -ENOMEM;
 	do {
@@ -1813,7 +1813,7 @@ static inline int remap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
 	int err;
 
 	pfn -= addr >> PAGE_SHIFT;
-	p4d = p4d_alloc(mm, pgd, addr);
+	p4d = p4d_alloc(mm, pgd, addr, GFP_KERNEL);
 	if (!p4d)
 		return -ENOMEM;
 	do {
@@ -1956,7 +1956,7 @@ static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
 	spinlock_t *uninitialized_var(ptl);
 
 	pte = (mm == &init_mm) ?
-		pte_alloc_kernel(pmd, addr) :
+		pte_alloc_kernel(pmd, addr, GFP_KERNEL) :
 		pte_alloc_map_lock(mm, pmd, addr, &ptl);
 	if (!pte)
 		return -ENOMEM;
@@ -1990,7 +1990,7 @@ static int apply_to_pmd_range(struct mm_struct *mm, pud_t *pud,
 
 	BUG_ON(pud_huge(*pud));
 
-	pmd = pmd_alloc(mm, pud, addr);
+	pmd = pmd_alloc(mm, pud, addr, GFP_KERNEL);
 	if (!pmd)
 		return -ENOMEM;
 	do {
@@ -2010,7 +2010,7 @@ static int apply_to_pud_range(struct mm_struct *mm, p4d_t *p4d,
 	unsigned long next;
 	int err;
 
-	pud = pud_alloc(mm, p4d, addr);
+	pud = pud_alloc(mm, p4d, addr, GFP_KERNEL);
 	if (!pud)
 		return -ENOMEM;
 	do {
@@ -2030,7 +2030,7 @@ static int apply_to_p4d_range(struct mm_struct *mm, pgd_t *pgd,
 	unsigned long next;
 	int err;
 
-	p4d = p4d_alloc(mm, pgd, addr);
+	p4d = p4d_alloc(mm, pgd, addr, GFP_KERNEL);
 	if (!p4d)
 		return -ENOMEM;
 	do {
@@ -3868,11 +3868,11 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	vm_fault_t ret;
 
 	pgd = pgd_offset(mm, address);
-	p4d = p4d_alloc(mm, pgd, address);
+	p4d = p4d_alloc(mm, pgd, address, GFP_KERNEL);
 	if (!p4d)
 		return VM_FAULT_OOM;
 
-	vmf.pud = pud_alloc(mm, p4d, address);
+	vmf.pud = pud_alloc(mm, p4d, address, GFP_KERNEL);
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
 	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) {
@@ -3898,7 +3898,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		}
 	}
 
-	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+	vmf.pmd = pmd_alloc(mm, vmf.pud, address, GFP_KERNEL);
 	if (!vmf.pmd)
 		return VM_FAULT_OOM;
 	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
@@ -3991,9 +3991,10 @@ EXPORT_SYMBOL_GPL(handle_mm_fault);
  * Allocate p4d page table.
  * We've already handled the fast-path in-line.
  */
-int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
+int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address,
+		gfp_t gfp)
 {
-	p4d_t *new = p4d_alloc_one(mm, address);
+	p4d_t *new = p4d_alloc_one(mm, address, gfp);
 	if (!new)
 		return -ENOMEM;
 
@@ -4014,9 +4015,10 @@ int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
  * Allocate page upper directory.
  * We've already handled the fast-path in-line.
  */
-int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
+int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address,
+		gfp_t gfp)
 {
-	pud_t *new = pud_alloc_one(mm, address);
+	pud_t *new = pud_alloc_one(mm, address, gfp);
 	if (!new)
 		return -ENOMEM;
 
@@ -4046,10 +4048,11 @@ int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
  * Allocate page middle directory.
  * We've already handled the fast-path in-line.
  */
-int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
+int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address,
+		gfp_t gfp)
 {
 	spinlock_t *ptl;
-	pmd_t *new = pmd_alloc_one(mm, address);
+	pmd_t *new = pmd_alloc_one(mm, address, gfp);
 	if (!new)
 		return -ENOMEM;
 

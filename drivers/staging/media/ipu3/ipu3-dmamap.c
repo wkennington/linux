@@ -137,7 +137,7 @@ void *imgu_dmamap_alloc(struct imgu_device *imgu, struct imgu_css_map *map,
 
 	map->vma->pages = pages;
 	/* And map it in KVA */
-	if (map_vm_area(map->vma, PAGE_KERNEL, pages))
+	if (map_vm_area(map->vma, GFP_KERNEL, PAGE_KERNEL, pages))
 		goto out_vunmap;
 
 	map->size = size;

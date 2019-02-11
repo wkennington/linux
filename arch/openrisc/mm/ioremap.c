@@ -118,12 +118,12 @@ EXPORT_SYMBOL(iounmap);
  * the memblock infrastructure.
  */
 
-pte_t __ref *pte_alloc_one_kernel(struct mm_struct *mm)
+pte_t __ref *pte_alloc_one_kernel(struct mm_struct *mm, gfp_t gfp)
 {
 	pte_t *pte;
 
 	if (likely(mem_init_done)) {
-		pte = (pte_t *)get_zeroed_page(GFP_KERNEL);
+		pte = (pte_t *)get_zeroed_page(gfp);
 	} else {
 		pte = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
 		if (!pte)
