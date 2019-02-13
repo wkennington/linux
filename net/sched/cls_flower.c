@@ -1176,16 +1176,22 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 	struct cls_fl_head *head = rtnl_dereference(tp->root);
 	struct cls_fl_filter *fold = *arg;
 	struct cls_fl_filter *fnew;
+	struct fl_flow_mask *mask;
 	struct nlattr **tb;
-	struct fl_flow_mask mask = {};
 	int err;
 
 	if (!tca[TCA_OPTIONS])
 		return -EINVAL;
 
-	tb = kcalloc(TCA_FLOWER_MAX + 1, sizeof(struct nlattr *), GFP_KERNEL);
-	if (!tb)
+	mask = kzalloc(sizeof(struct fl_flow_mask), GFP_KERNEL);
+	if (!mask)
 		return -ENOBUFS;
+
+	tb = kcalloc(TCA_FLOWER_MAX + 1, sizeof(struct nlattr *), GFP_KERNEL);
+	if (!tb) {
+		err = -ENOBUFS;
+		goto errout_mask_alloc;
+	}
 
 	err = nla_parse_nested(tb, TCA_FLOWER_MAX, tca[TCA_OPTIONS],
 			       fl_policy, NULL);
@@ -1229,12 +1235,12 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 		}
 	}
 
-	err = fl_set_parms(net, tp, fnew, &mask, base, tb, tca[TCA_RATE], ovr,
+	err = fl_set_parms(net, tp, fnew, mask, base, tb, tca[TCA_RATE], ovr,
 			   tp->chain->tmplt_priv, extack);
 	if (err)
 		goto errout_idr;
 
-	err = fl_check_assign_mask(head, fnew, fold, &mask);
+	err = fl_check_assign_mask(head, fnew, fold, mask);
 	if (err)
 		goto errout_idr;
 
@@ -1251,7 +1257,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 	if (!tc_skip_hw(fnew->flags)) {
 		err = fl_hw_replace_filter(tp, fnew, extack);
 		if (err)
-			goto errout_mask;
+			goto errout_mask_ht;
 	}
 
 	if (!tc_in_hw(fnew->flags))
@@ -1278,7 +1284,12 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 	}
 
 	kfree(tb);
+	kfree(mask);
 	return 0;
+
+errout_mask_ht:
+	rhashtable_remove_fast(&fnew->mask->ht, &fnew->ht_node,
+			       fnew->mask->filter_ht_params);
 
 errout_mask:
 	fl_mask_put(head, fnew->mask, false);
@@ -1291,6 +1302,8 @@ errout:
 	kfree(fnew);
 errout_tb:
 	kfree(tb);
+errout_mask_alloc:
+	kfree(mask);
 	return err;
 }
 
