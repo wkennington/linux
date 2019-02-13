@@ -1563,7 +1563,8 @@ int bch2_btree_split_leaf(struct bch_fs *c, struct btree_iter *iter,
 	closure_init_stack(&cl);
 
 	/* Hack, because gc and splitting nodes doesn't mix yet: */
-	if (!down_read_trylock(&c->gc_lock)) {
+	if (!(flags & BTREE_INSERT_GC_LOCK_HELD) &&
+	    !down_read_trylock(&c->gc_lock)) {
 		if (flags & BTREE_INSERT_NOUNLOCK)
 			return -EINTR;
 
@@ -1606,7 +1607,8 @@ int bch2_btree_split_leaf(struct bch_fs *c, struct btree_iter *iter,
 	 */
 	__bch2_btree_iter_downgrade(iter, 1);
 out:
-	up_read(&c->gc_lock);
+	if (!(flags & BTREE_INSERT_GC_LOCK_HELD))
+		up_read(&c->gc_lock);
 	closure_sync(&cl);
 	return ret;
 }
@@ -1684,7 +1686,8 @@ retry:
 	}
 
 	/* We're changing btree topology, doesn't mix with gc: */
-	if (!down_read_trylock(&c->gc_lock))
+	if (!(flags & BTREE_INSERT_GC_LOCK_HELD) &&
+	    !down_read_trylock(&c->gc_lock))
 		goto err_cycle_gc_lock;
 
 	if (!bch2_btree_iter_upgrade(iter, U8_MAX,
@@ -1744,7 +1747,8 @@ retry:
 
 	bch2_btree_update_done(as);
 
-	up_read(&c->gc_lock);
+	if (!(flags & BTREE_INSERT_GC_LOCK_HELD))
+		up_read(&c->gc_lock);
 out:
 	bch2_btree_iter_verify_locks(iter);
 
@@ -1775,7 +1779,8 @@ err_cycle_gc_lock:
 
 err_unlock:
 	six_unlock_intent(&m->lock);
-	up_read(&c->gc_lock);
+	if (!(flags & BTREE_INSERT_GC_LOCK_HELD))
+		up_read(&c->gc_lock);
 err:
 	BUG_ON(ret == -EAGAIN && (flags & BTREE_INSERT_NOUNLOCK));
 
