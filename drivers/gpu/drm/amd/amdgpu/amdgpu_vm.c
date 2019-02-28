@@ -637,12 +637,14 @@ void amdgpu_vm_move_to_lru_tail(struct amdgpu_device *adev,
 	struct ttm_bo_global *glob = adev->mman.bdev.glob;
 	struct amdgpu_vm_bo_base *bo_base;
 
+#if 0
 	if (vm->bulk_moveable) {
 		spin_lock(&glob->lru_lock);
 		ttm_bo_bulk_move_lru_tail(&vm->lru_bulk_move);
 		spin_unlock(&glob->lru_lock);
 		return;
 	}
+#endif
 
 	memset(&vm->lru_bulk_move, 0, sizeof(vm->lru_bulk_move));
 
@@ -850,9 +852,6 @@ static void amdgpu_vm_bo_param(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 	bp->size = amdgpu_vm_bo_size(adev, level);
 	bp->byte_align = AMDGPU_GPU_PAGE_SIZE;
 	bp->domain = AMDGPU_GEM_DOMAIN_VRAM;
-	if (bp->size <= PAGE_SIZE && adev->asic_type >= CHIP_VEGA10 &&
-	    adev->flags & AMD_IS_APU)
-		bp->domain |= AMDGPU_GEM_DOMAIN_GTT;
 	bp->domain = amdgpu_bo_get_preferred_pin_domain(adev, bp->domain);
 	bp->flags = AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
 		AMDGPU_GEM_CREATE_CPU_GTT_USWC;
