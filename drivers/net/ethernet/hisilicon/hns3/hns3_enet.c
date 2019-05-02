@@ -1852,7 +1852,9 @@ static pci_ers_result_t hns3_slot_reset(struct pci_dev *pdev)
 
 	/* request the reset */
 	if (ae_dev->ops->reset_event) {
-		ae_dev->ops->reset_event(pdev, NULL);
+		if (!ae_dev->override_pci_need_reset)
+			ae_dev->ops->reset_event(pdev, NULL);
+
 		return PCI_ERS_RESULT_RECOVERED;
 	}
 
@@ -2476,6 +2478,8 @@ static int hns3_add_frag(struct hns3_enet_ring *ring, struct hns3_desc *desc,
 		desc = &ring->desc[ring->next_to_clean];
 		desc_cb = &ring->desc_cb[ring->next_to_clean];
 		bd_base_info = le32_to_cpu(desc->rx.bd_base_info);
+		/* make sure HW write desc complete */
+		dma_rmb();
 		if (!hnae3_get_bit(bd_base_info, HNS3_RXD_VLD_B))
 			return -ENXIO;
 
@@ -3515,6 +3519,25 @@ static int hns3_init_mac_addr(struct net_device *netdev, bool init)
 	return ret;
 }
 
+static int hns3_init_phy(struct net_device *netdev)
+{
+	struct hnae3_handle *h = hns3_get_handle(netdev);
+	int ret = 0;
+
+	if (h->ae_algo->ops->mac_connect_phy)
+		ret = h->ae_algo->ops->mac_connect_phy(h);
+
+	return ret;
+}
+
+static void hns3_uninit_phy(struct net_device *netdev)
+{
+	struct hnae3_handle *h = hns3_get_handle(netdev);
+
+	if (h->ae_algo->ops->mac_disconnect_phy)
+		h->ae_algo->ops->mac_disconnect_phy(h);
+}
+
 static int hns3_restore_fd_rules(struct net_device *netdev)
 {
 	struct hnae3_handle *h = hns3_get_handle(netdev);
@@ -3623,6 +3646,10 @@ static int hns3_client_init(struct hnae3_handle *handle)
 		goto out_init_ring_data;
 	}
 
+	ret = hns3_init_phy(netdev);
+	if (ret)
+		goto out_init_phy;
+
 	ret = register_netdev(netdev);
 	if (ret) {
 		dev_err(priv->dev, "probe register netdev fail!\n");
@@ -3647,6 +3674,9 @@ static int hns3_client_init(struct hnae3_handle *handle)
 	return ret;
 
 out_reg_netdev_fail:
+	hns3_uninit_phy(netdev);
+out_init_phy:
+	hns3_uninit_all_ring(priv);
 out_init_ring_data:
 	(void)hns3_nic_uninit_vector_data(priv);
 out_init_vector_data:
@@ -3680,6 +3710,8 @@ static void hns3_client_uninit(struct hnae3_handle *handle, bool reset)
 	hns3_del_all_fd_rules(netdev, true);
 
 	hns3_force_clear_all_rx_ring(handle);
+
+	hns3_uninit_phy(netdev);
 
 	ret = hns3_nic_uninit_vector_data(priv);
 	if (ret)
