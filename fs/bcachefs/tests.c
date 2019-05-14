@@ -506,7 +506,7 @@ static void seq_insert(struct bch_fs *c, u64 nr)
 	bch2_trans_init(&trans, c);
 
 	for_each_btree_key(&trans, iter, BTREE_ID_DIRENTS, POS_MIN,
-			   BTREE_ITER_SLOTS|BTREE_ITER_INTENT, k) {
+			   BTREE_ITER_SLOTS|BTREE_ITER_INTENT, k, ret) {
 		insert.k.p = iter->pos;
 
 		bch2_trans_update(&trans, BTREE_INSERT_ENTRY(iter, &insert.k_i));
@@ -524,10 +524,11 @@ static void seq_lookup(struct bch_fs *c, u64 nr)
 	struct btree_trans trans;
 	struct btree_iter *iter;
 	struct bkey_s_c k;
+	int ret;
 
 	bch2_trans_init(&trans, c);
 
-	for_each_btree_key(&trans, iter, BTREE_ID_DIRENTS, POS_MIN, 0, k)
+	for_each_btree_key(&trans, iter, BTREE_ID_DIRENTS, POS_MIN, 0, k, ret)
 		;
 	bch2_trans_exit(&trans);
 }
@@ -542,7 +543,7 @@ static void seq_overwrite(struct bch_fs *c, u64 nr)
 	bch2_trans_init(&trans, c);
 
 	for_each_btree_key(&trans, iter, BTREE_ID_DIRENTS, POS_MIN,
-			   BTREE_ITER_INTENT, k) {
+			   BTREE_ITER_INTENT, k, ret) {
 		struct bkey_i_cookie u;
 
 		bkey_reassemble(&u.k_i, k);
