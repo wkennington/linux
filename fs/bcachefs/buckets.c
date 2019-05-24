@@ -228,12 +228,12 @@ retry:
 	if (unlikely(!ret))
 		return NULL;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 
 	v = fs_usage_u64s(c);
 	if (unlikely(u64s != v)) {
 		u64s = v;
-		percpu_up_read_preempt_enable(&c->mark_lock);
+		percpu_up_read(&c->mark_lock);
 		kfree(ret);
 		goto retry;
 	}
@@ -351,9 +351,9 @@ bch2_fs_usage_read_short(struct bch_fs *c)
 {
 	struct bch_fs_usage_short ret;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	ret = __bch2_fs_usage_read_short(c);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	return ret;
 }
@@ -450,6 +450,7 @@ static void bch2_dev_usage_update(struct bch_fs *c, struct bch_dev *ca,
 		bch2_data_types[old.data_type],
 		bch2_data_types[new.data_type]);
 
+	preempt_disable();
 	dev_usage = this_cpu_ptr(ca->usage[gc]);
 
 	if (bucket_type(old))
@@ -473,6 +474,7 @@ static void bch2_dev_usage_update(struct bch_fs *c, struct bch_dev *ca,
 		(int) new.cached_sectors - (int) old.cached_sectors;
 	dev_usage->sectors_fragmented +=
 		is_fragmented_bucket(new, ca) - is_fragmented_bucket(old, ca);
+	preempt_enable();
 
 	if (!is_available_bucket(old) && is_available_bucket(new))
 		bch2_wake_allocator(ca);
@@ -496,11 +498,9 @@ void bch2_dev_usage_from_buckets(struct bch_fs *c)
 
 		buckets = bucket_array(ca);
 
-		preempt_disable();
 		for_each_bucket(g, buckets)
 			bch2_dev_usage_update(c, ca, c->usage_base,
 					      old, g->mark, false);
-		preempt_enable();
 	}
 }
 
@@ -682,8 +682,12 @@ void bch2_mark_alloc_bucket(struct bch_fs *c, struct bch_dev *ca,
 			    size_t b, bool owned_by_allocator,
 			    struct gc_pos pos, unsigned flags)
 {
+	preempt_disable();
+
 	do_mark_fn(__bch2_mark_alloc_bucket, c, pos, flags,
 		   ca, b, owned_by_allocator);
+
+	preempt_enable();
 }
 
 static int bch2_mark_alloc(struct bch_fs *c, struct bkey_s_c k,
@@ -793,12 +797,16 @@ void bch2_mark_metadata_bucket(struct bch_fs *c, struct bch_dev *ca,
 	BUG_ON(type != BCH_DATA_SB &&
 	       type != BCH_DATA_JOURNAL);
 
+	preempt_disable();
+
 	if (likely(c)) {
 		do_mark_fn(__bch2_mark_metadata_bucket, c, pos, flags,
 			   ca, b, type, sectors);
 	} else {
 		__bch2_mark_metadata_bucket(c, ca, b, type, sectors, 0);
 	}
+
+	preempt_enable();
 }
 
 static s64 ptr_disk_sectors_delta(struct extent_ptr_decoded p,
@@ -1149,10 +1157,10 @@ int bch2_mark_key(struct bch_fs *c, struct bkey_s_c k,
 {
 	int ret;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	ret = bch2_mark_key_locked(c, k, sectors,
 				   fs_usage, journal_seq, flags);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	return ret;
 }
@@ -1665,10 +1673,10 @@ static u64 bch2_recalc_sectors_available(struct bch_fs *c)
 
 void __bch2_disk_reservation_put(struct bch_fs *c, struct disk_reservation *res)
 {
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	this_cpu_sub(c->usage[0]->online_reserved,
 		     res->sectors);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	res->sectors = 0;
 }
@@ -1683,7 +1691,8 @@ int bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 	s64 sectors_available;
 	int ret;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
+	preempt_disable();
 	pcpu = this_cpu_ptr(c->pcpu);
 
 	if (sectors <= pcpu->sectors_available)
@@ -1695,7 +1704,8 @@ int bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 		get = min((u64) sectors + SECTORS_CACHE, old);
 
 		if (get < sectors) {
-			percpu_up_read_preempt_enable(&c->mark_lock);
+			preempt_enable();
+			percpu_up_read(&c->mark_lock);
 			goto recalculate;
 		}
 	} while ((v = atomic64_cmpxchg(&c->sectors_available,
@@ -1708,7 +1718,8 @@ out:
 	this_cpu_add(c->usage[0]->online_reserved, sectors);
 	res->sectors			+= sectors;
 
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	preempt_enable();
+	percpu_up_read(&c->mark_lock);
 	return 0;
 
 recalculate:

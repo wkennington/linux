@@ -242,7 +242,7 @@ static ssize_t show_fs_alloc_debug(struct bch_fs *c, char *buf)
 
 	bch2_fs_usage_to_text(&out, c, fs_usage);
 
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	kfree(fs_usage);
 

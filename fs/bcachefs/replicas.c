@@ -229,9 +229,9 @@ bool bch2_replicas_marked(struct bch_fs *c,
 {
 	bool marked;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	marked = bch2_replicas_marked_locked(c, search, check_gc_replicas);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	return marked;
 }
@@ -447,9 +447,9 @@ bool bch2_bkey_replicas_marked(struct bch_fs *c,
 {
 	bool marked;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	marked = bch2_bkey_replicas_marked_locked(c, k, check_gc_replicas);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	return marked;
 }
@@ -972,7 +972,7 @@ struct replicas_status __bch2_replicas_status(struct bch_fs *c,
 
 	mi = bch2_sb_get_members(c->disk_sb.sb);
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 
 	for_each_cpu_replicas_entry(&c->replicas, e) {
 		if (e->data_type >= ARRAY_SIZE(ret.replicas))
@@ -999,7 +999,7 @@ struct replicas_status __bch2_replicas_status(struct bch_fs *c,
 			    nr_offline);
 	}
 
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	for (i = 0; i < ARRAY_SIZE(ret.replicas); i++)
 		if (ret.replicas[i].redundancy == INT_MAX)
@@ -1050,14 +1050,14 @@ unsigned bch2_dev_has_data(struct bch_fs *c, struct bch_dev *ca)
 	struct bch_replicas_entry *e;
 	unsigned i, ret = 0;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 
 	for_each_cpu_replicas_entry(&c->replicas, e)
 		for (i = 0; i < e->nr_devs; i++)
 			if (e->devs[i] == ca->dev_idx)
 				ret |= 1 << e->data_type;
 
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	return ret;
 }

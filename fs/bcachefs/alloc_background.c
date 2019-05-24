@@ -356,11 +356,11 @@ restart:
 
 			old_u = bch2_alloc_unpack(k);
 
-			percpu_down_read_preempt_disable(&c->mark_lock);
+			percpu_down_read(&c->mark_lock);
 			g	= bucket(ca, b);
 			m	= READ_ONCE(g->mark);
 			new_u	= alloc_mem_to_key(g, m);
-			percpu_up_read_preempt_enable(&c->mark_lock);
+			percpu_up_read(&c->mark_lock);
 
 			if (!m.dirty)
 				continue;
@@ -890,7 +890,7 @@ static int bch2_invalidate_one_bucket2(struct btree_trans *trans,
 	b = ca->alloc_heap.data[0].bucket;
 
 	/* first, put on free_inc and mark as owned by allocator: */
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	spin_lock(&c->freelist_lock);
 
 	verify_not_on_freelist(c, ca, b);
@@ -900,7 +900,7 @@ static int bch2_invalidate_one_bucket2(struct btree_trans *trans,
 	bch2_mark_alloc_bucket(c, ca, b, true, gc_pos_alloc(c, NULL), 0);
 
 	spin_unlock(&c->freelist_lock);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	BUG_ON(BKEY_ALLOC_VAL_U64s_MAX > 8);
 
@@ -916,11 +916,11 @@ retry:
 	 * we have to trust the in memory bucket @m, not the version in the
 	 * btree:
 	 */
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	g = bucket(ca, b);
 	m = READ_ONCE(g->mark);
 	u = alloc_mem_to_key(g, m);
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	invalidating_cached_data = m.cached_sectors != 0;
 
@@ -981,7 +981,7 @@ retry:
 		size_t b2;
 
 		/* remove from free_inc: */
-		percpu_down_read_preempt_disable(&c->mark_lock);
+		percpu_down_read(&c->mark_lock);
 		spin_lock(&c->freelist_lock);
 
 		bch2_mark_alloc_bucket(c, ca, b, false,
@@ -991,7 +991,7 @@ retry:
 		BUG_ON(b != b2);
 
 		spin_unlock(&c->freelist_lock);
-		percpu_up_read_preempt_enable(&c->mark_lock);
+		percpu_up_read(&c->mark_lock);
 	}
 
 	return ret;
@@ -1002,7 +1002,7 @@ static bool bch2_invalidate_one_bucket(struct bch_fs *c, struct bch_dev *ca,
 {
 	struct bucket_mark m;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 	spin_lock(&c->freelist_lock);
 
 	bch2_invalidate_bucket(c, ca, bucket, &m);
@@ -1015,7 +1015,7 @@ static bool bch2_invalidate_one_bucket(struct bch_fs *c, struct bch_dev *ca,
 	bucket_io_clock_reset(c, ca, bucket, READ);
 	bucket_io_clock_reset(c, ca, bucket, WRITE);
 
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 
 	*flush_seq = max(*flush_seq, bucket_journal_seq(c, m));
 
@@ -1564,10 +1564,10 @@ static bool bch2_fs_allocator_start_fast(struct bch_fs *c)
 			     test_bit(bu, ca->buckets_nouse)))
 				continue;
 
-			percpu_down_read_preempt_disable(&c->mark_lock);
+			percpu_down_read(&c->mark_lock);
 			bch2_mark_alloc_bucket(c, ca, bu, true,
 					gc_pos_alloc(c, NULL), 0);
-			percpu_up_read_preempt_enable(&c->mark_lock);
+			percpu_up_read(&c->mark_lock);
 
 			fifo_push(&ca->free_inc, bu);
 

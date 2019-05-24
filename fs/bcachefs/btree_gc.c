@@ -288,11 +288,11 @@ static int mark_journal_key(struct bch_fs *c, enum btree_id id,
 
 	for_each_btree_key(&trans, iter, id, bkey_start_pos(&insert->k),
 			   BTREE_ITER_SLOTS, k, ret) {
-		percpu_down_read_preempt_disable(&c->mark_lock);
+		percpu_down_read(&c->mark_lock);
 		ret = bch2_mark_overwrite(&trans, iter, k, insert, NULL,
 					 BCH_BUCKET_MARK_GC|
 					 BCH_BUCKET_MARK_NOATOMIC);
-		percpu_up_read_preempt_enable(&c->mark_lock);
+		percpu_up_read(&c->mark_lock);
 
 		if (!ret)
 			break;
@@ -368,9 +368,7 @@ void bch2_mark_dev_superblock(struct bch_fs *c, struct bch_dev *ca,
 	 */
 	if (c) {
 		lockdep_assert_held(&c->sb_lock);
-		percpu_down_read_preempt_disable(&c->mark_lock);
-	} else {
-		preempt_disable();
+		percpu_down_read(&c->mark_lock);
 	}
 
 	for (i = 0; i < layout->nr_superblocks; i++) {
@@ -392,11 +390,8 @@ void bch2_mark_dev_superblock(struct bch_fs *c, struct bch_dev *ca,
 					  gc_phase(GC_PHASE_SB), flags);
 	}
 
-	if (c) {
-		percpu_up_read_preempt_enable(&c->mark_lock);
-	} else {
-		preempt_enable();
-	}
+	if (c)
+		percpu_up_read(&c->mark_lock);
 }
 
 static void bch2_mark_superblocks(struct bch_fs *c)
@@ -436,7 +431,7 @@ static void bch2_mark_allocator_buckets(struct bch_fs *c)
 	size_t i, j, iter;
 	unsigned ci;
 
-	percpu_down_read_preempt_disable(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
 
 	spin_lock(&c->freelist_lock);
 	gc_pos_set(c, gc_pos_alloc(c, NULL));
@@ -472,7 +467,7 @@ static void bch2_mark_allocator_buckets(struct bch_fs *c)
 		spin_unlock(&ob->lock);
 	}
 
-	percpu_up_read_preempt_enable(&c->mark_lock);
+	percpu_up_read(&c->mark_lock);
 }
 
 static void bch2_gc_free(struct bch_fs *c)
