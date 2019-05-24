@@ -678,7 +678,7 @@ int bch2_set_page_dirty(struct page *page)
 	return __set_page_dirty_nobuffers(page);
 }
 
-int bch2_page_mkwrite(struct vm_fault *vmf)
+vm_fault_t bch2_page_mkwrite(struct vm_fault *vmf)
 {
 	struct page *page = vmf->page;
 	struct file *file = vmf->vma->vm_file;
@@ -800,10 +800,11 @@ static int bio_add_page_contig(struct bio *bio, struct page *page)
 
 static void bch2_readpages_end_io(struct bio *bio)
 {
+	struct bvec_iter_all iter;
 	struct bio_vec *bv;
 	int i;
 
-	bio_for_each_segment_all(bv, bio, i) {
+	bio_for_each_segment_all(bv, bio, i, iter) {
 		struct page *page = bv->bv_page;
 
 		if (!bio->bi_status) {
@@ -1185,11 +1186,12 @@ static void bch2_writepage_io_done(struct closure *cl)
 					struct bch_writepage_io, cl);
 	struct bch_fs *c = io->op.op.c;
 	struct bio *bio = &io->op.op.wbio.bio;
+	struct bvec_iter_all iter;
 	struct bio_vec *bvec;
 	unsigned i;
 
 	if (io->op.op.error) {
-		bio_for_each_segment_all(bvec, bio, i) {
+		bio_for_each_segment_all(bvec, bio, i, iter) {
 			SetPageError(bvec->bv_page);
 			mapping_set_error(bvec->bv_page->mapping, -EIO);
 		}
@@ -1216,7 +1218,7 @@ static void bch2_writepage_io_done(struct closure *cl)
 		i_sectors_acct(c, io->op.inode, NULL,
 			       io->op.sectors_added - (s64) io->new_sectors);
 
-	bio_for_each_segment_all(bvec, bio, i)
+	bio_for_each_segment_all(bvec, bio, i, iter)
 		end_page_writeback(bvec->bv_page);
 
 	closure_return_with_destructor(&io->cl, bch2_writepage_io_free);
@@ -1813,6 +1815,7 @@ static long bch2_dio_write_loop(struct dio_write *dio)
 	struct address_space *mapping = req->ki_filp->f_mapping;
 	struct bch_inode_info *inode = dio->iop.inode;
 	struct bio *bio = &dio->iop.op.wbio.bio;
+	struct bvec_iter_all iter;
 	struct bio_vec *bv;
 	loff_t offset;
 	bool sync;
@@ -1890,7 +1893,7 @@ err_wait_io:
 
 		closure_sync(&dio->cl);
 loop:
-		bio_for_each_segment_all(bv, bio, i)
+		bio_for_each_segment_all(bv, bio, i, iter)
 			put_page(bv->bv_page);
 		if (!dio->iter.count || dio->iop.op.error)
 			break;
